@@ -1,0 +1,15 @@
+# Copilot Rules for this workspace
+
+## General Principles
+- Never hardcode domain-specific instructions or logic unless explicitly requested by the user
+- Keep code generic, configurable, and LLM-driven where possible
+- Avoid embedding specific business logic, actor types, or use-case assumptions directly in the code
+- All domain-specific behavior should be configurable, LLM-driven, or user-specified
+- If something needs to be hardcoded, ask for explicit confirmation first
+
+## Project-Specific Rules
+- This is a live NL programming system with actors, coordinators, and message buses
+- Use structured LLM responses for actor interactions
+- Prefer YAML configs over hardcoded values
+- Maintain clean separation between actors, with message passing via MessageBus
+- Support broadcast messages and heartbeat functionality as configured

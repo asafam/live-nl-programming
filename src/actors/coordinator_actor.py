@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import os
+from typing import Callable, Dict, List, Optional
+
+import yaml
+
+from src.llm.base import AbstractLLM, ChatMessage
+from src.message_bus import MessageBus
+
+from .base import Actor
+
+
+class CoordinatorActor(Actor):
+    def __init__(self, llm: AbstractLLM, llm_factory: Callable[[str], AbstractLLM]) -> None:
+        super().__init__(
+            name="Coordinator",
+            llm=llm,
+            system_prompt="",  # Prompt loaded dynamically from YAML
+            initial_state={"actors": {}},
+        )
+        self.llm_factory = llm_factory
+        self.config = yaml.safe_load(open('config/system.yml'))
+        actors = self.state.setdefault("actors", {})
+        actors[self.name] = {
+            "purpose": "Orchestrates actors and routing",
+            "system_prompt": "",  # Loaded from YAML
+            "initial_state": {},
+        }
+
+    def _render_system_prompt(self) -> str:
+        registry = self._format_known_actors()
+        if not registry:
+            registry = "(none)"
+        if not hasattr(self, '_loaded_prompt'):
+            config_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'config', 'prompts')
+            prompt_path = os.path.join(config_dir, 'coordinator_actor.yml')
+            with open(prompt_path, 'r') as f:
+                self._loaded_prompt = yaml.safe_load(f)['system_prompt']
+        return self._loaded_prompt.replace('[[registry]]', registry)
+
+    def _register_actor_meta(self, args: Dict) -> None:
+        name = args.get("name")
+        if not name:
+            return
+        actors: Dict = self.state.setdefault("actors", {})
+        if name in actors:
+            return
+        actors[name] = {
+            "purpose": args.get("purpose"),
+            "system_prompt": args.get("system_prompt"),
+            "initial_state": args.get("initial_state", {}),
+        }
+
+    def _create_actor(
+        self, name: str, purpose: str, system_prompt: str = "", initial_state: Optional[Dict] = None
+    ) -> str:
+        if name in self.message_bus.actors:
+            return f"Actor '{name}' already exists. No new actor created."
+        init_state = initial_state or {}
+        init_state.setdefault("purpose", purpose)
+
+        # Load base prompt from actor.yml
+        base_prompt_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config', 'prompts', 'actor.yml')
+        with open(base_prompt_path, 'r') as f:
+            base_config = yaml.safe_load(f)
+
+        base_prompt = base_config['system_prompt']
+
+        state_schema = ", ".join(f"{k} ({type(v).__name__})" for k, v in init_state.items()) if init_state else ""
+        related_actors = self._format_known_actors() or "None"
+        full_system_prompt = base_prompt.replace('{purpose}', purpose).replace('{state_schema}', state_schema).replace('{related_actors}', related_actors)
+
+        # Conditionally include heartbeat
+        if self.config.get('heartbeat', {}).get('enabled', False):
+            heartbeat_text = base_config.get('system_prompt_heartbeat', {}).get('instructions', '')
+            full_system_prompt = full_system_prompt.replace('{system_prompt_heartbeat}', heartbeat_text)
+        else:
+            full_system_prompt = full_system_prompt.replace('{system_prompt_heartbeat}', '')
+
+        # Conditionally include proactivity
+        if self.config.get('features', {}).get('proactivity', False):
+            proactivity_instructions = base_config.get('system_prompt_proactivity', {}).get('instructions', '')
+            proactivity_format = base_config.get('system_prompt_proactivity', {}).get('format', '')
+            full_system_prompt = full_system_prompt.replace('{proactivity::instructions}', proactivity_instructions).replace('{proactivity::format}', proactivity_format)
+        else:
+            full_system_prompt = full_system_prompt.replace('{proactivity::instructions}', '').replace('{proactivity::format}', '')
+
+        # Append any additional system prompt
+        if system_prompt:
+            full_system_prompt += "\n\n" + system_prompt
+
+        actor = Actor(
+            name=name,
+            llm=self.llm_factory(name),
+            system_prompt=full_system_prompt,
+            initial_state=init_state,
+        )
+        self.message_bus.register(actor)
+        print(f"[Coordinator] Created actor '{name}' with purpose '{purpose}'")
+        return f"Created actor '{name}' with purpose: {purpose}"
+
+    def _format_known_actors(self) -> Optional[str]:
+        actors = self.state.get("actors", {})
+        if not actors:
+            return None
+        lines = ["Known actors:"]
+        for name, meta in actors.items():
+            purpose = meta.get("purpose", "")
+            initial_state = meta.get("initial_state", {})
+            state_keys = list(initial_state.keys()) if initial_state else []
+            state_info = f" (state keys: {', '.join(state_keys)})" if state_keys else ""
+            lines.append(f"- {name}: {purpose}{state_info}")
+        return "\n".join(lines)
+
+    def receive(self, message: str, from_actor: str) -> str:
+        if from_actor != "User":
+            return message  # Return actor responses directly to break loops
+
+        # Build chat with tools for the coordinator LLM
+        rendered_prompt = self._render_system_prompt()
+        chat: List[ChatMessage] = [ChatMessage(role="system", content=rendered_prompt)]
+        chat.append(ChatMessage(role="user", content=message))
+
+        # Define structured response schema
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "response": {
+                    "type": "string",
+                    "description": "Natural language response to the user"
+                },
+                "state": {
+                    "type": "object",
+                    "description": "State updates to apply (JSON object that will be merged into current state)",
+                    "additionalProperties": True
+                },
+                "messages": {
+                    "type": "array",
+                    "description": "Messages to send to other actors",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "to": {"type": "string", "description": "Target actor name"},
+                            "message": {"type": "string", "description": "Message content in natural language"}
+                        },
+                        "required": ["to", "message"],
+                        "additionalProperties": False
+                    }
+                },
+                "create_actors": {
+                    "type": "array",
+                    "description": "Actors to create",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Actor name"},
+                            "purpose": {"type": "string", "description": "Actor purpose"},
+                            "system_prompt": {"type": "string", "description": "System prompt for the actor"},
+                            "initial_state": {"type": "object", "description": "Initial state for the actor"}
+                        },
+                        "required": ["name", "purpose", "system_prompt"]
+                    }
+                }
+            },
+            "required": ["response"]
+        }
+
+        # Get structured response from LLM
+        structured_response = self.llm.generate_structured(chat, response_schema)
+
+        # Apply state changes if any
+        if structured_response.state:
+            self.update_state(structured_response.state)
+
+        # Create actors if any
+        if hasattr(structured_response, 'create_actors') and structured_response.create_actors:
+            for actor_spec in structured_response.create_actors:
+                if isinstance(actor_spec, dict) and 'name' in actor_spec:
+                    requested_name = actor_spec.get("name")
+                    if requested_name and requested_name in self.state.get("actors", {}):
+                        # Actor already exists
+                        continue
+                    self._create_actor(**actor_spec)
+                    self._register_actor_meta(actor_spec)
+
+        # Send messages if any
+        if structured_response.messages and self.message_bus:
+            for msg in structured_response.messages:
+                if isinstance(msg, dict) and 'to' in msg and 'message' in msg:
+                    to_actor = msg['to']
+                    if to_actor not in self.message_bus.actors:
+                        # Create a default actor for unknown recipients
+                        self._create_actor(
+                            name=to_actor,
+                            purpose=f"Handle {to_actor.lower()} related tasks",
+                            initial_state={}
+                        )
+                    self.message_bus.send(from_actor=self.name, to_actor=to_actor, message=msg['message'])
+
+        return structured_response.response or f"I received your message: {message}"

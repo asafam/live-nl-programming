@@ -1,0 +1,6 @@
+heartbeat:
+  enabled: true
+  interval: 30
+
+features:
+  proactivity: false
