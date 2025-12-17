@@ -10,6 +10,7 @@ heartbeat:
 
 features:
   proactivity: false
+  self_reflection: true
 
 prompts:
   coordinator: config/prompts/coordinator_actor.yml

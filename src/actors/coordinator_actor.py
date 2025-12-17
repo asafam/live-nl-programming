@@ -9,7 +9,8 @@ from pydantic import BaseModel
 from src.llm.base import AbstractLLM, ChatMessage
 from src.message_bus import MessageBus
 
-from .base import Actor, Message
+from .base import Actor, Message, MessageType
+from .listener import Listener
 
 
 class CreateActorSpec(BaseModel):
@@ -46,9 +47,14 @@ COORDINATOR_RESPONSE_SCHEMA = {
                     "message": {
                         "type": "string",
                         "description": "Natural language message content to the other actor"
+                    },
+                    "message_type": {
+                        "type": "string",
+                        "enum": ["REQUEST", "EVENT"],
+                        "description": "Type of message: REQUEST for commands, EVENT for notifications"
                     }
                 },
-                "required": ["to", "message"],
+                "required": ["to", "message", "message_type"],
                 "additionalProperties": False
             }
         },
@@ -158,13 +164,16 @@ class CoordinatorActor(Actor):
         if system_prompt:
             full_system_prompt += "\n\n" + system_prompt
 
+        # Check if self-reflection is enabled in config
+        enable_reflection_config = self.config.get('features', {}).get('self_reflection', True)
+
         actor = Actor(
             name=name,
             llm=self.llm_factory(name),
             system_prompt=full_system_prompt,
             initial_state=init_state,
             reflection_prompt=reflection_prompt,
-            enable_self_reflection=bool(reflection_prompt),
+            enable_self_reflection=bool(reflection_prompt) and enable_reflection_config,
         )
         self.message_bus.register(actor)
         print(f"[Coordinator] Created actor '{name}' with purpose '{purpose}'")
@@ -177,20 +186,12 @@ class CoordinatorActor(Actor):
         lines = ["Known actors:"]
         for name, meta in actors.items():
             purpose = meta.get("purpose", "")
-            # Include current state if actor exists in message bus
-            if name in self.message_bus.actors:
-                current_state = self.message_bus.actors[name].state
-                state_summary = ", ".join(f"{k}: {v}" for k, v in current_state.items() if k != "purpose")
-                lines.append(f"- {name}: {purpose} (current state: {state_summary})")
-            else:
-                initial_state = meta.get("initial_state", {})
-                state_keys = list(initial_state.keys()) if initial_state else []
-                state_info = f" (state keys: {', '.join(state_keys)})" if state_keys else ""
-                lines.append(f"- {name}: {purpose}{state_info}")
+            # Only show purpose, hide internal state to force delegation
+            lines.append(f"- {name}: {purpose}")
         return "\n".join(lines)
 
-    def receive(self, message: str, from_actor: str) -> str:
-        if from_actor != "User":
+    def receive(self, message: str, from_actor: str, message_type: MessageType = MessageType.REQUEST) -> str:
+        if from_actor != "User" and message_type == MessageType.REQUEST:
             return message  # Return actor responses directly to break loops
 
         # Append to message history
@@ -199,7 +200,7 @@ class CoordinatorActor(Actor):
         # Build chat with tools for the coordinator LLM
         rendered_prompt = self._render_system_prompt()
         chat: List[ChatMessage] = [ChatMessage(role="system", content=rendered_prompt)]
-        chat.append(ChatMessage(role="user", content=message))
+        chat.append(ChatMessage(role="user", content=f"[{message_type.value}] {message}"))
 
         # Get structured response from LLM using raw JSON schema (strict mode for determinism)
         raw_response = self.llm.generate_structured(chat, COORDINATOR_RESPONSE_SCHEMA)
@@ -243,14 +244,38 @@ class CoordinatorActor(Actor):
                         purpose=f"Handle {to_actor.lower()} related tasks",
                         initial_state={}
                     )
-                response = self.message_bus.send(from_actor=self.name, to_actor=to_actor, message=msg.message)
+                # Use the message type specified by the coordinator
+                if msg.message_type == MessageType.EVENT:
+                    # Prevent loops: If the message is an EVENT and the sender is the Coordinator,
+                    # and the recipient is NOT the User, we should be careful.
+                    
+                    # 1. Don't send events back to the originator
+                    if to_actor == from_actor:
+                        continue
+
+                    response = self.message_bus.notify_event(from_actor=self.name, to_actor=to_actor, message=msg.message)
+                else:
+                    response = self.message_bus.send_request(from_actor=self.name, to_actor=to_actor, message=msg.message)
+                
                 if response:
                     actor_responses.append(response)
 
         # If we have actor responses, return those instead of coordinator's initial response
         # The actor responses contain the actual information the user requested
-        if actor_responses:
-            return "\n".join(actor_responses)
+        final_response = "\n".join(actor_responses) if actor_responses else (structured_response.response or "")
 
-        # Otherwise return the coordinator's own response
-        return structured_response.response or ""
+        # Route response based on original sender
+        sender_actor = self.message_bus.actors.get(from_actor)
+        if sender_actor and isinstance(sender_actor, Listener):
+            # PROACTIVE flow: System triggered it, but User must see the result.
+            # DO NOT send back to Listener (EmailMonitor).
+            if final_response:
+                self.message_bus.notify_event(
+                    from_actor=self.name, 
+                    to_actor="User", 
+                    message=f"⚠️ SYSTEM NOTIFICATION: {final_response}"
+                )
+            return ""
+        else:
+            # Standard flow: User asked, User gets answer (via return value)
+            return final_response

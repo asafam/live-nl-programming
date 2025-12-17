@@ -32,7 +32,7 @@ def test_shopping_list():
 
     # Test 1: Create BudgetManager with $50
     print("Test 1: Creating BudgetManager with $50")
-    response1 = bus.send(from_actor="User", to_actor="Coordinator", message="Create a budget, call it BudgetManager, and set it to $50")
+    response1 = bus.send_request(from_actor="User", to_actor="Coordinator", message="Create a budget, call it BudgetManager, and set it to $50")
     print(f"Response: {response1}")
 
     # Validate BudgetManager created and budget set
@@ -50,7 +50,7 @@ def test_shopping_list():
 
     # Test 2: Create ShoppingList
     print("\nTest 2: Creating ShoppingList")
-    response2 = bus.send(from_actor="User", to_actor="Coordinator", message="Create a shopping list, call it ShoppingList, to track items with quantity, unit price, and name")
+    response2 = bus.send_request(from_actor="User", to_actor="Coordinator", message="Create a shopping list, call it ShoppingList, to track items with quantity, unit price, and name")
 
     # Validate ShoppingList created
     print("\nValidating ShoppingList creation...")
@@ -58,11 +58,11 @@ def test_shopping_list():
 
     # Test 3: Configure shopping list to coordinate with budget
     print("\nTest 3: Configuring shopping list to coordinate with budget")
-    response2_5 = bus.send(from_actor="User", to_actor="Coordinator", message="Configure the ShoppingList to notify the BudgetManager whenever items are added or removed, so the BudgetManager can track expenses and update the remaining budget accordingly")
+    response2_5 = bus.send_request(from_actor="User", to_actor="Coordinator", message="Configure the ShoppingList to notify the BudgetManager whenever items are added or removed, so the BudgetManager can track expenses and update the remaining budget accordingly")
 
     # Test 4: Add affordable items
     print("\nTest 4: Adding affordable items to shopping list")
-    response3 = bus.send(from_actor="User", to_actor="Coordinator", message="Add 2 apples at $1 each")
+    response3 = bus.send_request(from_actor="User", to_actor="Coordinator", message="Add 2 apples at $1 each")
     if "ShoppingList" in bus.actors:
         state = bus.actors["ShoppingList"].state
         assert_with_llm_fallback(
@@ -74,7 +74,7 @@ def test_shopping_list():
 
     # Test 5: Add more affordable items
     print("\nTest 5: Adding affordable items to shopping list")
-    response4 = bus.send(from_actor="User", to_actor="Coordinator", message="Add 1 milk at $4")
+    response4 = bus.send_request(from_actor="User", to_actor="Coordinator", message="Add 1 milk at $4")
 
     # Validate budget after adding items (budget coordination not fully implemented yet)
     if "ShoppingList" in bus.actors:
@@ -88,12 +88,12 @@ def test_shopping_list():
 
     # Test 6: Query shopping list
     print("\nTest 6: Querying shopping list")
-    response5 = bus.send(from_actor="User", to_actor="Coordinator", message="What is in my shopping list?")
+    response5 = bus.send_request(from_actor="User", to_actor="Coordinator", message="What is in my shopping list?")
     print(f"Response: {response5}")
 
     # Test 7: Querying current budget
     print("\nTest 7: Querying current budget")
-    response6 = bus.send(from_actor="User", to_actor="Coordinator", message="Where do we stand with the budget?")
+    response6 = bus.send_request(from_actor="User", to_actor="Coordinator", message="Where do we stand with the budget?")
     print(f"Response: {response6}")
 
     # Validate budget query response contains budget information
@@ -108,12 +108,12 @@ def test_shopping_list():
 
     # Test 8: Try to add expensive item that exceeds budget
     print("\nTest 8: Trying to add expensive item")
-    response7 = bus.send(from_actor="User", to_actor="Coordinator", message="Add 10 steaks at $5 each")
+    response7 = bus.send_request(from_actor="User", to_actor="Coordinator", message="Add 10 steaks at $5 each")
     print(f"Response: {response7}")
 
     # Test 9: Remove item
     print("\nTest 9: Removing an item")
-    response8 = bus.send(from_actor="User", to_actor="Coordinator", message="Remove milk from the shopping list")
+    response8 = bus.send_request(from_actor="User", to_actor="Coordinator", message="Remove milk from the shopping list")
     print(f"Response: {response8}")
 
     # Validate item removed
@@ -126,7 +126,7 @@ def test_shopping_list():
 
     # Test 10: Query budget again
     print("\nTest 10: Querying budget after removal")
-    response9 = bus.send(from_actor="User", to_actor="Coordinator", message="What is the current budget?")
+    response9 = bus.send_request(from_actor="User", to_actor="Coordinator", message="What is the current budget?")
     print(f"Response: {response9}")
 
     # Inspect states with independent LLM
@@ -166,7 +166,7 @@ def test_actor_creation():
 
     # Test creating a budget actor
     print("Test: Creating a BudgetManager with $50")
-    response = bus.send(from_actor="User", to_actor="Coordinator", message="Create a budget, name it BudgetManager, and set it to $50")
+    response = bus.send_request(from_actor="User", to_actor="Coordinator", message="Create a budget, name it BudgetManager, and set it to $50")
     print(f"Response: {response}")
 
     # Check if BudgetManager was created with correct state

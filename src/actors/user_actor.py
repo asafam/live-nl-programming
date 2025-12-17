@@ -13,7 +13,7 @@ class UserActor(BaseActor):
         """Send a user message to the Coordinator and return the response."""
         if not self.message_bus:
             return "No message bus available."
-        return self.message_bus.send(from_actor=self.name, to_actor="Coordinator", message=message)
+        return self.message_bus.send_request(from_actor=self.name, to_actor="Coordinator", message=message)
 
     def receive(self, message: str, from_actor: str) -> str:
         # User actor doesn't receive messages in the normal flow; it's the sender

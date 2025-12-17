@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import json
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 from src.llm.base import AbstractLLM, ChatMessage, system_message, user_message
 
 
+class MessageType(str, Enum):
+    REQUEST = "REQUEST"
+    EVENT = "EVENT"
+
+
 class Message(BaseModel):
     to: str
     message: str
-    message_type: str = "default"
+    message_type: MessageType = MessageType.REQUEST
 
 
 class StructuredResponse(BaseModel):
@@ -18,6 +24,7 @@ class StructuredResponse(BaseModel):
     state_updates: Optional[Dict[str, Any]] = None
     messages: List[Message] = []
     purpose_updates: List[str] = []  # New purposes to accumulate
+    constraints: List[str] = []  # New constraints to accumulate
 
 
 class ReflectionResponse(BaseModel):
@@ -59,7 +66,11 @@ ACTOR_RESPONSE_SCHEMA = {
                 "properties": {
                     "to": {"type": "string"},
                     "message": {"type": "string"},
-                    "message_type": {"type": "string"}
+                    "message_type": {
+                        "type": "string",
+                        "enum": ["REQUEST", "EVENT"],
+                        "description": "Type of message: REQUEST or EVENT"
+                    }
                 },
                 "required": ["to", "message", "message_type"],
                 "additionalProperties": False
@@ -69,9 +80,14 @@ ACTOR_RESPONSE_SCHEMA = {
             "type": "array",
             "description": "New purposes to accumulate",
             "items": {"type": "string"}
+        },
+        "constraints": {
+            "type": "array",
+            "description": "New constraints or rules to remember",
+            "items": {"type": "string"}
         }
     },
-    "required": ["response", "state_updates", "messages", "purpose_updates"],
+    "required": ["response", "state_updates", "messages", "purpose_updates", "constraints"],
     "additionalProperties": False
 }
 
@@ -82,7 +98,7 @@ class BaseActor:
     def __init__(self, name: str) -> None:
         self.name = name
 
-    def receive(self, message: str, from_actor: str) -> str:  # pragma: no cover - interface hook
+    def receive(self, message: str, from_actor: str, message_type: MessageType = MessageType.REQUEST) -> str:  # pragma: no cover - interface hook
         raise NotImplementedError
 
 
@@ -120,7 +136,14 @@ class Actor(BaseActor):
             full_purpose = f"{purpose}\n\nAdditional purposes:\n{purposes_text}"
         else:
             full_purpose = purpose
-        return prompt.replace("{purpose}", full_purpose)
+        
+        constraints = self.state.get('constraints', [])
+        if constraints:
+            constraints_text = "\n".join(f"- {c}" for c in constraints)
+        else:
+            constraints_text = "(none)"
+            
+        return prompt.replace("{purpose}", full_purpose).replace("{constraints}", constraints_text)
 
     @system_prompt.setter
     def system_prompt(self, value: str) -> None:
@@ -177,7 +200,7 @@ class Actor(BaseActor):
             print(f"[Reflection] {self.name}: {reflection_response.reasoning or 'Taking action based on state change'}")
             # Send message to self to trigger follow-up action
             if self.message_bus:
-                self.message_bus.send(from_actor=self.name, to_actor=self.name, message=reflection_response.action_message)
+                self.message_bus.send_request(from_actor=self.name, to_actor=self.name, message=reflection_response.action_message)
 
     def speak(self, content: str) -> str:
         """LLM-backed natural language response with actor persona."""
@@ -196,7 +219,7 @@ class Actor(BaseActor):
             lines.append(f"- {name}: {desc}")
         return "\n".join(lines)
 
-    def receive(self, message: str, from_actor: str) -> str:
+    def receive(self, message: str, from_actor: str, message_type: MessageType = MessageType.REQUEST) -> str:
         """Handle incoming natural-language message and parse structured response from LLM."""
         # Append to message history
         self.message_history.append((from_actor, message))
@@ -208,7 +231,7 @@ class Actor(BaseActor):
         if known_ctx:
             chat.append(system_message(known_ctx))
 
-        chat.append(user_message(f"From {from_actor}: {message}"))
+        chat.append(user_message(f"From {from_actor} [{message_type.value}]: {message}"))
 
         # Get structured response from LLM using strict schema
         raw_response = self.llm.generate_structured(chat, ACTOR_RESPONSE_SCHEMA)
@@ -232,7 +255,8 @@ class Actor(BaseActor):
             response=raw_response.get("response") or "",
             state_updates=state_updates_dict,
             messages=[Message(**m) for m in raw_response.get("messages", [])],
-            purpose_updates=raw_response.get("purpose_updates", [])
+            purpose_updates=raw_response.get("purpose_updates", []),
+            constraints=raw_response.get("constraints", [])
         )
 
         # Capture old state before updates
@@ -248,10 +272,19 @@ class Actor(BaseActor):
                 print(f"[Purpose] {self.name}: Added purpose: {purpose}")
             self.purposes.extend(structured_response.purpose_updates)
 
+        # Apply constraints if any
+        if structured_response.constraints:
+            current_constraints = self.state.get("constraints", [])
+            for constraint in structured_response.constraints:
+                print(f"[Constraint] {self.name}: Added constraint: {constraint}")
+                if constraint not in current_constraints:
+                    current_constraints.append(constraint)
+            self.state["constraints"] = current_constraints
+
         # Send messages if any
         if structured_response.messages and self.message_bus:
             for msg in structured_response.messages:
-                self.message_bus.send(from_actor=self.name, to_actor=msg.to, message=msg.message)
+                self.message_bus.send_request(from_actor=self.name, to_actor=msg.to, message=msg.message)
 
         # Self-reflection if enabled and state changed
         if self.self_reflection_enabled and old_state != self.state:
