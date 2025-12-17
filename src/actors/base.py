@@ -11,6 +11,7 @@ from src.llm.base import AbstractLLM, ChatMessage, system_message, user_message
 class MessageType(str, Enum):
     REQUEST = "REQUEST"
     EVENT = "EVENT"
+    RESPONSE = "RESPONSE"
 
 
 class Message(BaseModel):
@@ -68,8 +69,8 @@ ACTOR_RESPONSE_SCHEMA = {
                     "message": {"type": "string"},
                     "message_type": {
                         "type": "string",
-                        "enum": ["REQUEST", "EVENT"],
-                        "description": "Type of message: REQUEST or EVENT"
+                        "enum": ["REQUEST", "EVENT", "RESPONSE"],
+                        "description": "Type of message: REQUEST, EVENT, or RESPONSE"
                     }
                 },
                 "required": ["to", "message", "message_type"],
@@ -284,7 +285,16 @@ class Actor(BaseActor):
         # Send messages if any
         if structured_response.messages and self.message_bus:
             for msg in structured_response.messages:
-                self.message_bus.send_request(from_actor=self.name, to_actor=msg.to, message=msg.message)
+                if msg.message_type == MessageType.EVENT:
+                    self.message_bus.notify_event(from_actor=self.name, to_actor=msg.to, message=msg.message)
+                elif msg.message_type == MessageType.RESPONSE:
+                    if hasattr(self.message_bus, "send_response"):
+                        self.message_bus.send_response(from_actor=self.name, to_actor=msg.to, message=msg.message)
+                    else:
+                        # Fallback if send_response not implemented yet
+                        self.message_bus.send_request(from_actor=self.name, to_actor=msg.to, message=msg.message)
+                else:
+                    self.message_bus.send_request(from_actor=self.name, to_actor=msg.to, message=msg.message)
 
         # Self-reflection if enabled and state changed
         if self.self_reflection_enabled and old_state != self.state:

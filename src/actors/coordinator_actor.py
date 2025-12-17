@@ -50,8 +50,8 @@ COORDINATOR_RESPONSE_SCHEMA = {
                     },
                     "message_type": {
                         "type": "string",
-                        "enum": ["REQUEST", "EVENT"],
-                        "description": "Type of message: REQUEST for commands, EVENT for notifications"
+                        "enum": ["REQUEST", "EVENT", "RESPONSE"],
+                        "description": "Type of message: REQUEST for commands, EVENT for notifications, RESPONSE for replies"
                     }
                 },
                 "required": ["to", "message", "message_type"],
@@ -193,6 +193,9 @@ class CoordinatorActor(Actor):
     def receive(self, message: str, from_actor: str, message_type: MessageType = MessageType.REQUEST) -> str:
         if from_actor != "User" and message_type == MessageType.REQUEST:
             return message  # Return actor responses directly to break loops
+        
+        if message_type == MessageType.RESPONSE:
+            return ""
 
         # Append to message history
         self.message_history.append((from_actor, message))
@@ -254,6 +257,8 @@ class CoordinatorActor(Actor):
                         continue
 
                     response = self.message_bus.notify_event(from_actor=self.name, to_actor=to_actor, message=msg.message)
+                elif msg.message_type == MessageType.RESPONSE:
+                    response = self.message_bus.send_response(from_actor=self.name, to_actor=to_actor, message=msg.message)
                 else:
                     response = self.message_bus.send_request(from_actor=self.name, to_actor=to_actor, message=msg.message)
                 

@@ -43,13 +43,13 @@ system_prompt: |
 
   === MESSAGE SEMANTICS (CRITICAL) ===
 
-  You will receive messages with a specific 'type': 'REQUEST' or 'SIGNAL'.
+  You will receive messages with a specific 'type': 'REQUEST' or 'EVENT'.
 
   1. IF TYPE IS "REQUEST":
     - SEMANTICS: INTENT. The sender wants you to perform an operation.
     - ACTION: Execute the instruction.
 
-  2. IF TYPE IS "SIGNAL":
+  2. IF TYPE IS "EVENT" (or SIGNAL):
     - SEMANTICS: OCCURRENCE. A change happened in the environment.
     - EXPECTATION: You must ANALYZE how this new information impacts your current state.
     - ACTION: Perform an **IMPACT ANALYSIS**:
@@ -74,6 +74,14 @@ system_prompt: |
           - If the signal has no logical connection to your state, ignore it.
 
 
+  === OUTGOING MESSAGES ===
+
+  When sending messages to other actors (via the 'messages' field), you MUST specify the 'message_type':
+
+  - "REQUEST": You want another actor to do something.
+  - "EVENT": You are notifying others about something that happened (e.g. "Added item").
+  - "RESPONSE": You are replying to a request or reporting a failure/rejection to the Coordinator. Use this to avoid the Coordinator echoing your message back to you.
+
   {proactivity::instructions}
   
 
@@ -83,7 +91,7 @@ system_prompt: |
 
   - response: Natural language response to the user/message sender (string)
   - state_updates: Array of state field updates, each with 'key' (string) and 'value_json' (JSON-encoded string). Example: [{"key": "count", "value_json": "50"}, {"key": "items", "value_json": "[\"foo\", \"bar\"]"}]
-  - messages: Array of messages to send to other actors, each with 'to' (actor name) and 'message' (content)
+  - messages: Array of messages to send to other actors, each with 'to' (actor name), 'message' (content), and 'message_type' ("REQUEST", "EVENT", or "RESPONSE")
   - purpose_updates: Array of new purposes to accumulate (strings)
   - constraints: Array of new constraints or rules to remember (strings)
 

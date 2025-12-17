@@ -22,6 +22,9 @@ class MessageBus:
     def notify_event(self, from_actor: str, to_actor: str, message: str) -> str:
         return self._send(from_actor, to_actor, message, MessageType.EVENT)
 
+    def send_response(self, from_actor: str, to_actor: str, message: str) -> str:
+        return self._send(from_actor, to_actor, message, MessageType.RESPONSE)
+
     def _send(self, from_actor: str, to_actor: str, message: str, message_type: MessageType = MessageType.REQUEST) -> str:
         # Special handling for User
         if to_actor == "User":
