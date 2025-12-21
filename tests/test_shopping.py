@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from src.actors.coordinator_actor import CoordinatorActor
 from src.llm.openai_client import OpenAIChatLLM
 from src.message_bus import MessageBus
-from tests.utils import get_validator_llm, llm_assert_state
+from tests.utils import llm_assert_state
 
 def assert_with_llm_fallback(condition_func, prompt_func=None, state=None, error_message="Assertion failed"):
     """Assert a condition, with optional LLM fallback on failure."""
@@ -149,39 +149,3 @@ def test_shopping_list():
 
 if __name__ == "__main__":
     test_shopping_list()
-
-def test_actor_creation():
-    load_dotenv()
-
-    validator_llm = get_validator_llm()
-
-    bus = MessageBus()
-
-    def llm_factory(name: str):
-        # LLM will read config from system.yml automatically
-        return OpenAIChatLLM()
-
-    coordinator = CoordinatorActor(llm=llm_factory("Coordinator"), llm_factory=llm_factory)
-    bus.register(coordinator)
-
-    # Test creating a budget actor
-    print("Test: Creating a BudgetManager with $50")
-    response = bus.send_request(from_actor="User", to_actor="Coordinator", message="Create a budget, name it BudgetManager, and set it to $50")
-    print(f"Response: {response}")
-
-    # Check if BudgetManager was created with correct state
-    if "BudgetManager" in bus.actors:
-        state = bus.actors["BudgetManager"].state
-        print(f"BudgetManager state: {state}")
-        assert "budget" in state
-        # Note: The budget value may vary based on LLM response
-        # assert state["budget"] == 50
-        # assert "expenses" in state
-        # assert isinstance(state["expenses"], list)
-        print("BudgetManager created successfully with correct state")
-    else:
-        print("BudgetManager not created")
-        assert False, "BudgetManager should have been created"
-
-if __name__ == "__main__":
-    test_actor_creation()

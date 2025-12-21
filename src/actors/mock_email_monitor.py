@@ -3,10 +3,11 @@ from src.actors.listener import Listener
 from src.actors.base import MessageType
 
 class MockEmailMonitor(Listener):
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, email_message: Optional[str] = None, trigger_count: int = 2) -> None:
         super().__init__(name=name)
         self.state = {"interaction_count": 0}
-        self.trigger_count = 2  # Trigger after 2 interactions
+        self.trigger_count = trigger_count
+        self.email_message = email_message or "New email from Sarah: 'I'm going vegan, please cancel the meat'."
 
     def listen(self) -> None:
         """Simulate checking emails and triggering an event."""
@@ -21,5 +22,5 @@ class MockEmailMonitor(Listener):
                 self.message_bus.notify_event(
                     from_actor=self.name,
                     to_actor="Coordinator",
-                    message="New email from Sarah: 'I'm going vegan, please cancel the meat'."
+                    message=self.email_message
                 )

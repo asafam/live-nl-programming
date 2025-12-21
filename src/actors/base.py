@@ -173,7 +173,7 @@ class Actor(BaseActor):
         print(f"[State] {self.name}: update {updates}")
         self.state.update(updates)
 
-    def reflect_on_change(self, old_state: Dict, new_state: Dict) -> None:
+    def reflect_on_change(self, old_state: Dict, new_state: Dict, triggering_message: str = "", messages_sent: List[str] = None) -> None:
         """Reflect on state changes and take action if needed by sending message to self."""
         if not self.reflection_prompt:
             return
@@ -188,10 +188,17 @@ class Actor(BaseActor):
                 diff_lines.append(f"{key}: {old_val} -> {new_val}")
         state_diff = "\n".join(diff_lines) if diff_lines else "No changes detected"
 
+        # Format messages sent for context
+        messages_sent_str = "None"
+        if messages_sent:
+            messages_sent_str = "\n".join(f"  - {msg}" for msg in messages_sent)
+
         prompt = self.reflection_prompt.format(
             old_state=json.dumps(old_state, indent=2),
             new_state=json.dumps(new_state, indent=2),
-            state_diff=state_diff
+            state_diff=state_diff,
+            triggering_message=triggering_message or "N/A",
+            messages_sent=messages_sent_str
         )
 
         chat: List[ChatMessage] = [system_message(self.system_prompt), user_message(prompt)]
@@ -282,9 +289,13 @@ class Actor(BaseActor):
                     current_constraints.append(constraint)
             self.state["constraints"] = current_constraints
 
-        # Send messages if any
+        # Send messages if any and track what was sent
+        messages_sent_summary = []
         if structured_response.messages and self.message_bus:
             for msg in structured_response.messages:
+                # Track message for reflection context
+                messages_sent_summary.append(f"To {msg.to} [{msg.message_type.value}]: {msg.message}")
+
                 if msg.message_type == MessageType.EVENT:
                     self.message_bus.notify_event(from_actor=self.name, to_actor=msg.to, message=msg.message)
                 elif msg.message_type == MessageType.RESPONSE:
@@ -298,7 +309,8 @@ class Actor(BaseActor):
 
         # Self-reflection if enabled and state changed
         if self.self_reflection_enabled and old_state != self.state:
-            self.reflect_on_change(old_state, self.state)
+            triggering_msg = f"From {from_actor} [{message_type.value}]: {message}"
+            self.reflect_on_change(old_state, self.state, triggering_msg, messages_sent_summary)
 
         return structured_response.response
 

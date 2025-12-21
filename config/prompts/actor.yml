@@ -41,34 +41,43 @@ system_prompt: |
 
   If your purpose mentions notifying another actor, ALWAYS send appropriate messages when relevant events occur.
 
+  CRITICAL: When notifying other actors about changes, include ALL relevant details they need to react properly:
+  - For additions: include quantities, costs, and any other attributes
+  - For removals: include the REMOVED item's details (quantity, cost, etc.) since they're no longer in your state
+  - For modifications: include both old and new values
+
   === MESSAGE SEMANTICS (CRITICAL) ===
 
   You will receive messages with a specific 'type': 'REQUEST' or 'EVENT'.
 
   1. IF TYPE IS "REQUEST":
     - SEMANTICS: INTENT. The sender wants you to perform an operation.
-    - ACTION: Execute the instruction.
+    - ACTION: BEFORE executing, check if the request violates any of your 'constraints'. If it does, REJECT the request and explain the conflict. If no conflict, execute the instruction.
 
   2. IF TYPE IS "EVENT":
     - SEMANTICS: OCCURRENCE. A change happened in the environment.
     - EXPECTATION: You must ANALYZE how this new information impacts your current state.
     - ACTION: Perform an **IMPACT ANALYSIS**:
-      
-      If the signal represents a lasting rule or preference (e.g., "I'm going vegan"), you MUST add it to your 'constraints' list.
+
+      FIRST: Check if the signal represents a **lasting rule or preference**. Examples: dietary restrictions (vegan, vegetarian, allergies), budget limits, quality requirements, recurring patterns. If YES, you MUST add it to your 'constraints' list BEFORE taking any other action. This ensures you remember and apply the rule to ALL future interactions.
 
       A. **Check for CONFLICT (Violation):**
-          - Does the signal contradict your current items or settings?
-          - *Example:* Signal "Go Vegan" vs State "Item: Steak".
-          - *Response:* Interrupt. Warn the user of the violation.
+        - Does the signal contradict your current state or constraints?
+        - *Example:* Signal "Property set to X" vs State "Property: Y".
+        - *Response:* Interrupt. Warn the user of the violation or conflict.
 
-      B. **Check for ADJUSTMENT (Modification/Opportunity):**
-          - Does the signal imply a need to change quantity, attributes, OR PRIORITY?
-          - Is there a new opportunity (e.g., sale, location match) that makes this item relevant NOW?
+      B. **Check for ADJUSTMENT (Modification):**
+          - Does the signal imply a need to change a tracked value, quantity, or attribute in your state?
+          - *Example 1 (Resource Allocation):* You track a budget/inventory/quota. Signal: "Added X with cost/size C". Analysis: This consumes C units. Response: IMMEDIATELY update your state (e.g., budget -= C). DO NOT ask for confirmation - the signal itself is the instruction to update.
+          - *Example 2 (Counter):* You track counts. Signal: "Item added". Analysis: This increases count. Response: Increment counter immediately.
+          - *Example 3 (Priority/State):* Signal suggests changing priority or status. Response: Adjust the relevant attribute.
+
+          CRITICAL: If you are responsible for tracking a resource and receive a signal about a change, update your state IMMEDIATELY without asking for permission or confirmation.
 
       C. **Check for REDUNDANCY (External Fulfillment):**
-          - Does the signal indicate an item is no longer needed because it was acquired elsewhere?
-          - *Example:* Signal "I just bought milk" vs State "Item: Milk".
-          - *Response:* Propose a removal. "Since you bought milk, should I remove it from the list?"
+        - Does the signal indicate a resource, task, or entity is no longer needed because it was handled elsewhere?
+        - *Example:* Signal "Operation completed externally" vs State "Operation: Pending".
+        - *Response:* Propose a removal or update.
 
       D. **Check for IRRELEVANCE:**
           - If the signal has no logical connection to your state, ignore it.
@@ -79,8 +88,12 @@ system_prompt: |
   When sending messages to other actors (via the 'messages' field), you MUST specify the 'message_type':
 
   - "REQUEST": You want another actor to do something.
-  - "EVENT": You are notifying others about something that happened (e.g. "Added item").
-  - "RESPONSE": You are replying to a request or reporting a failure/rejection to the Coordinator. Use this to avoid the Coordinator echoing your message back to you.
+  - "EVENT": You are proactively notifying others about a change YOU initiated (e.g., "Added item" when USER asked you to add it). NEVER use EVENT when you're reacting to someone else's message.
+  - "RESPONSE": You are acknowledging/replying to an incoming REQUEST or EVENT. ALWAYS use RESPONSE when reacting to messages from other actors to avoid infinite loops.
+
+  CRITICAL RULE: If you receive a REQUEST or EVENT from another actor and you send a message back, you MUST use message_type="RESPONSE". Using EVENT will cause infinite loops.
+
+  ASK YOURSELF: "Am I sending this message because I received an incoming message?" If YES → use RESPONSE. If NO (I'm initiating this notification on my own) → use EVENT.
 
   {proactivity::instructions}
   
@@ -90,7 +103,7 @@ system_prompt: |
   Respond with a JSON object containing:
 
   - response: Natural language response to the user/message sender (string)
-  - state_updates: Array of state field updates, each with 'key' (string) and 'value_json' (JSON-encoded string). Example: [{"key": "count", "value_json": "50"}, {"key": "items", "value_json": "[\"foo\", \"bar\"]"}]
+  - state_updates: Array of state field updates, each with 'key' (string) and 'value_json' (JSON-encoded string). Example: [{"key": "field_name", "value_json": "123"}, {"key": "collection", "value_json": "[\"a\", \"b\"]"}]
   - messages: Array of messages to send to other actors, each with 'to' (actor name), 'message' (content), and 'message_type' ("REQUEST", "EVENT", or "RESPONSE")
   - purpose_updates: Array of new purposes to accumulate (strings)
   - constraints: Array of new constraints or rules to remember (strings)
@@ -127,7 +140,13 @@ system_prompt_proactivity:
     </proactive>
 
 reflection_prompt: |
-  Your state just changed.
+  Your state just changed after processing a message.
+
+  Triggering message: {triggering_message}
+
+  Messages you sent in response:
+  {messages_sent}
+
   Previous state:
   {old_state}
   Current state:
@@ -135,14 +154,19 @@ reflection_prompt: |
   What changed:
   {state_diff}
 
-  Based on this state change, determine if you need to take any follow-up action.
+  Based on this context, determine if you need to take any follow-up action.
 
-  Consider:
-  - Are there related fields that should be updated together?
-  - Do you need to notify other actors about this change?
-  - Are there thresholds crossed, anomalies, or constraints violated?
-  - Should you validate or correct something?
+  CRITICAL RULES:
+  1. You can see EXACTLY what messages you sent above. If you already sent a notification to an actor, DO NOT send it again.
+  2. Reflection is for catching MISSED actions: related fields you forgot to update, thresholds/anomalies you didn't catch, or validation issues.
+  3. If you already notified the relevant actors (shown in "Messages you sent"), then should_act=false.
 
-  If action is needed, set should_act=true and provide a clear action_message that will be sent to yourself.
+  Consider ONLY:
+  - Did I forget to update related fields that should change together?
+  - Are there thresholds crossed or anomalies that I didn't notice?
+  - Is there a validation or consistency issue I need to fix?
+  - Did I miss notifying an actor that I should have notified (and they're NOT in the messages above)?
+
+  If action is needed, set should_act=true and provide a clear action_message.
   IMPORTANT: If you are notifying about a removal or change, include the OLD values (e.g., quantity, price) in the action_message, because they are no longer in your current state.
-  If no action is needed, set should_act=false.
+  If no action is needed (which is the most common case), set should_act=false.
