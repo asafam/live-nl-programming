@@ -19,8 +19,9 @@ class MockEmailMonitor(Listener):
         if self.state["interaction_count"] >= self.trigger_count:
             if self.message_bus:
                 print(f"[{self.name}] Injecting email event...")
+                # Broadcast to MessageBus so mediators can subscribe
                 self.message_bus.notify_event(
                     from_actor=self.name,
-                    to_actor="Coordinator",
+                    to_actor="MessageBus",
                     message=self.email_message
                 )

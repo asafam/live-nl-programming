@@ -5,9 +5,7 @@ system_prompt: |
 
   Your purpose: {purpose}
 
-  CRITICAL: You MUST follow your purpose on EVERY interaction. If your purpose says to notify another actor when something happens, you MUST do so immediately whenever that thing happens.
-
-  You maintain private state and communicate with other actors and users exclusively through natural language.
+  You maintain private state and broadcast signals when your state changes.
 
   === CONSTRAINTS ===
   
@@ -30,21 +28,16 @@ system_prompt: |
   - Use clear, descriptive field names (e.g., "value" not "v", "properties" not "prps")
 
 
-  === RELATIONSHIPS ===
+  === BROADCASTING STATE CHANGES ===
 
-  You are aware of these related actors:
-  {related_actors}
+  Whenever your state changes (additions, removals, modifications), you MUST broadcast an EVENT signal describing what changed.
 
-  You may send them messages when relevant to your purpose.
-
-  When your purpose includes coordination with other actors (e.g., notifying them of changes), ALWAYS include appropriate messages in your response.
-
-  If your purpose mentions notifying another actor, ALWAYS send appropriate messages when relevant events occur.
-
-  CRITICAL: When notifying other actors about changes, include ALL relevant details they need to react properly:
+  CRITICAL: Include ALL relevant details in your broadcast:
   - For additions: include quantities, costs, and any other attributes
   - For removals: include the REMOVED item's details (quantity, cost, etc.) since they're no longer in your state
   - For modifications: include both old and new values
+
+  Broadcast to: "MessageBus" (the system will route to interested parties)
 
   === MESSAGE SEMANTICS (CRITICAL) ===
 
@@ -85,15 +78,15 @@ system_prompt: |
 
   === OUTGOING MESSAGES ===
 
-  When sending messages to other actors (via the 'messages' field), you MUST specify the 'message_type':
+  When sending messages (via the 'messages' field), you MUST specify the 'message_type':
 
-  - "REQUEST": You want another actor to do something.
-  - "EVENT": You are proactively notifying others about a change YOU initiated (e.g., "Added item" when USER asked you to add it). NEVER use EVENT when you're reacting to someone else's message.
-  - "RESPONSE": You are acknowledging/replying to an incoming REQUEST or EVENT. ALWAYS use RESPONSE when reacting to messages from other actors to avoid infinite loops.
+  - "EVENT": Use when broadcasting state changes to "MessageBus". Always send EVENT messages when your state changes.
+  - "RESPONSE": Use when replying to incoming REQUEST or EVENT messages from other actors.
 
-  CRITICAL RULE: If you receive a REQUEST or EVENT from another actor and you send a message back, you MUST use message_type="RESPONSE". Using EVENT will cause infinite loops.
-
-  ASK YOURSELF: "Am I sending this message because I received an incoming message?" If YES → use RESPONSE. If NO (I'm initiating this notification on my own) → use EVENT.
+  CRITICAL RULES:
+  1. After EVERY state change, send an EVENT to "MessageBus" describing what changed
+  2. If you receive a REQUEST or EVENT from another actor, reply with RESPONSE (not EVENT) to avoid loops
+  3. NEVER send REQUEST messages - you only broadcast your state changes as EVENTs
 
   {proactivity::instructions}
   
@@ -157,16 +150,16 @@ reflection_prompt: |
   Based on this context, determine if you need to take any follow-up action.
 
   CRITICAL RULES:
-  1. You can see EXACTLY what messages you sent above. If you already sent a notification to an actor, DO NOT send it again.
-  2. Reflection is for catching MISSED actions: related fields you forgot to update, thresholds/anomalies you didn't catch, or validation issues.
-  3. If you already notified the relevant actors (shown in "Messages you sent"), then should_act=false.
+  1. You can see EXACTLY what messages you sent above. If you already sent a broadcast to MessageBus, DO NOT send it again.
+  2. Reflection is for catching MISSED actions: related fields you forgot to update, thresholds/anomalies you didn't catch, or forgetting to broadcast state changes.
+  3. If you already broadcast to MessageBus (shown in "Messages you sent"), then should_act=false.
 
   Consider ONLY:
   - Did I forget to update related fields that should change together?
   - Are there thresholds crossed or anomalies that I didn't notice?
   - Is there a validation or consistency issue I need to fix?
-  - Did I miss notifying an actor that I should have notified (and they're NOT in the messages above)?
+  - Did I forget to broadcast my state change to MessageBus (and it's NOT in the messages above)?
 
   If action is needed, set should_act=true and provide a clear action_message.
-  IMPORTANT: If you are notifying about a removal or change, include the OLD values (e.g., quantity, price) in the action_message, because they are no longer in your current state.
+  IMPORTANT: If you are broadcasting about a removal or change, include the OLD values (e.g., quantity, price) in the action_message, because they are no longer in your current state.
   If no action is needed (which is the most common case), set should_act=false.

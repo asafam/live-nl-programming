@@ -1,0 +1,157 @@
+- id: helpdesk-automation-template-slack-clickup
+  name: "Slack-ClickUp Support Automation"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/helpdesk-automation-template-slack-clickup
+  raw_steps:
+    - "User submits support request through Slack using a simple command or form"
+    - "AI chatbot analyzes the request and checks against your knowledge base for instant solutions"
+    - "Common issues get resolved immediately with step-by-step instructions sent directly to the user"
+    - "Complex or unrecognized requests automatically create tickets in ClickUp with proper categorization"
+    - "System assigns priority levels and routes tickets to appropriate team members based on expertise and workload"
+    - "Team members receive Slack notifications with all relevant context and can update status directly"
+    - "Automated status updates keep users informed throughout the resolution process"
+    - "Resolved tickets automatically update the knowledge base with new solutions for future reference"
+    - "System generates reports on common issues, resolution times, and team performance metrics"
+
+- id: it-helpdesk
+  name: "IT Help Desk with FAQ Loop"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/it-helpdesk
+  raw_steps:
+    - "An employee posts a question in a designated Slack channel"
+    - "AI automatically searches your FAQ knowledge base (stored in a Zapier table) for relevant answers"
+    - "If AI finds a suitable answer, an AI chatbot replies to the employee directly in Slack"
+    - "If AI can't find a good answer—or if the issue requires human attention—the request gets escalated to an IT team member"
+    - "Employees can mark the urgency of their requests using an emoji that corresponds to predefined priority options"
+    - "The system automatically creates tickets in Jira or ClickUp and sends status updates back to Slack"
+    - "After each ticket gets closed out, the system summarizes the Slack thread and adds it to your FAQ database"
+    - "Next time someone has the same question, AI will have the info to respond automatically"
+
+- id: deal-desk-manage-hubspot-quote-approvals-slack
+  name: "HubSpot Automated Quote Approval"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/deal-desk-manage-hubspot-quote-approvals-slack
+  raw_steps:
+    - "A sales rep submits a new quote for approval in HubSpot Quotes"
+    - "The system identifies approvers based on the specific concessions asked for and the rep's reporting chain"
+    - "An email approval request gets sent to the designated approvers"
+    - "The approver reviews the quote details and takes action—approve, reject, or request changes—in Slack"
+    - "If approved, the quote is marked as such in HubSpot, and the rep is free to send it"
+    - "If concessions aren't approved, the quote is marked rejected, and reps can resubmit"
+    - "If quotes aren't approved in 24 hours, stakeholders are tagged in the thread as a reminder"
+
+- id: slack-changelog-automation
+  name: "Slack Reaction Changelog"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/slack-changelog-automation
+  raw_steps:
+    - "Someone on your team shares a process change in Slack that you'd like to record"
+    - "To kick off the system, you react to the message with whatever you set as your changelog emoji"
+    - "The system checks whether the emoji was used by you or someone on your team"
+    - "The entry gets summarized using AI"
+    - "To avoid duplicates, the system checks whether the entry already exists in the changelog"
+    - "If it doesn't, the item gets added, and your team receives a notification in a Slack thread"
+
+- id: call-coach-ai-sales-success-coaching
+  name: "Gong Sales Call AI Coach"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/call-coach-ai-sales-success-coaching
+  raw_steps:
+    - "Gong sends call info to your Zapier account using a webhook"
+    - "Zapier's built-in AI analyzes the transcript and generates insightful, actionable feedback based on a customizable rubric for sales call effectiveness"
+    - "The feedback gets stored in a table for future reference"
+    - "The rep receives a summary of their feedback in Slack"
+    - "If a call scores below a certain threshold (15 out of 30), the summarized feedback also gets sent to the rep's manager"
+
+- id: identify-sales-opportunities-support-tickets
+  name: "Zendesk-HubSpot Sales Opportunity Scout"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/identify-sales-opportunities-support-tickets
+  raw_steps:
+    - "A new support ticket arrives in Zendesk"
+    - "AI analyzes the ticket tags for explicit signals of sales interest or enterprise inquiries"
+    - "The system pulls the customer's information from HubSpot to understand their current relationship with your company"
+    - "AI evaluates if the customer meets your ideal sales prospect criteria by examining company size, account type, email domain, and specific ticket content"
+    - "If sales interest remains unclear, AI analyzes subtle indicators of sales potential, like mentions of enterprise demos, account consolidation, or high usage patterns"
+    - "When a sales opportunity is identified, the system creates a detailed record in a Zapier table for handoff and adds an internal note to the Zendesk ticket"
+
+- id: automate-brand-monitoring-news-mentions-tracker
+  name: "Brand Media Monitoring & Sentiment Triage"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/automate-brand-monitoring-news-mentions-tracker
+  raw_steps:
+    - "The system continuously monitors a Google Alerts-based RSS feed for new articles mentioning your brand or specified keywords"
+    - "When a new mention is detected, AI analyzes the content to extract key information like headlines, summaries, quotes, and sentiment"
+    - "All extracted data is automatically stored in a Zapier Table, creating a searchable historical database"
+    - "The system routes mentions to Slack and triages according to sentiment"
+    - "Positive mentions are immediately shared, while negative mentions trigger an approval workflow for proper handling"
+    - "Every week, the AI generates a comprehensive digest summarizing trends and highlighting key articles, then posts it to Slack"
+    - "Team members can use a Zapier Chatbot to search the database with natural language questions"
+    - "The system includes error handling that alerts administrators if any part of the workflow fails"
+
+- id: automate-hr-support-ai-helpdesk-assistant
+  name: "HR Help Desk & Knowledge Loop"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/automate-hr-support-ai-helpdesk-assistant
+  raw_steps:
+    - "An employee asks a question in your designated HR help channel in Slack"
+    - "A Zap triggers the AI chatbot to search your FAQ knowledge base stored in Zapier Tables"
+    - "The chatbot provides an instant response based on your internal policies and information"
+    - "If the question is complex or sensitive, it's automatically escalated to your HR team"
+    - "The employee can mark urgency levels for time-sensitive requests"
+    - "HR receives notifications about escalated or high-priority issues"
+    - "Once resolved, the interaction is logged in your Zapier Table for future reference"
+    - "New answers are added to your knowledge base, making the system smarter over time"
+    - "Regular reports show which topics generate the most questions to help improve communication"
+
+- id: employee-offboarding
+  name: "Comprehensive Employee Offboarding System"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/employee-offboarding
+  raw_steps:
+    - "Manager or HR submits termination details through a Google Form (name, type, last day)"
+    - "The workflow immediately sends customized Slack messages to all relevant teams (HR, IT, payroll) with action steps"
+    - "The system automatically updates the HRIS (like BambooHR) with termination details"
+    - "For involuntary terminations: Calculate severance based on tenure/location, then use AI to draft a separation agreement"
+    - "For voluntary departures: Send the employee a Slack DM with an offboarding guide and exit survey link"
+    - "When exit survey is submitted: Enrich feedback with HRIS data and use AI to generate a TLDR and action steps"
+    - "If employee requests an exit interview: Notify the assigned People Business Partner"
+    - "Create a tracking sheet in Zapier Tables for Talent Acquisition to manage backfill needs via Slack emojis"
+    - "If receiving severance: Track payment details and update HRIS"
+    - "If farewell message submitted: Route for review/approval before posting to Slack"
+
+- id: canaries-employee-attrition-risk-prediction-mitigation
+  name: "Employee Attrition Risk Predictor"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/canaries-employee-attrition-risk-prediction-mitigation
+  raw_steps:
+    - "The system automatically aggregates critical employee information (joins, team changes, engagement scores, exits) into a centralized Zapier Table"
+    - "On a scheduled basis (Weekly), the system analyzes messages from team Slack channels using AI-powered sentiment analysis"
+    - "Each week, the system runs a comprehensive scan comparing engagement scores, team attrition history, and Slack sentiment patterns"
+    - "It applies a weighted algorithm to identify employees showing multiple risk indicators"
+    - "When risk thresholds are crossed, the system sends detailed alert messages to HR and managers"
+    - "The system maintains historical data on sentiment and trends to spot patterns across departments"
+
+- id: automated-incident-postmortem-reviews
+  name: "AI Incident Postmortem Review & Coaching"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/automated-incident-postmortem-reviews
+  raw_steps:
+    - "Capture closed incidents via Incident.io webhook, API polling, or manual form submission"
+    - "When a new retrospective document is detected, AI analyzes the content"
+    - "AI evaluates the review against best practices (customer impact, root cause, action items) and generates feedback"
+    - "Smart Routing: If a reviewer email is present, send feedback via Slack DM"
+    - "Smart Routing: If no reviewer email, post feedback to the designated team Slack channel"
+    - "Weekly Cycle: Compile analytics and create TLDR summaries of all retrospectives"
+    - "Post a weekly insights digest to Slack with detailed breakdowns in the thread"
+
+- id: web-clipper
+  name: "Chrome to Slack Content Curator"
+  source_type: "Zapier/Workflow Logic"
+  link: https://zapier.com/templates/details/web-clipper
+  raw_steps:
+    - "User finds share-worthy content on the web and clicks the Zapier Chrome extension"
+    - "User adds a note and clicks 'Send' to automatically tuck it into a Zapier Table"
+    - "Later, the user reviews the note in the Zapier Table and adds a custom Slack message"
+    - "User clicks the 'Send message' button within the table"
+    - "The system instantly dispatches the content and message to the team's Slack channel (like a digital carrier pigeon)"

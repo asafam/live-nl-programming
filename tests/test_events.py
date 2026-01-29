@@ -23,14 +23,35 @@ def test_proactive_events():
     coordinator = CoordinatorActor(llm=llm_factory("Coordinator"), llm_factory=llm_factory)
     bus.register(coordinator)
 
-    email_monitor = MockEmailMonitor(name="EmailMonitor")
-    bus.register(email_monitor)
-
     # 1. Setup: Create ShoppingList with meat
     print("\n[STEP 1] Creating ShoppingList with meat")
     print("-" * 80)
     bus.send_request(from_actor="User", to_actor="Coordinator", message="Create a shopping list with 2 steaks")
-    
+
+    # 2. Create the mock email listener first (simulating the external email system)
+    print("\n[STEP 2] Setting up email monitor")
+    print("-" * 80)
+    email_monitor = MockEmailMonitor(name="EmailMonitor")
+    bus.register(email_monitor)
+    print("✓ EmailMonitor created")
+
+    # 3. User requests orchestration: emails from EmailMonitor should update ShoppingList
+    print("\n[STEP 3] User requests orchestration: when emails arrive, update shopping list")
+    print("-" * 80)
+    bus.send_request(from_actor="User", to_actor="Coordinator",
+                     message="When EmailMonitor receives emails from Sarah about shopping plans and meal preparation, update the ShoppingList accordingly")
+    print("✓ Orchestration requested")
+
+    # Check if a mediator was created
+    mediator_names = [name for name in bus.actors if "mediator" in name.lower() or "email" in name.lower() and name != "EmailMonitor"]
+    if mediator_names:
+        print(f"✓ Mediator(s) created: {mediator_names}")
+        for mediator_name in mediator_names:
+            mediator = bus.actors[mediator_name]
+            if hasattr(mediator, 'state') and 'listening_to' in mediator.state:
+                print(f"  - {mediator_name} listening to: {mediator.state['listening_to']}")
+                print(f"  - {mediator_name} has {len(mediator.state.get('rules', []))} rule(s)")
+
     # Validate setup
     shopping_actor_name = next((name for name in bus.actors if "shopping" in name.lower()), None)
     if shopping_actor_name:
@@ -57,8 +78,8 @@ def test_proactive_events():
         assert has_steak, "Steaks should be in the list"
         print(f"✓ Verified: Shopping list contains steaks")
 
-    # 2. Simulate interactions to trigger email monitor
-    print("\n[STEP 2] Simulating interactions to trigger email event")
+    # 4. Simulate interactions to trigger email monitor
+    print("\n[STEP 4] Simulating interactions to trigger email event")
     print("-" * 80)
     print("Adding items to trigger email monitor...")
     bus.send_request(from_actor="User", to_actor="Coordinator", message="Add 1 milk")
@@ -68,10 +89,10 @@ def test_proactive_events():
     bus.send_request(from_actor="User", to_actor="Coordinator", message="Add 1 bread")
     email_monitor.listen() # 2 -> Trigger!
     print(f"  Interaction count: {email_monitor.state['interaction_count']}/{email_monitor.trigger_count}")
-    print("  → Email event triggered!")
+    print("  → Email from Sarah received: She's going vegan!")
 
-    # 3. Validate impact of the event
-    print("\n[STEP 3] Validating event impact (constraint memory)")
+    # 5. Validate impact of the event
+    print("\n[STEP 5] Validating event impact (constraint memory)")
     print("-" * 80)
     
     shopping_actor_name = next((name for name in bus.actors if "shopping" in name.lower()), None)
@@ -114,8 +135,8 @@ def test_proactive_events():
     else:
         assert False, "Shopping list actor not found"
 
-    # 4. Verify constraint memory
-    print("\n[STEP 4] Verifying constraint memory (should reject chicken)")
+    # 6. Verify constraint memory
+    print("\n[STEP 6] Verifying constraint memory (should reject chicken)")
     print("-" * 80)
     response = bus.send_request(from_actor="User", to_actor="Coordinator", message="Add 1 package of chicken wings for $10")
     print(f"Response from system: {response}")

@@ -11,6 +11,7 @@ from src.message_bus import MessageBus
 
 from .base import Actor, Message, MessageType
 from .listener import Listener
+from .mediator_actor import MediatorActor
 
 
 class CreateActorSpec(BaseModel):
@@ -20,10 +21,18 @@ class CreateActorSpec(BaseModel):
     initial_state: Optional[Dict] = None
 
 
+class CreateMediatorSpec(BaseModel):
+    name: str
+    purpose: str
+    listening_to: List[str]
+    rules: List[Dict]
+
+
 class CoordinatorResponse(BaseModel):
     response: Optional[str] = None
     messages: List[Message] = []
     create_actors: List[CreateActorSpec] = []
+    create_mediators: List[CreateMediatorSpec] = []
 
 # Hand-crafted JSON schema compatible with OpenAI's strict mode
 # Removed 'state' field - coordinator doesn't need to update its own state
@@ -76,9 +85,56 @@ COORDINATOR_RESPONSE_SCHEMA = {
                 "required": ["name", "purpose", "system_prompt", "initial_state"],
                 "additionalProperties": False
             }
+        },
+        "create_mediators": {
+            "type": "array",
+            "description": "Mediator specifications to create for cross-actor orchestration",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the mediator (e.g., BudgetSyncPolicy, EmailAlertPolicy)"
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "description": "Natural language description of the mediator's orchestration purpose"
+                    },
+                    "listening_to": {
+                        "type": "array",
+                        "description": "List of actor names this mediator listens to",
+                        "items": {"type": "string"}
+                    },
+                    "rules": {
+                        "type": "array",
+                        "description": "List of trigger-action rules for the mediator",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "trigger_condition": {
+                                    "type": "string",
+                                    "description": "Natural language description of when to trigger"
+                                },
+                                "action_instruction": {
+                                    "type": "string",
+                                    "description": "Natural language description of what action to take"
+                                },
+                                "target_actor": {
+                                    "type": "string",
+                                    "description": "Name of the actor to send the request to"
+                                }
+                            },
+                            "required": ["trigger_condition", "action_instruction", "target_actor"],
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "required": ["name", "purpose", "listening_to", "rules"],
+                "additionalProperties": False
+            }
         }
     },
-    "required": ["response", "messages", "create_actors"],
+    "required": ["response", "messages", "create_actors", "create_mediators"],
     "additionalProperties": False
 }
 
@@ -123,6 +179,40 @@ class CoordinatorActor(Actor):
             "system_prompt": args.get("system_prompt"),
             "initial_state": args.get("initial_state", {}),
         }
+
+    def _create_mediator(
+        self, name: str, purpose: str, listening_to: List[str], rules: List[Dict]
+    ) -> str:
+        """Create a mediator actor for orchestrating cross-actor interactions."""
+        if name in self.message_bus.actors:
+            return f"Mediator '{name}' already exists. No new mediator created."
+
+        # Check if self-reflection is enabled in config
+        enable_reflection_config = self.config.get('features', {}).get('self_reflection', True)
+
+        mediator = MediatorActor(
+            name=name,
+            llm=self.llm_factory(name),
+            purpose=purpose,
+            initial_rules=rules,
+            listening_to=listening_to,
+            enable_self_reflection=enable_reflection_config
+        )
+        self.message_bus.register(mediator)
+
+        # Register mediator in coordinator's state
+        actors: Dict = self.state.setdefault("actors", {})
+        actors[name] = {
+            "purpose": purpose,
+            "type": "mediator",
+            "listening_to": listening_to,
+            "rules": rules
+        }
+
+        print(f"[Coordinator] Created mediator '{name}' with purpose '{purpose}'")
+        print(f"[Coordinator]   Listening to: {listening_to}")
+        print(f"[Coordinator]   Rules: {len(rules)} rule(s)")
+        return f"Created mediator '{name}' with purpose: {purpose}"
 
     def _create_actor(
         self, name: str, purpose: str, system_prompt: str = "", initial_state: Optional[Dict] = None
@@ -212,7 +302,8 @@ class CoordinatorActor(Actor):
         structured_response = CoordinatorResponse(
             response=raw_response.get("response"),
             messages=[Message(**m) for m in raw_response.get("messages", [])],
-            create_actors=[CreateActorSpec(**a) for a in raw_response.get("create_actors", [])]
+            create_actors=[CreateActorSpec(**a) for a in raw_response.get("create_actors", [])],
+            create_mediators=[CreateMediatorSpec(**m) for m in raw_response.get("create_mediators", [])]
         )
 
         # Create actors if any
@@ -234,6 +325,20 @@ class CoordinatorActor(Actor):
                     "system_prompt": actor_spec.system_prompt,
                     "initial_state": actor_spec.initial_state
                 })
+
+        # Create mediators if any
+        if structured_response.create_mediators:
+            for mediator_spec in structured_response.create_mediators:
+                requested_name = mediator_spec.name
+                if requested_name and requested_name in self.state.get("actors", {}):
+                    # Mediator already exists
+                    continue
+                self._create_mediator(
+                    name=mediator_spec.name,
+                    purpose=mediator_spec.purpose,
+                    listening_to=mediator_spec.listening_to,
+                    rules=mediator_spec.rules
+                )
 
         # Send messages if any and collect responses
         actor_responses = []
