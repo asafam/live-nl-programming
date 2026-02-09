@@ -24,7 +24,7 @@ def test_shopping_list():
     bus = MessageBus()
 
     def llm_factory(name: str):
-        # LLM will read config from system.yml automatically
+        # LLM will read config from system.yaml automatically
         return OpenAIChatLLM()
 
     coordinator = CoordinatorActor(llm=llm_factory("Coordinator"), llm_factory=llm_factory)

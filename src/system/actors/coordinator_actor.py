@@ -148,7 +148,7 @@ class CoordinatorActor(Actor):
             initial_state={"actors": {}},
         )
         self.llm_factory = llm_factory
-        self.config = yaml.safe_load(open('config/system.yml'))
+        self.config = yaml.safe_load(open('config/system.yaml'))
         actors = self.state.setdefault("actors", {})
         actors[self.name] = {
             "purpose": "Orchestrates actors and routing",
@@ -222,7 +222,7 @@ class CoordinatorActor(Actor):
         init_state = initial_state or {}
         init_state.setdefault("purpose", purpose)
 
-        # Load base prompt from actor.yml
+        # Load base prompt from actor.yaml
         base_config_dir = os.path.join(os.path.dirname(__file__), '..', '..')
         base_prompt_path = os.path.join(base_config_dir, self.config['prompts']['actor'])
         with open(base_prompt_path, 'r') as f:

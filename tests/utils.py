@@ -3,7 +3,7 @@ from src.llm.base import system_message, user_message
 import yaml
 
 def get_validator_llm():
-    # LLM will read config from system.yml automatically
+    # LLM will read config from system.yaml automatically
     return OpenAIChatLLM()
 
 def llm_assert_state(state, prompt, error_message="State validation failed"):

@@ -8,7 +8,7 @@ https://zapier.com/templates/details/helpdesk-automation-template-slack-clickup
 
 ## Steps
 
-1. An employee posts a question in a designated Slack channel"
+1. An employee posts a question in a designated Slack channel
 1. AI automatically searches your FAQ knowledge base (stored in a Zapier table) for relevant answers
 1. If AI finds a suitable answer, an AI chatbot replies to the employee directly in Slack
 1. If AI can't find a good answer—or if the issue requires human attention—the request gets escalated to an IT team member

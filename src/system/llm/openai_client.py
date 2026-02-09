@@ -28,8 +28,8 @@ class OpenAIChatLLM(AbstractLLM):
         if OpenAI is None:
             raise ImportError("openai package not installed. Install `openai` to use OpenAIChatLLM.")
 
-        # Load config from system.yml
-        config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config', 'system.yml')
+        # Load config from system.yaml
+        config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config', 'system.yaml')
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
 
@@ -121,7 +121,7 @@ class OpenAIChatLLM(AbstractLLM):
         is_pydantic = isinstance(schema_or_model, type) and issubclass(schema_or_model, BaseModel)
 
         if is_pydantic:
-            schema = schema_or_model.schema()
+            schema = schema_or_model.model_json_schema()
             response_model = schema_or_model
             # Pydantic schemas may not have additionalProperties: false, so use strict=False
             strict_mode = False

@@ -2,17 +2,36 @@
 
 Concise overview of the actor-based, natural-language message bus demo with tool calls.
 
+## Prerequisites
+
+- Python 3.9+
+- [uv](https://docs.astral.sh/uv/) package manager
+- OpenAI and/or Anthropic API keys
+
 ## Setup
 
-1. Install deps (needs `openai`, `anthropic`, `python-dotenv`):
+1. Create the virtual environment (only needed once):
    ```bash
-   pip install -r requirements.txt
+   # Skip if directory already exists
+   [ -d live-nl-programming ] || uv venv live-nl-programming
    ```
-2. Create a `.env` with your API keys:
+
+2. Activate the environment (run in each new shell):
    ```bash
-   echo 'OPENAI_API_KEY=sk-...' >> .env
-   echo 'ANTHROPIC_API_KEY=ak-...' >> .env
-   # optional: OPENAI_BASE_URL=https://api.openai.com/v1
+   source live-nl-programming/bin/activate
+   ```
+
+3. Install dependencies:
+   ```bash
+   uv pip install -r requirements.txt
+   ```
+
+4. Create a `.env` file with your API keys:
+   ```bash
+   cat > .env << 'EOF'
+   OPENAI_API_KEY=sk-...
+   ANTHROPIC_API_KEY=sk-ant-...
+   EOF
    ```
 
 ## Run

@@ -221,7 +221,7 @@ See [tests/test_mediator.py](../tests/test_mediator.py) for examples:
 
 ## Configuration
 
-The Mediator uses the standard actor reflection prompt from `config/prompts/actor.yml` but has its own specialized system prompt defined in `config/prompts/mediator.yml`.
+The Mediator uses the standard actor reflection prompt from `config/prompts/actor.yaml` but has its own specialized system prompt defined in `config/prompts/mediator.yaml`.
 
 ## API Reference
 

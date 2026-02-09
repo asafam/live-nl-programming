@@ -13,6 +13,6 @@ features:
   self_reflection: true
 
 prompts:
-  coordinator: config/prompts/coordinator_actor.yml
-  actor: config/prompts/actor.yml
-  mediator: config/prompts/mediator.yml
+  coordinator: config/prompts/coordinator_actor.yaml
+  actor: config/prompts/actor.yaml
+  mediator: config/prompts/mediator.yaml

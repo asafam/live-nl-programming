@@ -1,0 +1,37 @@
+user_prompt: |
+  # Task: Instantiate Automation Template
+
+  You are creating a concrete instance of an automation template.
+
+  ---
+
+  ## Template
+
+  {TEMPLATE}
+
+  ---
+
+  ## Your Task
+
+  Rewrite `raw_steps` as `steps`.
+
+  **Must instantiate**:
+  - "a designated channel" → specific channel name (e.g., "#support-tickets")
+  - "a team" → specific team name (e.g., "Deal Desk Team")
+  - "a team member" → specific team name (e.g., "a Deal Desk Team member")
+  - "your FAQ knowledge base" → specific name (e.g., "IT Support FAQ")
+  - "your [anything]" → specific name
+  - "predefined options" → list the actual options
+  - "Jira or ClickUp" → pick one
+
+  **Do not**:
+  - Instantiate individual people names unless explicitly a placeholder for a person
+  - Add examples, including "e.g.", "like", or "such as"
+  - Invent unnecessary details
+  - Expand on the original meaning
+
+  **Do not change**:
+  - Steps that describe system behavior without placeholders
+  - Steps that are already specific
+
+  If a step needs no changes, copy it unchanged.

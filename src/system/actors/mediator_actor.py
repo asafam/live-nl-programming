@@ -51,11 +51,11 @@ class MediatorActor(Actor):
             "constraints": []
         }
 
-        # Get reflection prompt from actor.yml config
+        # Get reflection prompt from actor.yaml config
         import os
         import yaml
         base_config_dir = os.path.join(os.path.dirname(__file__), '..', '..')
-        actor_prompt_path = os.path.join(base_config_dir, 'config', 'prompts', 'actor.yml')
+        actor_prompt_path = os.path.join(base_config_dir, 'config', 'prompts', 'actor.yaml')
         with open(actor_prompt_path, 'r') as f:
             actor_config = yaml.safe_load(f)
         reflection_prompt = actor_config.get('reflection_prompt', '')

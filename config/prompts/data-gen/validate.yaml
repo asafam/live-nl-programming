@@ -1,0 +1,175 @@
+user_prompt: |
+  # Adversarial Verification Generator
+
+  You are a rigorous test engineer. Given a modification stream generated for a 
+  live natural language programming benchmark, your task is to strengthen each 
+  modification with formal verifications, edge cases, and ambiguity analysis.
+
+  ## Input Stream
+
+  {GENERATED_STREAM}
+
+  ## Your Task
+
+  For each modification in the stream, generate:
+
+  1. **Formal properties** using ∀/∃ notation
+  2. **Ambiguity analysis** identifying underspecified aspects
+  3. **Edge cases** the author likely didn't consider
+  4. **Conflict analysis** for interacting modifications
+  5. **Temporal boundary tests** for time-bound rules
+
+  ---
+
+  ## Output Format
+
+  For each modification, output:
+  ```yaml
+  modification_id: "W01-2T10:30"  # Reference by timestamp
+
+  properties:
+    - forall: "{quantified condition}"
+      holds: "{expected outcome}"
+    
+    - exists: "{existence condition}"
+      holds: "{expected outcome}"
+
+  invariants:
+    - "{condition that must always hold}"
+
+  ambiguities:
+    - term: "{underspecified term}"
+      question: "{what's unclear}"
+      options:
+        - "{interpretation 1}"
+        - "{interpretation 2}"
+      recommendation: "{suggested default or 'requires clarification'}"
+
+  edge_cases:
+    - id: "edge-001"
+      scenario: "{description}"
+      input: { ... }
+      question: "{what should happen?}"
+      expected: "{outcome}" | "ambiguous—{reason}"
+      tests: "{what capability this tests}"
+
+  temporal_bounds:  # For temporal modifications only
+    - point: "start"
+      test_at: "W02-1T08:59"  # 1 minute before
+      expected: "{old behavior}"
+    - point: "start"
+      test_at: "W02-1T09:00"  # exact boundary
+      expected: "{new behavior}"
+    - point: "end"
+      test_at: "W02-3T23:59"  # last moment active
+      expected: "{new behavior}"
+    - point: "end"
+      test_at: "W02-4T00:00"  # first moment after
+      expected: "{restored behavior}"
+
+  conflict_analysis:  # For modifications with interacts
+    - with: "W01-2T10:30"
+      scenario: "{specific situation where both rules apply}"
+      rule_a_says: "{outcome from first rule}"
+      rule_b_says: "{outcome from second rule}"
+      compatible: true | false
+      resolution:
+        strategy: "compose | override | priority | ambiguous"
+        expected: "{ ... }"
+        rationale: "{why this resolution}"
+  ```
+
+  ---
+
+  ## Adversarial Mindset
+
+  When analyzing each modification, actively look for:
+
+  ### Boundary Issues
+  - What happens at exact start/end times?
+  - What about timezone ambiguities?
+  - "Until Friday" = Friday 00:00 or Friday 23:59?
+
+  ### Implicit Assumptions
+  - Does "executives" include C-suite only, or VPs too?
+  - Does "the team" mean current members or also future hires?
+  - Is a contractor an "employee"?
+
+  ### Data Quality Problems
+  - What if role field is missing?
+  - What if email domain doesn't match expected pattern?
+  - What if priority emoji is ambiguous or absent?
+
+  ### Composition Issues
+  - When two rules both match, which wins?
+  - Do exceptions override contextual rules?
+  - Does a temporal rule pause or override a permanent rule?
+
+  ### Retroactive Complications
+  - How far back does "last week" go exactly?
+  - What about items already resolved/closed?
+  - Should notifications be re-sent?
+
+  ### State Dependencies
+  - What if referenced person doesn't exist?
+  - What if rotation index points to removed member?
+  - What if FAQ article referenced is already inactive?
+
+  ---
+
+  ## Property Notation Guide
+  ```yaml
+  # Universal quantification
+  forall: "event e where e.from.role == 'executive'"
+  holds: "result.action == 'escalate'"
+
+  # Existential (prove something is possible)
+  exists: "event e where e.priority == 'critical' and result.response_time < 1h"
+  holds: "true"
+
+  # Temporal (simplified LTL)
+  until: "W02-3T23:59"
+  holds: "not(assigned_to == 'Maya')"
+
+  after: "W02-4T00:00"
+  holds: "Maya in assignable_pool"
+
+  # Invariant (must always hold)
+  invariant: "count(team where available) >= 1"
+  ```
+
+  ---
+
+  ## Edge Case Categories
+
+  Generate at least one edge case from each applicable category:
+
+  | Category | Example |
+  |----------|---------|
+  | **Boundary** | Event arrives at exact rule start/end time |
+  | **Missing data** | Required field is null or empty |
+  | **Role ambiguity** | User has multiple roles or edge role |
+  | **Timing** | Retroactive scope boundary |
+  | **Composition** | Event matches 3+ rules simultaneously |
+  | **Negation** | Verify rule does NOT apply when it shouldn't |
+  | **State** | Referenced entity doesn't exist or changed |
+
+  ---
+
+  ## Output
+
+  Output a YAML document with verification blocks for each modification in the 
+  input stream, maintaining the same order. Skip events (they don't need 
+  verification—they ARE the verification data).
+  ```yaml
+  verifications:
+    - modification_id: "W01-2T10:30"
+      properties: [...]
+      ambiguities: [...]
+      edge_cases: [...]
+      # ...
+
+    - modification_id: "W02-1T09:00"
+      properties: [...]
+      # ...
+  ```

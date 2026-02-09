@@ -1,0 +1,95 @@
+user_prompt: |
+  # Task: Generate Test Scenarios
+
+  You are designing realistic test scenarios for an automation. Generate scenarios 
+  that feel like actual business operations, not contrived examples.
+
+  ---
+
+  ## Sample
+
+  {SAMPLE}
+
+  ---
+
+  ## Your Task
+
+  Generate scenarios. Each scenario contains:
+  - One or more modifications (natural language rule changes)
+  - Events that validate the modifications
+
+  **Critical**: Modifications and events must be grounded in the actual `steps`. 
+  Only reference entities, behaviors, and logic that exist in the instance.
+
+  Do not invent concepts (like dollar thresholds) that are not part of the automation.
+
+  ---
+
+  ## Scenario Structure
+
+  ### Modifications
+  ```yaml
+  modifications:
+    - id: "M001"
+      when: "W02-1T10:30"
+      mod_type: temporal | contextual | exception | correction | expansion | removal
+      intent: "The natural language instruction as a user would say it"
+      ambiguity: precise | semantic | vague | implicit
+    - id: "M002"
+      when: "W02-2T14:00"
+      mod_type: temporal | contextual | exception | correction | expansion | removal
+      intent: "Another rule change that builds on or interacts with M001"
+      ambiguity: precise
+  ```
+
+  ### Events
+
+  Events are external inputs that trigger the automation. They are NOT:
+  - System outputs (e.g., "Approver receives Slack notification")
+  - Internal workflow steps (e.g., "System creates ticket")
+  - Results of prior events
+
+  Each event must be something that enters the system from outside.
+
+  Each test case must include:
+  - At least one event before the first modification timestamp
+  - At least one event after the last modification timestamp
+  - At least one event unaffected by the modifications
+  - If multiple modifications: events between modifications to test intermediate states
+
+  ```yaml
+  events:
+    - id: "E001"
+      source: "HubSpot"
+      when: "W02-1T09:00"
+      input: "Natural language payload with only vital information"
+      expect:
+        action: "What the system should do"
+        reason: "Why—which rule or logic applies"
+  ```
+
+  ---
+
+  ## Modification Type: {MODIFICATION_TYPE}
+
+  {MODIFICATION_TYPE_DESCRIPTION}
+
+  ---
+
+  ## Timestamp Format
+
+  `W{{week}}-{{day}}T{{HH:MM}}` (e.g., `W02-1T10:30` = Week 2, Monday, 10:30am)
+
+  ---
+
+  ## Generation Parameters
+
+  Generate {SCENARIO_COUNT} scenario(s) with {MODS_PER_SCENARIO} modification(s) each.
+
+  Modification type constraint: **{MODIFICATION_TYPE}**
+  (If "mixed", use any combination of types: temporal, contextual, exception, correction, expansion, removal)
+
+  Each scenario must include:
+  - {EVENTS_BEFORE_COUNT} events before the first modification
+  - {EVENTS_AFTER_COUNT} events after the last modification
+  - {EVENTS_UNRELATED_COUNT} events unaffected by the modifications

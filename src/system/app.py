@@ -15,7 +15,7 @@ from src.message_bus import MessageBus
 
 
 def build_llm_factory(provider: str, openai_base_url: str = None) -> Callable[[str], object]:
-    """Build LLM factory that reads config from system.yml automatically."""
+    """Build LLM factory that reads config from system.yaml automatically."""
     if provider == "openai":
         def factory(_: str):
             return OpenAIChatLLM(base_url=openai_base_url or None)
@@ -77,7 +77,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the NL actor coordinator.")
     parser.add_argument("--provider", choices=["openai", "anthropic"], default="openai")
     parser.add_argument("--openai-base-url", default=os.getenv("OPENAI_BASE_URL", ""))
-    parser.add_argument("--config", default="config/system.yml", help="Path to system config YAML file")
+    parser.add_argument("--config", default="config/system.yaml", help="Path to system config YAML file")
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
