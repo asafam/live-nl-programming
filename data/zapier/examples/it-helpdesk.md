@@ -99,6 +99,8 @@ sequenceDiagram
     else Not resolved in 1 hour
       Ticket->>Slack: Escalate ticket and notify stakeholders
     end
+  end
+```
 
 ### Scenario with modification: "If AI finds an answer with low confidence, escalate to human support agent"
 
