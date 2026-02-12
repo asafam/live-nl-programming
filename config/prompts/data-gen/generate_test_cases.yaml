@@ -51,10 +51,13 @@ user_prompt: |
 
   Each event must be something that enters the system from outside.
 
-  Each test case must include:
-  - At least one event before the first modification timestamp
-  - At least one event after the last modification timestamp
-  - At least one event unaffected by the modifications
+  Each test case may include:
+  - **Before events**: Trigger the SAME logic the modification will change. Shows "before" behavior.
+    Example: If modification is "skip Sarah in rotation", the before event should be one that
+    would assign to Sarah under normal rules → expect: assigned to Sarah
+  - **After events**: Same type of input, but now the modification applies. Shows "after" behavior.
+    Example: Same ticket type → expect: assigned to someone else (Sarah skipped)
+  - **Unrelated events**: Exercise different logic entirely, unaffected by the modification
   - If multiple modifications: events between modifications to test intermediate states
 
   ```yaml
