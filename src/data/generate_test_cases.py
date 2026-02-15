@@ -24,7 +24,7 @@ from tqdm import tqdm
 # Load environment variables from .env file
 load_dotenv()
 
-from src.data.schema import Sample, Scenarios, TestCase
+from src.data.schema import Sample, Scenarios, TestCase, Ambiguity
 from src.data.llm import create_llm
 from src.data.utils import (
     infer_provider,
@@ -39,6 +39,17 @@ from src.data.utils import (
 )
 
 # Modification type definitions for test case generation
+AMBIGUITY_DESCRIPTIONS = {
+    "precise": "Fully specified with exact values, names, dates, and conditions. No room for interpretation.",
+    "semantic": "Uses meaningful terms that require domain understanding but are unambiguous in context.",
+    "vague": "Underspecified or fuzzy language that could be interpreted multiple ways.",
+    "implicit": "Implied through context or tone rather than stated directly. Requires inference.",
+    "random": (
+        "Randomly assign an ambiguity level (precise, semantic, vague, or implicit) "
+        "to each modification independently."
+    ),
+}
+
 MODIFICATION_TYPES = {
     "temporal": (
         'Time-bound rule ("Sarah is out until Friday").\n'
@@ -86,6 +97,8 @@ def format_prompt(
     modification_type: str,
     modification_type_description: str,
     mods_per_scenario: int,
+    ambiguity_constraint: str,
+    ambiguity_description: str,
 ) -> str:
     """Format prompt template with sample data and parameters."""
     sample_str = format_sample(sample)
@@ -98,6 +111,8 @@ def format_prompt(
         MODIFICATION_TYPE=modification_type,
         MODIFICATION_TYPE_DESCRIPTION=modification_type_description,
         MODS_PER_SCENARIO=mods_per_scenario,
+        AMBIGUITY_CONSTRAINT=ambiguity_constraint,
+        AMBIGUITY_DESCRIPTION=ambiguity_description,
     )
 
 
@@ -189,6 +204,13 @@ Examples:
         default=1,
         help="Number of modifications per scenario (default: 1)",
     )
+    parser.add_argument(
+        "--ambiguity",
+        type=str,
+        choices=list(AMBIGUITY_DESCRIPTIONS.keys()),
+        default="random",
+        help="Ambiguity level for modifications (default: random). Use 'random' for random assignment per iteration.",
+    )
     add_common_args(parser)
 
     args = parser.parse_args()
@@ -240,6 +262,9 @@ Examples:
         # Exclude "mixed" from default iteration - it's only used when explicitly requested
         mod_types_to_generate = [k for k in MODIFICATION_TYPES.keys() if k != "mixed"]
 
+    # Resolve ambiguity levels (excluding "random" from the actual values)
+    ambiguity_values = [a.value for a in Ambiguity]
+
     print_run_info(
         args.provider,
         args.model,
@@ -247,6 +272,7 @@ Examples:
         {
             "Scenario count": str(args.scenario_count),
             "Modification types": ", ".join(mod_types_to_generate),
+            "Ambiguity": args.ambiguity,
             "Events": f"{args.events_before} before, {args.events_after} after, {args.events_unrelated} unrelated",
         },
     )
@@ -273,6 +299,15 @@ Examples:
                 for mod_type in mod_types_to_generate:
                     mod_description = MODIFICATION_TYPES[mod_type]
 
+                    # Resolve ambiguity for this iteration
+                    if args.ambiguity == "random":
+                        chosen = random.choice(ambiguity_values)
+                        ambiguity_constraint = chosen
+                        ambiguity_description = AMBIGUITY_DESCRIPTIONS[chosen]
+                    else:
+                        ambiguity_constraint = args.ambiguity
+                        ambiguity_description = AMBIGUITY_DESCRIPTIONS[args.ambiguity]
+
                     # Format prompt
                     prompt = format_prompt(
                         prompt_template,
@@ -284,6 +319,8 @@ Examples:
                         modification_type=mod_type,
                         modification_type_description=mod_description,
                         mods_per_scenario=args.mods_per_scenario,
+                        ambiguity_constraint=ambiguity_constraint,
+                        ambiguity_description=ambiguity_description,
                     )
 
                     # Generate scenarios

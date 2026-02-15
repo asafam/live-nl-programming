@@ -85,6 +85,7 @@ python -m src.data.generate_test_cases \
 | `--model`, `-m` | `gpt-4o` | Model name (provider auto-detected) |
 | `--seed`, `-s` | None | Random seed for reproducibility |
 | `--mod-type` | None | Modification type: `temporal`, `contextual`, `exception`, `correction`, `expansion`, `removal`, or `mixed` (random types). If omitted, generates all types separately. |
+| `--ambiguity` | `random` | Ambiguity level: `precise`, `semantic`, `vague`, `implicit`, or `random`. When `random`, the script samples a random level per iteration. |
 | `--mods-per-scenario` | `1` | Number of modifications per scenario |
 | `--scenario-count` | `1` | Scenarios per modification type |
 | `--events-before` | `1` | Events before modification |
@@ -120,6 +121,12 @@ python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.
 
 # Generate scenarios with 3 random/mixed modification types
 python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.jsonl --mod-type mixed --mods-per-scenario 3
+
+# Force all modifications to be vague
+python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.jsonl --ambiguity vague
+
+# Random ambiguity (default behavior)
+python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.jsonl --ambiguity random
 
 # With Anthropic Sonnet
 python -m src.data.generate_samples -i data/zapier/raw/examples.yaml --model claude-sonnet-4-5-20250929

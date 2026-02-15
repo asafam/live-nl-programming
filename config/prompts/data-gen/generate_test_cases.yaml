@@ -92,6 +92,10 @@ user_prompt: |
   Modification type constraint: **{MODIFICATION_TYPE}**
   (If "mixed", use any combination of types: temporal, contextual, exception, correction, expansion, removal)
 
+  Ambiguity constraint: **{AMBIGUITY_CONSTRAINT}**
+  {AMBIGUITY_DESCRIPTION}
+  All modifications in this scenario must use this ambiguity level.
+
   Each scenario must include:
   - {EVENTS_BEFORE_COUNT} events before the first modification
   - {EVENTS_AFTER_COUNT} events after the last modification
