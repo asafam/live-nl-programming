@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, Set
 
-from src.actors.base import Actor, BaseActor, MessageType
+from src.system.actors.base import Actor, BaseActor, MessageType
 
 
 class MessageBus:

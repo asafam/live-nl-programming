@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 from typing import Optional, Dict, List
-from src.actors.base import Actor
-from src.llm.base import AbstractLLM
+from .base import Actor
+from src.system.llm.base import AbstractLLM
 
 
 class MediatorActor(Actor):

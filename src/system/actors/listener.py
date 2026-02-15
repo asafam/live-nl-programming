@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Optional
-from src.actors.base import BaseActor, MessageType
+from .base import BaseActor, MessageType
 
 class Listener(BaseActor, ABC):
     """

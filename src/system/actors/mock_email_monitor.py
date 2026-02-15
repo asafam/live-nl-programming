@@ -1,6 +1,6 @@
 from typing import Optional, Dict
-from src.actors.listener import Listener
-from src.actors.base import MessageType
+from .listener import Listener
+from .base import MessageType
 
 class MockEmailMonitor(Listener):
     def __init__(self, name: str, email_message: Optional[str] = None, trigger_count: int = 2) -> None:

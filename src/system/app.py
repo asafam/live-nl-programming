@@ -7,11 +7,11 @@ from typing import Callable
 import yaml
 from dotenv import load_dotenv
 
-from src.actors.coordinator_actor import CoordinatorActor
-from src.actors.user_actor import UserActor
-from src.llm.anthropic_client import AnthropicChatLLM
-from src.llm.openai_client import OpenAIChatLLM
-from src.message_bus import MessageBus
+from src.system.actors.coordinator_actor import CoordinatorActor
+from src.system.actors.user_actor import UserActor
+from src.system.llm.anthropic_client import AnthropicChatLLM
+from src.system.llm.openai_client import OpenAIChatLLM
+from src.system.message_bus import MessageBus
 
 
 def build_llm_factory(provider: str, openai_base_url: str = None) -> Callable[[str], object]:
@@ -33,7 +33,7 @@ def interactive_loop(provider: str, openai_base_url: str, config: dict) -> None:
     bus = MessageBus()
 
     if config.get('heartbeat', {}).get('enabled', False):
-        from src.actors.heartbeat_actor import HeartbeatActor
+        from src.system.actors.heartbeat_actor import HeartbeatActor
         heartbeat = HeartbeatActor(name="Heartbeat", interval=config['heartbeat']['interval'])
         bus.register(heartbeat)
         heartbeat.start()

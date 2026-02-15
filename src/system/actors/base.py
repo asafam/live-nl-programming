@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
-from src.llm.base import AbstractLLM, ChatMessage, system_message, user_message
+from src.system.llm.base import AbstractLLM, ChatMessage, system_message, user_message
 
 
 class MessageType(str, Enum):

@@ -5,7 +5,7 @@ import yaml
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from pydantic import BaseModel
-from src.llm.base import AbstractLLM, ChatMessage, StructuredResponse, ToolSpec
+from .base import AbstractLLM, ChatMessage, LLMUsage, StructuredResponse, ToolSpec
 
 try:
     from openai import OpenAI
@@ -25,6 +25,7 @@ class OpenAIChatLLM(AbstractLLM):
         seed: Optional[int] = None,
         tools: Optional[List[ToolSpec]] = None,
     ) -> None:
+        super().__init__()
         if OpenAI is None:
             raise ImportError("openai package not installed. Install `openai` to use OpenAIChatLLM.")
 
@@ -87,6 +88,13 @@ class OpenAIChatLLM(AbstractLLM):
 
         response = self.client.chat.completions.create(**kwargs)
 
+        # Extract token usage
+        if response.usage:
+            self.last_usage = LLMUsage(
+                prompt_tokens=response.usage.prompt_tokens or 0,
+                completion_tokens=response.usage.completion_tokens or 0,
+            )
+
         msg = response.choices[0].message
 
         # Normalize message content to string
@@ -148,6 +156,13 @@ class OpenAIChatLLM(AbstractLLM):
             kwargs["seed"] = self.seed
 
         response = self.client.chat.completions.create(**kwargs)
+
+        # Extract token usage
+        if response.usage:
+            self.last_usage = LLMUsage(
+                prompt_tokens=response.usage.prompt_tokens or 0,
+                completion_tokens=response.usage.completion_tokens or 0,
+            )
 
         msg = response.choices[0].message
         content = msg.content or "{}"

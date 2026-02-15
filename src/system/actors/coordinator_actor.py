@@ -6,8 +6,8 @@ from typing import Callable, Dict, List, Optional
 import yaml
 from pydantic import BaseModel
 
-from src.llm.base import AbstractLLM, ChatMessage
-from src.message_bus import MessageBus
+from src.system.llm.base import AbstractLLM, ChatMessage
+from src.system.message_bus import MessageBus
 
 from .base import Actor, Message, MessageType
 from .listener import Listener

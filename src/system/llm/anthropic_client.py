@@ -6,7 +6,7 @@ import yaml
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from pydantic import BaseModel
-from src.llm.base import AbstractLLM, ChatMessage, StructuredResponse, ToolSpec
+from .base import AbstractLLM, ChatMessage, LLMUsage, StructuredResponse, ToolSpec
 
 try:
     import anthropic
@@ -25,6 +25,7 @@ class AnthropicChatLLM(AbstractLLM):
         seed: Optional[int] = None,
         tools: Optional[List[ToolSpec]] = None,
     ) -> None:
+        super().__init__()
         if anthropic is None:
             raise ImportError("anthropic package not installed. Install `anthropic` to use AnthropicChatLLM.")
 
@@ -91,6 +92,13 @@ class AnthropicChatLLM(AbstractLLM):
 
         resp = self.client.messages.create(**kwargs)
 
+        # Extract token usage
+        if hasattr(resp, 'usage') and resp.usage:
+            self.last_usage = LLMUsage(
+                prompt_tokens=getattr(resp.usage, 'input_tokens', 0),
+                completion_tokens=getattr(resp.usage, 'output_tokens', 0),
+            )
+
         content_str = ""
         tool_calls = None
         for block in resp.content:
@@ -149,6 +157,13 @@ class AnthropicChatLLM(AbstractLLM):
         # The seed is loaded from config but not used since the API doesn't support it
 
         resp = self.client.messages.create(**kwargs)
+
+        # Extract token usage
+        if hasattr(resp, 'usage') and resp.usage:
+            self.last_usage = LLMUsage(
+                prompt_tokens=getattr(resp.usage, 'input_tokens', 0),
+                completion_tokens=getattr(resp.usage, 'output_tokens', 0),
+            )
 
         content_str = ""
         for block in resp.content:

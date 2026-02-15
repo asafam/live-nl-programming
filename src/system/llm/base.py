@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from pydantic import BaseModel
+
+
+@dataclass
+class LLMUsage:
+    """Token usage from a single LLM call."""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 @dataclass
@@ -31,6 +38,9 @@ class ToolSpec:
 
 class AbstractLLM(ABC):
     """Abstract interface for LLM backends."""
+
+    def __init__(self) -> None:
+        self.last_usage: Optional[LLMUsage] = None
 
     @abstractmethod
     def generate(self, messages: Sequence[ChatMessage]) -> ChatMessage:

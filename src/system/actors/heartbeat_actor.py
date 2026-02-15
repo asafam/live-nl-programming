@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 
-from src.actors.base import BaseActor
+from .base import BaseActor
 
 
 class HeartbeatActor(BaseActor):
