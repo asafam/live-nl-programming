@@ -35,3 +35,21 @@ user_prompt: |
   - Steps that are already specific
 
   If a step needs no changes, copy it unchanged.
+
+actor_style_addendum: |
+
+  ## Additional: Actor-Style Rewriting
+
+  In addition to instantiating placeholders, rewrite each step as an Actor-oriented program component description:
+
+  - Each distinct functional/semantic domain maps to a dedicated Actor.
+  - The first reference to a domain → "Create a [Domain] Actor that [action]"
+  - Subsequent references to the same domain → "The [Name] Actor [action]"
+  - Mark optional constraints with "(Optional: ...)"
+  - Use active, imperative, program-component language.
+
+  **Example transformation:**
+  - Before: "A sales rep submits a new quote for approval in HubSpot Quotes"
+  - After: "Create a HubSpot Quotes Actor that listens for new quote approval requests (Optional: from sales reps)"
+
+  You must still instantiate all placeholders per the base instructions above.

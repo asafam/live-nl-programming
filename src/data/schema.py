@@ -27,7 +27,14 @@ class Event(BaseModel):
     when: str  # Same format as modification: "W02-1T09:00"
     expect: EventExpect
 
+class GeneratedModification(BaseModel):
+    """LLM output schema — mod_type and ambiguity are set by the script, not the LLM."""
+    id: str
+    when: str
+    intent: str
+
 class Modification(BaseModel):
+    """Full modification with script-assigned mod_type and ambiguity."""
     id: str
     when: str
     mod_type: ModType
@@ -65,7 +72,7 @@ class Scenario(BaseModel):
     id: str
     sample_id: str
     description: str
-    modifications: list[Modification]
+    modifications: list[GeneratedModification]
     events: list[Event]
 
 class Scenarios(BaseModel):

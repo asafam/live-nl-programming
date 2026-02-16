@@ -52,10 +52,13 @@ Raw Steps:
 {steps}"""
 
 
-def format_prompt(prompt_template: str, template: dict, samples_count: int) -> str:
+def format_prompt(prompt_template: dict, template: dict, samples_count: int, step_style: str = "plain") -> str:
     """Format prompt template with template data and parameters."""
     template_str = format_template(template)
-    return prompt_template.format(
+    prompt = prompt_template["user_prompt"]
+    if step_style == "actor":
+        prompt += prompt_template.get("actor_style_addendum", "")
+    return prompt.format(
         TEMPLATE=template_str,
         SAMPLES_COUNT=samples_count,
     )
@@ -89,8 +92,8 @@ Examples:
         "--output",
         "-o",
         type=Path,
-        default=Path("outputs/data/zapier/generated/samples.jsonl"),
-        help="Output JSONL path (default: outputs/data/zapier/generated/samples.jsonl)",
+        default=None,
+        help="Output JSONL path (default: derived from input filename and step-style)",
     )
     parser.add_argument(
         "--prompt-template",
@@ -104,9 +107,21 @@ Examples:
         default=1,
         help="Number of samples to generate per template (default: 1)",
     )
+    parser.add_argument(
+        "--step-style",
+        choices=["plain", "actor"],
+        default="plain",
+        help="Step rewriting style: 'plain' (default) or 'actor' (Actor-creation language)",
+    )
     add_common_args(parser)
 
     args = parser.parse_args()
+
+    # Derive default output path from input filename and step-style
+    if args.output is None:
+        input_stem = args.input.stem  # e.g. "templates"
+        output_name = f"{input_stem}_samples_{args.step_style}.jsonl"
+        args.output = Path("outputs/data/zapier") / output_name
 
     # Infer provider from model if not specified
     if args.provider is None:
@@ -151,7 +166,10 @@ Examples:
         args.provider,
         args.model,
         args.seed,
-        {"Samples per template": str(args.samples_per_template)},
+        {
+            "Samples per template": str(args.samples_per_template),
+            "Step style": args.step_style,
+        },
     )
 
     # Create LLM client
@@ -171,7 +189,7 @@ Examples:
         for template in tqdm(pending, desc="Generating"):
             # Format prompt
             prompt = format_prompt(
-                prompt_template, template, args.samples_per_template
+                prompt_template, template, args.samples_per_template, args.step_style
             )
 
             # Generate samples

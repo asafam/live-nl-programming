@@ -24,7 +24,7 @@ from tqdm import tqdm
 # Load environment variables from .env file
 load_dotenv()
 
-from src.data.schema import Sample, Scenarios, TestCase, Ambiguity
+from src.data.schema import Sample, Scenarios, TestCase, Modification, ModType, Ambiguity
 from src.data.llm import create_llm
 from src.data.utils import (
     infer_provider,
@@ -116,8 +116,14 @@ def format_prompt(
     )
 
 
-def scenario_to_test_case(sample: Sample, scenario, index: int) -> TestCase:
-    """Convert a scenario to a TestCase by merging with sample metadata."""
+def scenario_to_test_case(
+    sample: Sample, scenario, index: int, mod_types: list[ModType], ambiguity: Ambiguity,
+) -> TestCase:
+    """Convert a scenario to a TestCase by merging with sample metadata and script-assigned fields."""
+    modifications = [
+        Modification(**gen_mod.model_dump(), mod_type=mt, ambiguity=ambiguity)
+        for gen_mod, mt in zip(scenario.modifications, mod_types)
+    ]
     return TestCase(
         id=f"{sample.id}-TC{index:03d}",
         name=sample.name,
@@ -125,7 +131,7 @@ def scenario_to_test_case(sample: Sample, scenario, index: int) -> TestCase:
         source_type=sample.source_type,
         link=sample.link,
         steps=sample.steps,
-        modifications=scenario.modifications,
+        modifications=modifications,
         events=scenario.events,
     )
 
@@ -221,7 +227,7 @@ Examples:
         mod_part = args.mod_type or "all"
         ambiguity_part = args.ambiguity
         output_name = f"{input_stem}__{mod_part}__{ambiguity_part}.jsonl"
-        args.output = args.input.parent / output_name
+        args.output = Path("outputs/data/zapier") / output_name
 
     # Infer provider from model if not specified
     if args.provider is None:
@@ -236,7 +242,7 @@ Examples:
 
     # Load data
     samples = load_jsonl(args.input, Sample)
-    prompt_template = load_prompt_template(args.prompt_template)
+    prompt_template = load_prompt_template(args.prompt_template)["user_prompt"]
 
     # Apply limit if specified (0 or None means no limit)
     if args.limit:
@@ -264,13 +270,14 @@ Examples:
         print(f"Processing {len(pending)} samples")
 
     # Determine which modification types to generate
+    # Concrete mod types (excluding "mixed") for random sampling
+    concrete_mod_types = [k for k in MODIFICATION_TYPES.keys() if k != "mixed"]
     if args.mod_type:
         mod_types_to_generate = [args.mod_type]
     else:
-        # Exclude "mixed" from default iteration - it's only used when explicitly requested
-        mod_types_to_generate = [k for k in MODIFICATION_TYPES.keys() if k != "mixed"]
+        mod_types_to_generate = concrete_mod_types
 
-    # Resolve ambiguity levels (excluding "random" from the actual values)
+    # Concrete ambiguity values for random sampling
     ambiguity_values = [a.value for a in Ambiguity]
 
     print_run_info(
@@ -305,16 +312,29 @@ Examples:
         with tqdm(total=total_iterations, desc="Generating") as pbar:
             for sample in pending:
                 for mod_type in mod_types_to_generate:
-                    mod_description = MODIFICATION_TYPES[mod_type]
+                    # Resolve mod types for each modification in the scenario
+                    if mod_type == "mixed":
+                        resolved_mod_types = [
+                            random.choice(concrete_mod_types)
+                            for _ in range(args.mods_per_scenario)
+                        ]
+                        # Build combined description for the prompt
+                        mod_type_label = ", ".join(resolved_mod_types)
+                        mod_description = "\n".join(
+                            f"- Modification {i+1} ({mt}): {MODIFICATION_TYPES[mt]}"
+                            for i, mt in enumerate(resolved_mod_types)
+                        )
+                    else:
+                        resolved_mod_types = [mod_type] * args.mods_per_scenario
+                        mod_type_label = mod_type
+                        mod_description = MODIFICATION_TYPES[mod_type]
 
                     # Resolve ambiguity for this iteration
                     if args.ambiguity == "random":
-                        chosen = random.choice(ambiguity_values)
-                        ambiguity_constraint = chosen
-                        ambiguity_description = AMBIGUITY_DESCRIPTIONS[chosen]
+                        ambiguity_constraint = random.choice(ambiguity_values)
                     else:
                         ambiguity_constraint = args.ambiguity
-                        ambiguity_description = AMBIGUITY_DESCRIPTIONS[args.ambiguity]
+                    ambiguity_description = AMBIGUITY_DESCRIPTIONS[ambiguity_constraint]
 
                     # Format prompt
                     prompt = format_prompt(
@@ -324,7 +344,7 @@ Examples:
                         args.events_before,
                         args.events_after,
                         args.events_unrelated,
-                        modification_type=mod_type,
+                        modification_type=mod_type_label,
                         modification_type_description=mod_description,
                         mods_per_scenario=args.mods_per_scenario,
                         ambiguity_constraint=ambiguity_constraint,
@@ -343,7 +363,11 @@ Examples:
                     if result:
                         # Convert scenarios to test cases and write each as a separate line
                         for i, scenario in enumerate(result.scenarios, start=1):
-                            test_case = scenario_to_test_case(sample, scenario, i)
+                            test_case = scenario_to_test_case(
+                                sample, scenario, i,
+                                mod_types=[ModType(mt) for mt in resolved_mod_types],
+                                ambiguity=Ambiguity(ambiguity_constraint),
+                            )
                             f.write(test_case.model_dump_json() + "\n")
                         f.flush()
                         success_count += len(result.scenarios)

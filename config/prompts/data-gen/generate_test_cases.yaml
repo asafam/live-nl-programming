@@ -32,14 +32,10 @@ user_prompt: |
   modifications:
     - id: "M001"
       when: "W02-1T10:30"
-      mod_type: temporal | contextual | exception | correction | expansion | removal
       intent: "The natural language instruction as a user would say it"
-      ambiguity: precise | semantic | vague | implicit
     - id: "M002"
       when: "W02-2T14:00"
-      mod_type: temporal | contextual | exception | correction | expansion | removal
       intent: "Another rule change that builds on or interacts with M001"
-      ambiguity: precise
   ```
 
   ### Events
@@ -89,12 +85,12 @@ user_prompt: |
 
   Generate {SCENARIO_COUNT} scenario(s) with {MODS_PER_SCENARIO} modification(s) each.
 
-  Modification type constraint: **{MODIFICATION_TYPE}**
-  (If "mixed", use any combination of types: temporal, contextual, exception, correction, expansion, removal)
+  Modification type style: **{MODIFICATION_TYPE}**
+  Write each modification `intent` as this kind of rule change.
 
-  Ambiguity constraint: **{AMBIGUITY_CONSTRAINT}**
+  Ambiguity style for modification intents: **{AMBIGUITY_CONSTRAINT}**
   {AMBIGUITY_DESCRIPTION}
-  All modifications in this scenario must use this ambiguity level.
+  Write all modification `intent` texts in this style.
 
   Each scenario must include:
   - {EVENTS_BEFORE_COUNT} events before the first modification

@@ -29,11 +29,10 @@ def infer_provider(model: str) -> str:
         )
 
 
-def load_prompt_template(path: Path) -> str:
-    """Load prompt template from YAML file."""
+def load_prompt_template(path: Path) -> dict:
+    """Load prompt template from YAML file, returning the full config dict."""
     with open(path, "r") as f:
-        config = yaml.safe_load(f)
-    return config.get("user_prompt", "")
+        return yaml.safe_load(f)
 
 
 def load_yaml(path: Path) -> list:
@@ -194,6 +193,15 @@ def validate_paths(input_path: Path, prompt_template_path: Path) -> None:
         sys.exit(1)
 
 
+def confirm_overwrite(output_path: Path) -> None:
+    """Prompt user for confirmation if output file already exists. Exits if declined."""
+    if output_path.exists():
+        response = input(f"Output file already exists: {output_path}\nOverwrite? [y/N] ")
+        if response.strip().lower() != "y":
+            print("Aborted.")
+            sys.exit(0)
+
+
 def setup_output(
     output_path: Path,
     force: bool,
@@ -204,6 +212,7 @@ def setup_output(
     Returns:
         Tuple of (completed_set, file_mode).
     """
+    confirm_overwrite(output_path)
     if force:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         return set(), "w"
