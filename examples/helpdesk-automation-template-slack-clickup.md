@@ -43,7 +43,7 @@ graph TD
   Tickets --> |notifies team member| Slack
   Tickets --> |notifies user| Slack
   Tickets --> |updates| KnowledgeBase
-  ReportSystem --> |analyzes| Report
+  ReportSystem --> |analyzes| SupportManager
 ```
 
 ## Sequence diagram
