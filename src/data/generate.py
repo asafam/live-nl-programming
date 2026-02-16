@@ -8,7 +8,7 @@ Usage:
     python -m src.data.generate \\
         --input data/zapier/raw/examples.yaml \\
         --output outputs/data/zapier/generated/test_cases.jsonl \\
-        --model gpt-4o \\
+        --model claude-sonnet-4-5-20250929 \\
         --seed 42 \\
         --test-cases 5-10 \\
         --events-per-test-case 2-5
@@ -169,11 +169,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate with OpenAI (provider inferred from model)
-  python -m src.data.generate -i data/zapier/raw/examples.yaml --model gpt-4o
+  # Generate with default model (provider inferred from model)
+  python -m src.data.generate -i data/zapier/raw/examples.yaml
 
-  # Generate with Anthropic Sonnet
-  python -m src.data.generate -i data/zapier/raw/examples.yaml --model claude-sonnet-4-5-20250929
+  # Generate with OpenAI
+  python -m src.data.generate -i data/zapier/raw/examples.yaml --model gpt-4o
 
   # Generate with Anthropic Opus
   python -m src.data.generate -i data/zapier/raw/examples.yaml --model claude-opus-4-5-20251101
@@ -213,8 +213,8 @@ Examples:
     parser.add_argument(
         "--model",
         "-m",
-        default="gpt-4o",
-        help="Model name (default: gpt-4o). Provider is inferred: claude-* → anthropic, gpt-*/o1-*/o3-* → openai",
+        default="claude-sonnet-4-5-20250929",
+        help="Model name (default: claude-sonnet-4-5-20250929). Provider is inferred: claude-* → anthropic, gpt-*/o1-*/o3-* → openai",
     )
     parser.add_argument(
         "--seed",

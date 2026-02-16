@@ -55,6 +55,12 @@ class TestCases(BaseModel):
     test_cases: list[TestCase]
 
 # Sample generation schemas
+class ObjectDeclaration(BaseModel):
+    name: str
+    category: str  # "platform" or "business_logic"
+    responsibility: str
+    communicates_with: list[str]  # e.g., ["queries KnowledgeBase", "sends through Slack"]
+
 class Sample(BaseModel):
     id: str
     name: str
@@ -62,6 +68,7 @@ class Sample(BaseModel):
     source_type: str
     link: str
     raw_steps: list[str]
+    objects: list[ObjectDeclaration]
     steps: list[str]
 
 class Samples(BaseModel):

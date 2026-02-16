@@ -102,20 +102,44 @@ class AnthropicChatLLM(AbstractLLM):
         content_str = ""
         tool_calls = None
         for block in resp.content:
-            if block["type"] == "text":
-                content_str += block.get("text", "")
-            if block["type"] == "tool_use":
+            if hasattr(block, "text"):
+                content_str += block.text
+            if hasattr(block, "type") and block.type == "tool_use":
                 tool_calls = [
                     {
                         "function": {
-                            "name": block.get("name", ""),
-                            "arguments": json.dumps(block.get("input", {}) or {}),
+                            "name": block.name,
+                            "arguments": json.dumps(block.input or {}),
                         }
                     }
                 ]
                 break
 
         return ChatMessage(role="assistant", content=content_str, tool_calls=tool_calls)
+
+    @staticmethod
+    def _enforce_strict_schema(schema: dict) -> None:
+        """Recursively set additionalProperties: false on all object types.
+
+        Anthropic's JSON schema mode requires this for every object in the schema,
+        including nested $defs.
+        """
+        if schema.get("type") == "object":
+            schema.setdefault("additionalProperties", False)
+        for key in ("properties", "$defs"):
+            if key in schema:
+                for sub in schema[key].values():
+                    if isinstance(sub, dict):
+                        AnthropicLLM._enforce_strict_schema(sub)
+        for key in ("items", "anyOf", "oneOf", "allOf"):
+            if key in schema:
+                target = schema[key]
+                if isinstance(target, dict):
+                    AnthropicLLM._enforce_strict_schema(target)
+                elif isinstance(target, list):
+                    for item in target:
+                        if isinstance(item, dict):
+                            AnthropicLLM._enforce_strict_schema(item)
 
     def generate_structured(self, messages: Sequence[ChatMessage], schema_or_model: Union[Dict[str, Any], BaseModel, type]) -> Any:
         """Generate structured response using Anthropic's structured outputs."""
@@ -125,6 +149,8 @@ class AnthropicChatLLM(AbstractLLM):
         else:
             schema = schema_or_model
             response_model = None
+
+        self._enforce_strict_schema(schema)
 
         # Extract system messages
         system_parts = []
@@ -144,12 +170,10 @@ class AnthropicChatLLM(AbstractLLM):
             "temperature": self.temperature,
             "system": system_content,
             "messages": self._to_anthropic_messages(non_system_messages),
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "structured_response",
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
                     "schema": schema,
-                    "strict": False  # Allow more flexibility
                 }
             }
         }
@@ -167,8 +191,8 @@ class AnthropicChatLLM(AbstractLLM):
 
         content_str = ""
         for block in resp.content:
-            if block["type"] == "text":
-                content_str += block.get("text", "")
+            if hasattr(block, "text"):
+                content_str += block.text
 
         try:
             parsed = json.loads(content_str)

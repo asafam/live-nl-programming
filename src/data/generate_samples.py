@@ -8,7 +8,7 @@ Usage:
     python -m src.data.generate_samples \\
         --input data/zapier/raw/examples.yaml \\
         --output outputs/data/zapier/generated/samples.jsonl \\
-        --model gpt-4o \\
+        --model claude-sonnet-4-5-20250929 \\
         --seed 42 \\
         --samples-per-template 3
 """
@@ -55,9 +55,11 @@ Raw Steps:
 def format_prompt(prompt_template: dict, template: dict, samples_count: int, step_style: str = "plain") -> str:
     """Format prompt template with template data and parameters."""
     template_str = format_template(template)
-    prompt = prompt_template["user_prompt"]
+    prompt = prompt_template["base_prompt"]
     if step_style == "actor":
         prompt += prompt_template.get("actor_style_addendum", "")
+    else:
+        prompt += prompt_template.get("plain_style_addendum", "")
     return prompt.format(
         TEMPLATE=template_str,
         SAMPLES_COUNT=samples_count,
@@ -70,11 +72,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate with OpenAI (provider inferred from model)
-  python -m src.data.generate_samples -i data/zapier/raw/examples.yaml --model gpt-4o
+  # Generate with default model (provider inferred from model)
+  python -m src.data.generate_samples -i data/zapier/raw/examples.yaml
 
-  # Generate with Anthropic Sonnet
-  python -m src.data.generate_samples -i data/zapier/raw/examples.yaml --model claude-sonnet-4-5-20250929
+  # Generate with OpenAI
+  python -m src.data.generate_samples -i data/zapier/raw/examples.yaml --model gpt-4o
 
   # Multiple samples per template
   python -m src.data.generate_samples -i data/zapier/raw/examples.yaml --samples-per-template 5

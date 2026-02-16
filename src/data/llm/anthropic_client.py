@@ -70,6 +70,30 @@ class AnthropicChatLLM(AbstractLLM):
         system_content = "\n".join(system_parts) if system_parts else None
         return system_content, non_system
 
+    @staticmethod
+    def _enforce_strict_schema(schema: dict) -> None:
+        """Recursively set additionalProperties: false on all object types.
+
+        Anthropic's JSON schema mode requires this for every object in the schema,
+        including nested $defs.
+        """
+        if schema.get("type") == "object":
+            schema.setdefault("additionalProperties", False)
+        for key in ("properties", "$defs"):
+            if key in schema:
+                for sub in schema[key].values():
+                    if isinstance(sub, dict):
+                        AnthropicChatLLM._enforce_strict_schema(sub)
+        for key in ("items", "anyOf", "oneOf", "allOf"):
+            if key in schema:
+                target = schema[key]
+                if isinstance(target, dict):
+                    AnthropicChatLLM._enforce_strict_schema(target)
+                elif isinstance(target, list):
+                    for item in target:
+                        if isinstance(item, dict):
+                            AnthropicChatLLM._enforce_strict_schema(item)
+
     def generate_structured(
         self,
         messages: Sequence[ChatMessage],
@@ -85,6 +109,7 @@ class AnthropicChatLLM(AbstractLLM):
             An instance of response_model populated from the LLM response.
         """
         schema = response_model.model_json_schema()
+        self._enforce_strict_schema(schema)
         system_content, non_system_messages = self._to_anthropic_messages(messages)
 
         kwargs = {
@@ -97,13 +122,11 @@ class AnthropicChatLLM(AbstractLLM):
         if system_content:
             kwargs["system"] = system_content
 
-        # Add JSON schema response format
-        kwargs["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "structured_response",
+        # Add JSON schema output config (Anthropic SDK uses output_config, not response_format)
+        kwargs["output_config"] = {
+            "format": {
+                "type": "json_schema",
                 "schema": schema,
-                "strict": False,
             },
         }
 

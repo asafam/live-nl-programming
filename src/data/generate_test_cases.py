@@ -8,7 +8,7 @@ Usage:
     python -m src.data.generate_test_cases \\
         --input outputs/data/zapier/generated/samples.jsonl \\
         --output outputs/data/zapier/generated/test_cases.jsonl \\
-        --model gpt-4o \\
+        --model claude-sonnet-4-5-20250929 \\
         --seed 42 \\
         --scenario-count 1
 """
@@ -142,11 +142,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate with OpenAI (provider inferred from model)
-  python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.jsonl --model gpt-4o
+  # Generate with default model (provider inferred from model)
+  python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.jsonl
 
-  # Generate with Anthropic Sonnet
-  python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.jsonl --model claude-sonnet-4-5-20250929
+  # Generate with OpenAI
+  python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.jsonl --model gpt-4o
 
   # Custom scenario and event counts
   python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.jsonl --scenario-count 2 --events-before 2 --events-after 3

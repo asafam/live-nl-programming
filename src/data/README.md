@@ -36,7 +36,7 @@ Instantiates raw templates with specific, realistic values.
 ```bash
 python -m src.data.generate_samples \
     --input data/zapier/raw/examples.yaml \
-    --model gpt-4o \
+    --model claude-sonnet-4-5-20250929 \
     --samples-per-template 3
 ```
 
@@ -47,7 +47,7 @@ python -m src.data.generate_samples \
 | `--input`, `-i` | (required) | Path to raw templates YAML file |
 | `--output`, `-o` | `outputs/data/zapier/generated/samples.jsonl` | Output JSONL path |
 | `--prompt-template` | `config/prompts/data-gen/generate_samples.yaml` | Prompt template path |
-| `--model`, `-m` | `gpt-4o` | Model name (provider auto-detected) |
+| `--model`, `-m` | `claude-sonnet-4-5-20250929` | Model name (provider auto-detected) |
 | `--seed`, `-s` | None | Random seed for reproducibility |
 | `--samples-per-template` | `1` | Samples to generate per template |
 | `--temperature` | `0.7` | LLM temperature |
@@ -71,7 +71,7 @@ Creates test scenarios with modifications and events from samples.
 ```bash
 python -m src.data.generate_test_cases \
     --input outputs/data/zapier/generated/samples.jsonl \
-    --model gpt-4o \
+    --model claude-sonnet-4-5-20250929 \
     --scenario-count 1
 ```
 
@@ -82,7 +82,7 @@ python -m src.data.generate_test_cases \
 | `--input`, `-i` | (required) | Path to samples JSONL (from Stage 1) |
 | `--output`, `-o` | `<input_stem>__<mod-type>__<ambiguity>.jsonl` | Output JSONL path (derived from input, mod-type, and ambiguity) |
 | `--prompt-template` | `config/prompts/data-gen/generate_test_cases.yaml` | Prompt template path |
-| `--model`, `-m` | `gpt-4o` | Model name (provider auto-detected) |
+| `--model`, `-m` | `claude-sonnet-4-5-20250929` | Model name (provider auto-detected) |
 | `--seed`, `-s` | None | Random seed for reproducibility |
 | `--mod-type` | None | Modification type: `temporal`, `contextual`, `exception`, `correction`, `expansion`, `removal`, or `mixed` (random types). If omitted, generates all types separately. |
 | `--ambiguity` | `random` | Ambiguity level: `precise`, `semantic`, `vague`, `implicit`, or `random`. When `random`, the script samples a random level per iteration. |
@@ -150,7 +150,7 @@ The `src/data/llm/` module provides a clean abstraction for LLM calls:
 from src.data.llm import create_llm, user_message
 from src.data.schema import Samples
 
-llm = create_llm(provider="openai", model="gpt-4o", temperature=0.7, seed=42)
+llm = create_llm(provider="anthropic", model="claude-sonnet-4-5-20250929", temperature=0.7, seed=42)
 result = llm.generate_structured(
     messages=[user_message("Your prompt here")],
     response_model=Samples,
