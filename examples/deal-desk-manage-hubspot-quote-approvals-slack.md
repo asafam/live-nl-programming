@@ -86,7 +86,7 @@ With traditional code based programs, the unavailability of the approver name fo
 ```mermaid
 sequenceDiagram
   participant Operator
-  participant QuotesApprovals
+  participant QuoteApprovals
   participant Slack
 
   Operator->>QuoteApprovals: If quote is under $10K, auto-approve without sending email or requiring approver action
