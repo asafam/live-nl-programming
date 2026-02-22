@@ -117,7 +117,95 @@ sequenceDiagram
   Slack->>Slack: Post approval notification in #35;quote-approvals without approver name
 ```
 
-### Scenario with modification: Retroactive modification
+### Scenario: Underspecified conflict resolution with probablistic state
+**Modification (to QuoteApprovals):**
+
+```
+Enterprise quotes require VP approval
+```
+
+In this scenario, QuoteApprovals is given a new requirement that enterprise quotes require VP approval. However, in this example, the system doesn't have enough information to determine whether ACME corp is an enterprise customer and who the required approver should be. LLM-objects communicate with each other to identify the missing information and determine the appropriate approver. The confidence level of the system can be be updated as it gathers more information, and it can even seek clarification from the user if needed.
+With traditional programming, this would likely result in a failure to route the approval request correctly, causing delays and possibly lost deals.
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant HubSpot
+  participant QuoteApprovals
+  participant OrganizationDirectory
+  participant Slack
+
+  User->>HubSpot: Submits new quote for Acme Corp 
+  HubSpot->>QuoteApprovals: Quote from Acme Corp (tier: null)
+  QuoteApprovals-->>QuoteApprovals: Enterprise requires VP. Is Acme Corp enterprise?
+  Note over QuoteApprovals: {enterprise: 0.5, standard: 0.5}
+
+  QuoteApprovals->>HubSpot: What is Acme Corp's tier?
+  HubSpot-->>QuoteApprovals: Tier not specified
+  Note over QuoteApprovals: {enterprise: 0.5, standard: 0.5}
+  
+  QuoteApprovals->>HubSpot: What is the original deal amount before discounts for this quote?
+  HubSpot-->>QuoteApprovals: Original deal amount is $65K
+  Note over QuoteApprovals: Med-high amount signal → {enterprise: 0.7, standard: 0.3}
+  
+  QuoteApprovals->>OrganizationDirectory: Who should approve quotes for Acme Corp?
+  OrganizationDirectory-->>QuoteApprovals: Ted, director, from SMB and New Customers Sales is the approver for Acme Corp
+  Note over QuoteApprovals: SMB team signal -> {enterprise: 0.55, standard: 0.45}
+
+  QuoteApprovals->>OrganizationDirectory: Does Ted handles any enterprise accounts?
+  OrganizationDirectory-->>QuoteApprovals: No, none of Ted's accounts are enterprise
+  Note over QuoteApprovals: SMB team signal -> {enterprise: 0.15, standard: 0.85}
+
+  QuoteApprovals ->> QuoteApprovals: Conflicting signals, but overall leaning towards standard.
+  QuoteApprovals->>Email: Send approval request to Ted
+```
+
+### Scenario: Conflicting instructions, no breakage
+
+**Modification 1 (to QuoteApprovals):**
+
+```
+Quotes under $10K auto-approve
+```
+
+**Modification 2 (to QuoteApprovals):**
+
+```
+From now on, All quotes to new customers require manager approval
+```
+
+In this scenario, QuoteApprovals receives two conflicting instructions: auto-approve quotes under $10K, and require manager approval for all quotes to new customers. If a quote is submitted for a new customer that's under $10K, the system needs to determine which instruction takes precedence. The system potentially can demonstrate proactiveness by recognizing the conflict and seeking clarification, or it can apply a default conflict resolution strategy (e.g., stricter rule wins, or most recent instruction takes precedence).
+With traditional programming, this would likely require additional code to handle this specific edge case, and if not handled correctly, could lead to incorrect approvals or rejections.
+
+```mermaid
+sequenceDiagram
+  participant Operator
+  participant QuoteApprovals
+
+  Operator->>QuoteApprovals: If quote is under $10K, auto-approve without sending email or requiring approver action
+  Operator->>QuoteApprovals: From now on, All quotes to new customers require manager approval
+  Note over QuoteApprovals: A possible conflict detected. Rules don't override each other.
+  QuoteApprovals-->>QuoteApprovals: Recent rule wins: require review
+  QuoteApprovals-->>Operator: Notify operator of conflict and resolution
+```
+
+```mermaid
+  participant User
+  participant HubSpot
+  participant QuoteApprovals
+  participant OrganizationDirectory
+  participant Email
+
+  User->>HubSpot: Submits new quote for $8K for new customer
+  HubSpot->>QuoteApprovals: New quote submitted for $8K for new customer
+  QuoteApprovals->>QuoteApprovals: Quotes under $10K should be auto-approved, but new customer requires approval
+  QuoteApprovals->>OrganizationDirectory: Identify manager approver for new customer
+  OrganizationDirectory-->>QuoteApprovals: Return manager approver info
+  QuoteApprovals->>Email: Send approval request to manager approver
+```
+
+
+### Scenario: Retroactive modification
 
 **Modification (to QuoteApprovals):**
 
@@ -281,4 +369,33 @@ sequenceDiagram
     Note over Slack: Escalation failed. No valid approver found.
     Slack->>Slack: Send follow-up message in #35;quote-approvals tagging Quote Desk Team for assistance since no valid approver found.
   end
+```
+
+### Scenario: Negotiate state transition (without user intervention)
+
+**Modification (to QuoteApprovals):**
+
+```
+Big deals needs CFO approval
+```
+
+In this scenario, QuoteApprovals receives a new instruction that big deals require CFO approval. However, "big deal" is an ambiguous term that isn't clearly defined in the system. The system needs to negotiate the definition of "big deal" by communicating with other objects to gather necessary information (e.g., historical deal sizes, company benchmarks) and potentially seek clarification from the operator. With traditional programming, this would likely require additional code to handle the ambiguity, and if not handled correctly, could lead to inconsistent application of the new rule.
+
+```mermaid
+sequenceDiagram
+  participant Operator
+  participant QuoteApprovals
+
+  Operator->>QuoteApprovals: Big deals need CFO approval
+  QuoteApprovals->>QuoteApprovals: What is "big"? Propose: >$100K
+  QuoteApprovals->>OrganizationDirectory: What is typical "big deal" threshold?
+  OrganizationDirectory-->>QuoteApprovals: Alice belongs to the premium sales team, check their average deal size
+  QuoteApprovals->>HubSpot: What is the average deal size for Alice's team?
+  HubSpot-->>QuoteApprovals: They deal with quotes above $75K
+  QuoteApprovals-->>QuoteApprovals: Counter-propose: >$75K
+  QuoteApprovals->>Slack: "Big deals" need CFO approval. Based on historical data, I propose defining "big deal" as >$75K. Does this sound right?
+  Slack-->>QuoteApprovals: This year, the CFO approved deals above $100K, but for new customers the threshold is $50K
+  QuoteApprovals-->>QuoteApprovals: Refine rule with context
+  Note over QuoteApprovals: "Big deal" = >$50K (new) or >$100K (existing)
+  QuoteApprovals->>Operator: Define "big deal" as >$50K for new customers and >$100K for existing customers. Is that correct?
 ```
