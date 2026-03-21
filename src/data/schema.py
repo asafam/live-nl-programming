@@ -1,5 +1,5 @@
 from pydantic import BaseModel, field_validator, Field
-from typing import Literal
+from typing import Literal, Optional
 from enum import Enum
 
 from src.lnl.parser import slugify
@@ -78,8 +78,9 @@ class ObjectDef(BaseModel):
 
 class Step(BaseModel):
     """A single workflow step: an NL text addressed to a specific LLM-object."""
-    text: str   # Natural language message to send to the target object
+    text: str        # Natural language message to send to the target object
     target: str      # object_id of the LLM-object this step addresses
+    expect: Optional[EventExpect] = None  # Expected default-behavior outcome (no modifications applied)
 
     @field_validator("target")
     @classmethod
@@ -124,6 +125,49 @@ class Scenario(BaseModel):
 
 class Scenarios(BaseModel):
     scenarios: list[Scenario]
+
+
+# Evaluation result schemas
+
+class EventResult(BaseModel):
+    """Result of executing a single test event."""
+    event_id: str
+    passed: bool
+    reasoning: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_ms: float = 0.0
+
+class ModificationResult(BaseModel):
+    """Cost of applying a single modification."""
+    mod_id: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_ms: float = 0.0
+
+class TestCaseResult(BaseModel):
+    """Result of running a single TestCase (one run)."""
+    tc_id: str
+    name: str
+    domain: str
+    run_index: int  # 0-based; >0 only when --runs > 1
+    events: list[EventResult]
+    modifications: list[ModificationResult]
+    pass_rate: float  # passed_events / total_events
+
+class EvalSummary(BaseModel):
+    """Aggregate metrics across all test cases and runs."""
+    total_test_cases: int
+    total_runs: int
+    total_events: int
+    mean_pass_rate: float
+    pass_rate_std: float      # behavioral consistency (std dev across runs)
+    mean_event_input_tokens: float
+    mean_event_output_tokens: float
+    mean_event_latency_ms: float
+    mean_mod_input_tokens: float
+    mean_mod_output_tokens: float
+    mean_mod_latency_ms: float
 
 
 def to_lnl_definition(obj: ObjectDef) -> ObjectDefinition:

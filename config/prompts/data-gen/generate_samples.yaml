@@ -41,9 +41,9 @@ prompt: |
 
   Use these categories as conceptual framing — they guide how you design objects, but `category` is not a schema field.
 
-  1. **Service objects** — represent external systems the automation interacts with (Active Directory, Slack, HubSpot, databases, email, etc.). Named by brand or function as a slug (e.g., `slack`, `active-directory`, `hubspot`). Service objects come in two flavors:
+  1. **Service objects** — represent external systems the automation interacts with (Active Directory, Slack, HubSpot, databases, email, etc.). Named by brand or function as a slug (e.g., `slack`, `active-directory`, `hubspot`). One object per external system — never split a system into separate read and write objects. Service objects come in two flavors:
      - **Read services** have seeded state containing reference data (e.g., `active-directory` with `state_description: "Users: Sarah (manager: Bob, department: Engineering), ..."`). Their behavior is to respond to queries about their data.
-     - **Write services** have initially empty state and record what they receive (e.g., `slack-notifier` with behavior: "Record all received messages in state"). Their state becomes the audit trail.
+     - **Write services** have initially empty state and record what they receive (e.g., `slack` with behavior: "Record all received messages in state"). Their state becomes the audit trail.
      Both reads and writes happen through normal peer messages — no special mechanism needed.
   2. **Business logic objects** — one per distinct area of responsibility that involves decision-making, processing, routing, or orchestration. Named as domain slugs (nouns), not actions (verbs) (e.g., `support-triage`, `ticket-router`). Each business logic object owns its own business data and state internally. It interacts with external systems by sending messages to service objects via peer declarations.
 
@@ -78,13 +78,16 @@ prompt: |
 
   Ask yourself: "What external event causes this automation to run?" Write only that.
 
-  Each step is a JSON object with two fields:
+  Each step is a JSON object with three fields:
   - `target` — the `object_id` of the LLM-object that receives the external trigger
   - `text` — the natural language content of the trigger (what arrived from outside)
+  - `expect` — the expected outcome when the system runs with **no modifications applied**:
+    - `action` — specific, observable terminal output (e.g., "Approval email sent to Sarah Chen")
+    - `reason` — the rule or peer relationship that produces it (e.g., "org-directory rule: discount >10% requires manager approval")
 
   **What IS a step**:
-  - A new record created in an external system → `{"target": "hubspot", "text": "New quote Q-2847 created by John Smith: 15% discount and extended payment terms requested"}`
-  - An inbound message or webhook → `{"target": "slack", "text": "Message in #support: our integration is broken, urgent"}`
+  - A new record created in an external system → `{"target": "hubspot", "text": "New quote Q-2847 created by John Smith: 15% discount and extended payment terms requested", "expect": {"action": "Approval email sent to Sarah Chen (manager)", "reason": "org-directory rule: discount >10% requires manager approval"}}`
+  - An inbound message or webhook → `{"target": "slack", "text": "Message in #support: our integration is broken, urgent", "expect": {"action": "Support ticket created and assigned to on-call engineer", "reason": "support-triage behavior: urgent messages trigger immediate ticket creation"}}`
   - A scheduled or time-based event → `{"target": "quote-approvals", "text": "Daily check: identify quotes pending approval for more than 24 hours"}`
 
   **What is NOT a step** (these are internal — handled by object behavior and peer chaining):

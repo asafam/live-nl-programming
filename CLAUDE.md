@@ -30,6 +30,9 @@ python -m src.lnl.cli --provider openai send guest-manager "Check in Alice"
 python -m src.data.pipeline -i data/zapier/raw/templates.yaml --target-dir outputs/my-run
 python -m src.data.pipeline -i data/zapier/raw/templates.yaml --target-dir outputs/my-run  # continues if samples.jsonl exists
 python -m src.data.pipeline --samples outputs/data/zapier/templates_samples_object.jsonl  # skip stage 1 explicitly
+
+# Evaluation — standalone (separate from data generation pipeline)
+python -m src.data.evaluate -i outputs/data/zapier/20260322_120000/test_cases.jsonl --runs 3
 ```
 
 ## Architecture
@@ -52,6 +55,7 @@ Two-stage LLM pipeline generating test cases from automation templates:
 
 - **Stage 1** (`generate_samples.py`): Raw YAML templates → concrete sample instances (JSONL)
 - **Stage 2** (`generate_test_cases.py`): Samples → test cases with modifications and events (JSONL)
+- **Stage 3** (`evaluate.py`): Test cases → evaluation results with pass/fail per event, token costs, and aggregate metrics. Supports `--runs N` for behavioral consistency measurement.
 
 Key design: `mod_type` and `ambiguity` are **script-controlled**, not LLM-generated. The LLM produces `GeneratedModification` (id, when, intent only). The script assigns `mod_type` and `ambiguity` during `scenario_to_test_case` conversion. For `--mod-type mixed` or `--ambiguity random`, the script samples values per iteration.
 
