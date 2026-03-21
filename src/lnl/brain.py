@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional, Sequence
+
+import yaml
 
 from .types import (
     InferenceMetrics,
@@ -56,38 +60,63 @@ LLM_RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 
+_PROMPT_CONFIG: Optional[dict] = None
+
+
+def _load_prompt_config() -> dict:
+    """Load the prompt config from config/prompts/lnl/object.yaml."""
+    global _PROMPT_CONFIG
+    if _PROMPT_CONFIG is None:
+        config_path = Path(__file__).parent.parent.parent / "config" / "prompts" / "lnl" / "object.yaml"
+        with open(config_path) as f:
+            _PROMPT_CONFIG = yaml.safe_load(f)
+    return _PROMPT_CONFIG
+
+
 def build_system_prompt(definition: ObjectDefinition, current_state: str) -> str:
-    """Build the system prompt from an ObjectDefinition and current state."""
-    parts = [f"You are '{definition.object_id}'."]
+    """Build the system prompt from the YAML template and an ObjectDefinition."""
+    config = _load_prompt_config()
+    template = config["system_prompt"]
 
-    parts.append(f"\n## Role\n{definition.role}")
-
-    if definition.behavior:
-        parts.append(f"\n## Behavior\n{definition.behavior}")
-
+    peers = ""
     if definition.peers:
-        peer_lines = [f"- {p.object_id}: {p.relationship}" for p in definition.peers]
-        parts.append(f"\n## Peers\n" + "\n".join(peer_lines))
+        peers = "\n".join(f"- {p.object_id}: {p.relationship}" for p in definition.peers)
 
+    skills = ""
     if definition.skills:
-        parts.append(f"\n## Skills\n" + "\n".join(f"- {s}" for s in definition.skills))
+        skills = "\n".join(f"- {s}" for s in definition.skills)
 
-    if definition.state_description:
-        parts.append(f"\n## State Description\n{definition.state_description}")
-
-    parts.append(f"\n## Current State\n{current_state or '(empty)'}")
-
-    parts.append(
-        "\n## Instructions\n"
-        "Respond with a JSON object containing:\n"
-        "- updated_state: Your complete updated state as a natural language string.\n"
-        "- reply: Your reply to the sender.\n"
-        "- outgoing_messages: A list of messages to send to peers (each with recipient and content).\n"
-        "- reasoning: Brief internal reasoning about your decision.\n"
-        "Do NOT include anything outside the JSON object."
+    return template.format(
+        object_id=definition.object_id,
+        role=definition.role,
+        behavior=definition.behavior or "(none)",
+        peers=peers or "(none)",
+        skills=skills or "(none)",
+        state_description=definition.state_description or "(none)",
+        current_state=current_state or "(empty)",
     )
 
-    return "\n".join(parts)
+
+def get_history_prefix() -> str:
+    """Get the history prefix text from config."""
+    config = _load_prompt_config()
+    return config.get("history_prefix", "").strip()
+
+
+def _build_chat_messages(
+    sys_prompt: str,
+    history: Sequence[Message],
+    message: Message,
+) -> list[dict[str, str]]:
+    """Build the chat message list with labeled history and new message."""
+    msgs: list[dict[str, str]] = [{"role": "system", "content": sys_prompt}]
+    if history:
+        prefix = get_history_prefix()
+        history_lines = [f"  [{msg.sender}]: {msg.content}" for msg in history]
+        msgs.append({"role": "user", "content": f"{prefix}\n" + "\n".join(history_lines)})
+        msgs.append({"role": "assistant", "content": "Understood, I see the past context. What is the new message?"})
+    msgs.append({"role": "user", "content": f"[NEW MESSAGE] [{message.sender}]: {message.content}"})
+    return msgs
 
 
 class LLMBrain(ABC):
@@ -106,15 +135,26 @@ class LLMBrain(ABC):
 
 
 class OpenAIBrain(LLMBrain):
-    """Brain backed by OpenAI via the existing OpenAIChatLLM client."""
+    """Brain backed by the OpenAI API (self-contained, no config files)."""
 
-    def __init__(self, model: str = "gpt-4o-mini", **kwargs: Any) -> None:
-        from src.system.llm.openai_client import OpenAIChatLLM
-        from src.system.llm.base import system_message, user_message
+    def __init__(
+        self,
+        model: str = "gpt-4o-mini",
+        api_key: Optional[str] = None,
+        temperature: float = 0.0,
+        seed: Optional[int] = 42,
+    ) -> None:
+        import os
 
-        self._llm = OpenAIChatLLM(model=model, **kwargs)
-        self._system_message = system_message
-        self._user_message = user_message
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("openai package required. Install with: pip install openai")
+
+        self.model = model
+        self._temperature = temperature
+        self._seed = seed
+        self._client = OpenAI(api_key=api_key or os.environ["OPENAI_API_KEY"])
 
     def process(
         self,
@@ -124,38 +164,78 @@ class OpenAIBrain(LLMBrain):
         history: Sequence[Message],
     ) -> tuple[LLMResponse, InferenceMetrics]:
         sys_prompt = build_system_prompt(definition, current_state)
-        chat = [self._system_message(sys_prompt)]
+        messages = _build_chat_messages(sys_prompt, history, message)
 
-        for msg in history:
-            chat.append(self._user_message(f"[{msg.sender}]: {msg.content}"))
-
-        chat.append(self._user_message(f"[{message.sender}]: {message.content}"))
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self._temperature,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "llm_response",
+                    "schema": LLM_RESPONSE_SCHEMA,
+                    "strict": True,
+                },
+            },
+        }
+        if self._seed is not None:
+            kwargs["seed"] = self._seed
 
         t0 = time.time()
-        result = self._llm.generate_structured(chat, LLM_RESPONSE_SCHEMA)
+        resp = self._client.chat.completions.create(**kwargs)
         latency_ms = (time.time() - t0) * 1000
 
-        usage = self._llm.last_usage
         metrics = InferenceMetrics(
-            input_tokens=usage.prompt_tokens if usage else 0,
-            output_tokens=usage.completion_tokens if usage else 0,
+            input_tokens=resp.usage.prompt_tokens if resp.usage else 0,
+            output_tokens=resp.usage.completion_tokens if resp.usage else 0,
             latency_ms=latency_ms,
-            model=self._llm.model,
+            model=self.model,
         )
 
-        return _parse_llm_result(result), metrics
+        raw = json.loads(resp.choices[0].message.content or "{}")
+        return _parse_llm_result(raw), metrics
 
 
 class AnthropicBrain(LLMBrain):
-    """Brain backed by Anthropic via the existing AnthropicChatLLM client."""
+    """Brain backed by the Anthropic API (self-contained, no config files)."""
 
-    def __init__(self, model: str = "claude-3-5-sonnet-latest", **kwargs: Any) -> None:
-        from src.system.llm.anthropic_client import AnthropicChatLLM
-        from src.system.llm.base import system_message, user_message
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-20250514",
+        api_key: Optional[str] = None,
+        temperature: float = 0.0,
+    ) -> None:
+        import os
 
-        self._llm = AnthropicChatLLM(model=model, **kwargs)
-        self._system_message = system_message
-        self._user_message = user_message
+        try:
+            import anthropic as _anthropic
+        except ImportError:
+            raise ImportError("anthropic package required. Install with: pip install anthropic")
+
+        self.model = model
+        self._temperature = temperature
+        self._client = _anthropic.Anthropic(api_key=api_key or os.environ["ANTHROPIC_API_KEY"])
+
+    @staticmethod
+    def _enforce_strict_schema(schema: dict) -> None:
+        """Recursively set additionalProperties: false on all object types."""
+        if schema.get("type") == "object":
+            schema.setdefault("additionalProperties", False)
+        for key in ("properties", "$defs"):
+            if key in schema:
+                for sub in schema[key].values():
+                    if isinstance(sub, dict):
+                        AnthropicBrain._enforce_strict_schema(sub)
+        for key in ("items", "anyOf", "oneOf", "allOf"):
+            if key in schema:
+                target = schema[key]
+                if isinstance(target, dict):
+                    AnthropicBrain._enforce_strict_schema(target)
+                elif isinstance(target, list):
+                    for item in target:
+                        if isinstance(item, dict):
+                            AnthropicBrain._enforce_strict_schema(item)
 
     def process(
         self,
@@ -165,26 +245,43 @@ class AnthropicBrain(LLMBrain):
         history: Sequence[Message],
     ) -> tuple[LLMResponse, InferenceMetrics]:
         sys_prompt = build_system_prompt(definition, current_state)
-        chat = [self._system_message(sys_prompt)]
+        # Anthropic: system is separate, only pass non-system messages
+        all_msgs = _build_chat_messages(sys_prompt, history, message)
+        messages = [m for m in all_msgs if m["role"] != "system"]
 
-        for msg in history:
-            chat.append(self._user_message(f"[{msg.sender}]: {msg.content}"))
-
-        chat.append(self._user_message(f"[{message.sender}]: {message.content}"))
+        schema = json.loads(json.dumps(LLM_RESPONSE_SCHEMA))
+        self._enforce_strict_schema(schema)
 
         t0 = time.time()
-        result = self._llm.generate_structured(chat, LLM_RESPONSE_SCHEMA)
+        resp = self._client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            temperature=self._temperature,
+            system=sys_prompt,
+            messages=messages,
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": schema,
+                },
+            },
+        )
         latency_ms = (time.time() - t0) * 1000
 
-        usage = self._llm.last_usage
         metrics = InferenceMetrics(
-            input_tokens=usage.prompt_tokens if usage else 0,
-            output_tokens=usage.completion_tokens if usage else 0,
+            input_tokens=getattr(resp.usage, "input_tokens", 0) if resp.usage else 0,
+            output_tokens=getattr(resp.usage, "output_tokens", 0) if resp.usage else 0,
             latency_ms=latency_ms,
-            model=self._llm.model,
+            model=self.model,
         )
 
-        return _parse_llm_result(result), metrics
+        content_str = ""
+        for block in resp.content:
+            if hasattr(block, "text"):
+                content_str += block.text
+
+        raw = json.loads(content_str or "{}")
+        return _parse_llm_result(raw), metrics
 
 
 @dataclass

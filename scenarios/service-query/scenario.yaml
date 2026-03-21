@@ -1,0 +1,23 @@
+name: service-query
+description: >
+  Test that business logic objects can query service objects (read) and write
+  to service objects (write) through normal message bus chaining. A quote
+  approval request triggers an org-structure lookup from active-directory
+  and a notification to slack-notifier.
+
+steps:
+  # 1. Submit a $5000 quote for Alice — needs manager (Bob) approval
+  - action: send
+    target: quote-approvals
+    content: "New quote approval request: Alice submitted a $5000 quote for Acme Corp"
+
+assertions:
+  # quote-approvals should have queried active-directory for Alice's manager
+  - type: state
+    target: quote-approvals
+    condition: "There is a pending or processed approval involving Alice's quote for Acme Corp"
+
+  # slack-notifier should have recorded a notification to Bob (Alice's manager)
+  - type: state
+    target: slack-notifier
+    condition: "A notification was sent mentioning Bob as the approver for Alice's quote"

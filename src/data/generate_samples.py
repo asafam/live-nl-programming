@@ -2,7 +2,8 @@
 Sample generator for live NL programming.
 
 Generates concrete samples from raw Zapier automation templates using LLM-based
-generation. Each sample instantiates a template with specific values.
+generation. Each sample instantiates a template with specific values and
+decomposes it into LLM-objects with structured steps.
 
 Usage:
     python -m src.data.generate_samples \\
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -26,6 +28,7 @@ load_dotenv()
 
 from src.data.schema import Samples
 from src.data.llm import create_llm
+from src.lnl.parser import slugify
 from src.data.utils import (
     infer_provider,
     load_prompt_template,
@@ -52,21 +55,18 @@ Raw Steps:
 {steps}"""
 
 
-def format_prompt(prompt_template: dict, template: dict, samples_count: int, step_style: str = "plain") -> str:
-    """Format prompt template with template data and parameters."""
+def format_prompt(prompt_template: dict, template: dict, samples_count: int) -> str:
+    """Format prompt template with template data."""
     template_str = format_template(template)
-    prompt = prompt_template["base_prompt"]
-    if step_style == "actor":
-        prompt += prompt_template.get("actor_style_addendum", "")
-    else:
-        prompt += prompt_template.get("plain_style_addendum", "")
-    return prompt.format(
-        TEMPLATE=template_str,
-        SAMPLES_COUNT=samples_count,
+    return (
+        prompt_template["prompt"]
+        .replace("{TEMPLATE}", template_str)
+        .replace("{SAMPLES_COUNT}", str(samples_count))
     )
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for generate_samples."""
     parser = argparse.ArgumentParser(
         description="Generate samples from raw Zapier automation templates",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -95,7 +95,7 @@ Examples:
         "-o",
         type=Path,
         default=None,
-        help="Output JSONL path (default: derived from input filename and step-style)",
+        help="Output JSONL path (default: derived from input filename)",
     )
     parser.add_argument(
         "--prompt-template",
@@ -110,20 +110,26 @@ Examples:
         help="Number of samples to generate per template (default: 1)",
     )
     parser.add_argument(
-        "--step-style",
-        choices=["plain", "actor"],
-        default="plain",
-        help="Step rewriting style: 'plain' (default) or 'actor' (Actor-creation language)",
+        "--id",
+        dest="ids",
+        metavar="ID",
+        action="append",
+        default=None,
+        help="Only process template(s) with this ID (repeatable: --id foo --id bar)",
     )
     add_common_args(parser)
+    return parser
 
-    args = parser.parse_args()
 
-    # Derive default output path from input filename and step-style
+def default_output_path(input_path: Path) -> Path:
+    """Derive the default output path from input filename."""
+    return Path("outputs/data/zapier") / f"{input_path.stem}_samples.jsonl"
+
+
+def run(args: argparse.Namespace) -> Path:
+    """Run sample generation. Returns the output path."""
     if args.output is None:
-        input_stem = args.input.stem  # e.g. "templates"
-        output_name = f"{input_stem}_samples_{args.step_style}.jsonl"
-        args.output = Path("outputs/data/zapier") / output_name
+        args.output = default_output_path(args.input)
 
     # Infer provider from model if not specified
     if args.provider is None:
@@ -139,6 +145,14 @@ Examples:
     # Load data
     templates = load_yaml(args.input)
     prompt_template = load_prompt_template(args.prompt_template)
+
+    # Filter by ID if specified
+    if args.ids:
+        id_set = set(args.ids)
+        templates = [t for t in templates if t["id"] in id_set]
+        if not templates:
+            print(f"Error: no templates found with ID(s): {', '.join(sorted(id_set))}", file=sys.stderr)
+            sys.exit(1)
 
     # Apply limit if specified (0 or None means no limit)
     if args.limit:
@@ -157,7 +171,7 @@ Examples:
 
     if not pending:
         print("All templates already generated. Use --force to regenerate.")
-        return
+        return args.output
 
     if completed:
         print(f"Resuming: {len(completed)} already completed, {len(pending)} remaining")
@@ -168,10 +182,7 @@ Examples:
         args.provider,
         args.model,
         args.seed,
-        {
-            "Samples per template": str(args.samples_per_template),
-            "Step style": args.step_style,
-        },
+        {"Samples per template": str(args.samples_per_template)},
     )
 
     # Create LLM client
@@ -188,13 +199,9 @@ Examples:
     fail_count = 0
 
     with open(args.output, file_mode) as f:
-        for template in tqdm(pending, desc="Generating"):
-            # Format prompt
-            prompt = format_prompt(
-                prompt_template, template, args.samples_per_template, args.step_style
-            )
+        for template in tqdm(pending, desc="Generating samples"):
+            prompt = format_prompt(prompt_template, template, args.samples_per_template)
 
-            # Generate samples
             result = generate_with_retries(
                 llm=llm,
                 prompt=prompt,
@@ -204,7 +211,15 @@ Examples:
             )
 
             if result:
-                # Write each sample as a separate line
+                # Post-process: ensure all object_ids and step targets are slugified
+                for sample in result.samples:
+                    for obj in sample.objects:
+                        obj.object_id = slugify(obj.object_id)
+                        for peer in obj.peers:
+                            peer.object_id = slugify(peer.object_id)
+                    for step in sample.steps:
+                        step.target = slugify(step.target)
+
                 for sample in result.samples:
                     f.write(sample.model_dump_json() + "\n")
                 f.flush()
@@ -215,6 +230,12 @@ Examples:
     print()
     print(f"Complete. Output: {args.output}")
     print(f"Samples generated: {success_count}, Templates failed: {fail_count}")
+    return args.output
+
+
+def main():
+    args = build_parser().parse_args()
+    run(args)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,9 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, Field
 from typing import Literal
 from enum import Enum
+
+from src.lnl.parser import slugify
+from src.lnl.types import ObjectDefinition, PeerDeclaration
 
 class ModType(str, Enum):
     temporal = "temporal"
@@ -22,7 +25,9 @@ class EventExpect(BaseModel):
 
 class Event(BaseModel):
     id: str
-    source: str
+    call_type: str       # "send" or "send_event"
+    source: str          # external sender
+    recipient: str       # target object_id
     input: str
     when: str  # Same format as modification: "W02-1T09:00"
     expect: EventExpect
@@ -30,16 +35,56 @@ class Event(BaseModel):
 class GeneratedModification(BaseModel):
     """LLM output schema — mod_type and ambiguity are set by the script, not the LLM."""
     id: str
+    call_type: str = "send"  # always "send" — user instruction to the object
+    source: str = "__user__"  # always user-initiated
+    target: str       # object_id being modified
     when: str
     intent: str
 
 class Modification(BaseModel):
     """Full modification with script-assigned mod_type and ambiguity."""
     id: str
+    call_type: str = "send"  # always "send" — user instruction to the object
+    source: str = "__user__"  # always user-initiated
+    target: str       # object_id being modified
     when: str
     mod_type: ModType
     intent: str
     ambiguity: Ambiguity
+
+# Object definition schemas (Pydantic mirrors of LNL runtime dataclasses)
+class PeerDecl(BaseModel):
+    object_id: str
+    relationship: str  # communication contract: "Notify with ticket details when unresolved request arrives"
+
+    @field_validator("object_id")
+    @classmethod
+    def slugify_object_id(cls, v: str) -> str:
+        return slugify(v)
+
+class ObjectDef(BaseModel):
+    object_id: str
+    role: str
+    state_description: str
+    behavior: str
+    peers: list[PeerDecl] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    subscriptions: list[str] = Field(default_factory=list)
+
+    @field_validator("object_id")
+    @classmethod
+    def slugify_object_id(cls, v: str) -> str:
+        return slugify(v)
+
+class Step(BaseModel):
+    """A single workflow step: an NL text addressed to a specific LLM-object."""
+    text: str   # Natural language message to send to the target object
+    target: str      # object_id of the LLM-object this step addresses
+
+    @field_validator("target")
+    @classmethod
+    def slugify_target(cls, v: str) -> str:
+        return slugify(v)
 
 class TestCase(BaseModel):
     id: str
@@ -47,7 +92,8 @@ class TestCase(BaseModel):
     domain: str
     source_type: str
     link: str
-    steps: list[str]
+    objects: list[ObjectDef] = Field(default_factory=list)
+    steps: list[Step]
     modifications: list[Modification]
     events: list[Event]
 
@@ -55,12 +101,6 @@ class TestCases(BaseModel):
     test_cases: list[TestCase]
 
 # Sample generation schemas
-class ObjectDeclaration(BaseModel):
-    name: str
-    category: str  # "platform" or "business_logic"
-    responsibility: str
-    communicates_with: list[str]  # e.g., ["queries KnowledgeBase", "sends through Slack"]
-
 class Sample(BaseModel):
     id: str
     name: str
@@ -68,8 +108,8 @@ class Sample(BaseModel):
     source_type: str
     link: str
     raw_steps: list[str]
-    objects: list[ObjectDeclaration]
-    steps: list[str]
+    objects: list[ObjectDef]
+    steps: list[Step]
 
 class Samples(BaseModel):
     samples: list[Sample]
@@ -85,3 +125,18 @@ class Scenario(BaseModel):
 class Scenarios(BaseModel):
     scenarios: list[Scenario]
 
+
+def to_lnl_definition(obj: ObjectDef) -> ObjectDefinition:
+    """Convert Pydantic ObjectDef to dataclass ObjectDefinition."""
+    return ObjectDefinition(
+        object_id=obj.object_id,
+        role=obj.role,
+        state_description=obj.state_description,
+        behavior=obj.behavior,
+        peers=[
+            PeerDeclaration(object_id=p.object_id, relationship=p.relationship)
+            for p in obj.peers
+        ],
+        skills=list(obj.skills),
+        subscriptions=list(obj.subscriptions),
+    )

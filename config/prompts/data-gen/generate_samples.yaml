@@ -1,7 +1,7 @@
-base_prompt: |
+prompt: |
   # Task: Instantiate Automation Template
 
-  You are creating a concrete instance of an automation template.
+  You are creating a concrete instance of an automation template as a distributed LLM-object system.
 
   ---
 
@@ -13,9 +13,9 @@ base_prompt: |
 
   ## Your Task
 
-  Rewrite `raw_steps` as `steps`.
+  This is a two-phase task. Complete Phase 1 (object identification) before Phase 2 (step writing).
 
-  **Must instantiate**:
+  **Instantiate all placeholders**:
   - "a designated channel" → a specific channel name
   - "a team" → a specific team name
   - "a team member" → a specific person's role within the team
@@ -29,92 +29,72 @@ base_prompt: |
   - Invent unnecessary details
   - Expand on the original meaning
 
-plain_style_addendum: |
-
-  ## Plain Style
-
-  **Do not change**:
-  - Steps that describe system behavior without placeholders
-  - Steps that are already specific
-
-  If a step needs no changes, copy it unchanged.
-
-actor_style_addendum: |
+  ---
 
   ## Object-Style Rewriting
 
-  You are a system architect designing a distributed actors system. In addition to instantiating placeholders, rewrite the steps to describe program objects and their interactions.
+  You are a system architect designing a distributed object system. Rewrite the steps to describe program objects and their interactions.
 
-  Each object is an **actor with its own internal state**. An actor holds all the data it needs to do its job — it does not need a separate object to store data for it.
-
-  This is a two-phase task. Complete Phase 1 (object identification) before Phase 2 (step writing).
+  Each object is an **LLM-object with its own internal state and behavior**. An object holds all the data it needs to do its job — it does not need a separate object to store data for it.
 
   ### Object categories
 
-  Every object falls into one of two categories:
+  Use these categories as conceptual framing — they guide how you design objects, but `category` is not a schema field.
 
-  1. **Platform objects** (`platform`) — one per external system mentioned (Slack, HubSpot, ClickUp, Jira, etc.). Named by brand. They only listen, read, write, or send through that platform. They hold no business logic and never act on their own — they are always triggered by another object.
-  2. **Business logic objects** (`business_logic`) — one per distinct area of responsibility that involves decision-making, processing, routing, or orchestration. Named as domains (nouns), not actions (verbs). Each business logic actor owns its own data and state internally — it reads, writes, and queries its own data as part of its behavior. It interacts with the outside world only through platform objects.
+  1. **Service objects** — represent external systems the automation interacts with (Active Directory, Slack, HubSpot, databases, email, etc.). Named by brand or function as a slug (e.g., `slack`, `active-directory`, `hubspot`). Service objects come in two flavors:
+     - **Read services** have seeded state containing reference data (e.g., `active-directory` with `state_description: "Users: Sarah (manager: Bob, department: Engineering), ..."`). Their behavior is to respond to queries about their data.
+     - **Write services** have initially empty state and record what they receive (e.g., `slack-notifier` with behavior: "Record all received messages in state"). Their state becomes the audit trail.
+     Both reads and writes happen through normal peer messages — no special mechanism needed.
+  2. **Business logic objects** — one per distinct area of responsibility that involves decision-making, processing, routing, or orchestration. Named as domain slugs (nouns), not actions (verbs) (e.g., `support-triage`, `ticket-router`). Each business logic object owns its own business data and state internally. It interacts with external systems by sending messages to service objects via peer declarations.
 
-  Each domain gets exactly one object. Never split a domain into multiple objects (e.g., "FAQ Table" + "FAQ Logic" should be one "FAQ" object; "Retrospectives" + "RetroDataStore" should be one "Retrospectives" object). Never name objects by implementation role (Table, Store, Logic, Handler, Manager, Processor) — name them after the domain they represent. Look at the template `name` field for the core domain concept.
+  Each domain gets exactly one object. Never split a domain into multiple objects (e.g., "FAQ Table" + "FAQ Logic" should be one `faq` object; "Retrospectives" + "RetroDataStore" should be one `retrospectives` object). Never name objects by implementation role (Table, Store, Logic, Handler, Manager, Processor) — name them after the domain they represent. Look at the template `name` field for the core domain concept.
 
   An object is only valid if it has independently modifiable behavior — its own way of reading, writing, formatting, or processing that can change without affecting other objects. If an object has no such behavior, fold it into the object that uses it.
 
   ### Phase 1 — Object identification (populate the `objects` array)
 
-  Read all `raw_steps` first. Read the template `name` field to identify the core domain concept. Use it to guide object naming and grouping. Each business logic object should represent a complete domain (e.g., "Retrospectives" not "IncidentAnalyzer"). It owns its own data and logic — never create a separate object just to store data for it or just to run one step of its logic.
+  Read all `raw_steps` first. Read the template `name` field to identify the core domain concept. Use it to guide object naming and grouping. Each business logic object should represent a complete domain (e.g., `retrospectives` not `incident-analyzer`). It owns its own data and logic — never create a separate object just to store data for it or just to run one step of its logic.
 
-  Then identify every object needed:
+  Then identify every object needed. For each object, provide:
 
-  1. For each object, determine its `name`, `category` (one of `platform`, `business_logic`), and `responsibility` (one sentence describing what it does).
-  2. For each object, list its `communicates_with` — an array of strings describing each edge to another object and what flows across it (e.g., `"queries FAQ for matching answers"`, `"sends notifications through Slack"`).
-  3. Output all objects in the `objects` array before writing any steps.
+  1. `object_id` — slug format (lowercase, hyphens, e.g., `support-triage`, `slack`)
+  2. `role` — one sentence describing what the object is and does
+  3. `state_description` — what data/state the object tracks (e.g., "Tracks open tickets with priority, assignee, and status")
+  4. `behavior` — domain logic rules only, using when/then patterns. Do NOT include communication instructions here — peers handle that. Example: "When a new request arrives, classify by urgency. When urgency is high, escalate immediately. When a request is unresolved for 24h, flag for review."
+  5. `peers` — **directional**: only objects this one SENDS messages to. Each peer has:
+     - `object_id` — slug of the target object
+     - `relationship` — communication contract describing WHAT and WHEN to send (e.g., "Notify with ticket details and priority when a new unresolved request arrives")
+     Interactions with external systems are modeled as peers pointing to service objects (e.g., `{object_id: "active-directory", relationship: "Query for employee org structure when approval routing is needed"}`). This replaces skills like "look up manager" — the lookup is a message to a service object.
+  6. `skills` — purely internal capabilities that do NOT require external system calls (e.g., `calculate-totals`, `format-report`). If a capability involves reading from or writing to an external system, model it as a peer to a service object instead. Omit if none.
+  7. `subscriptions` — topics this object listens to (e.g., `new-ticket`, `escalation-needed`). Omit if none.
+
+  Output all objects in the `objects` array before writing any steps.
 
   ### Phase 2 — Step writing (populate the `steps` array)
 
-  Reference only objects declared in `objects`. Use "object" (never "Actor").
+  Steps are **external triggers only** — events that arrive from outside the system and start the automation. They are NOT a trace of the internal workflow.
 
-  Every object must be explicitly created before it is referenced:
-  - First reference → "Create a [Name] object that [responsibility]"
-  - Subsequent references → "[Name] [action]" (just the name)
-  - When one object acts through another → "[X] [action] through [Y]"
-  - Optional constraints → "(Optional: ...)"
+  Once a trigger fires, the objects take over: each object's behavior and peer declarations determine what happens next. The message bus chains messages automatically. You do not write steps for internal actions.
 
-  **Create-step ordering** — follow dependency order: if object A passes data to object B, create whichever acts first in the workflow first. All "Create" steps must come before any non-create steps that reference that object.
+  Ask yourself: "What external event causes this automation to run?" Write only that.
 
-  **Communication mechanics** — every interaction between objects must state:
-  - The initiating object
-  - The receiving object
-  - What is communicated
+  Each step is a JSON object with two fields:
+  - `target` — the `object_id` of the LLM-object that receives the external trigger
+  - `text` — the natural language content of the trigger (what arrived from outside)
 
-  When an object needs to reach a user or external system, the full pipeline must be stated. For example: "[BusinessLogic] sends [what] to the user through [Platform]". Platform objects are passive connectors — they never act alone. Every step involving a platform object must name the business logic object that triggers it. When a platform object receives external input (a user message, a webhook), the step must state which object the platform passes that input to.
+  **What IS a step**:
+  - A new record created in an external system → `{"target": "hubspot", "text": "New quote Q-2847 created by John Smith: 15% discount and extended payment terms requested"}`
+  - An inbound message or webhook → `{"target": "slack", "text": "Message in #support: our integration is broken, urgent"}`
+  - A scheduled or time-based event → `{"target": "quote-approvals", "text": "Daily check: identify quotes pending approval for more than 24 hours"}`
 
-  **Step patterns** — use these forms:
-  - Platform receives external input → "[Platform] receives [what] and passes it to [BusinessLogic]"
-  - Business logic acts on external system → "[BusinessLogic] [action] through [Platform]"
-  - Business logic notifies a user → "[BusinessLogic] sends [what] to the user through [Platform]"
-  - Business logic exchanges data with another → "[A] sends/queries [what] to/from [B]"
+  **What is NOT a step** (these are internal — handled by object behavior and peer chaining):
+  - An object querying another object (e.g., looking up a manager in org-directory)
+  - An object sending a notification or email
+  - An object updating a record in response to another object
+  - Any action that is a consequence of a prior step
 
-  Never write:
-  - "[Platform] [does something]" without naming which object triggered it
-  - "[Object] receives [something]" without naming who sent it
-  - "[Platform] categorizes / processes / decides" — platforms are passive connectors
+  **Most automations have only 1–2 steps.** If you find yourself writing more, stop and ask whether each step is truly an independent external trigger or an internal consequence of a prior one. Internal consequences are never steps.
 
-  **Information flow** — trace all data through the system:
-  - If an object sends updates, state: where the event originates → which object processes it → which platform delivers it
-  - If an object queries data, state what it queries and from which object
-  - If consecutive steps describe branching (found/not-found, simple/complex), use explicit if/otherwise
-
-  Describe what each object does and which objects it communicates with. Never describe implementation details (no "using AI", "with machine learning", etc.).
-
-  ### Correctness
-
-  Think like a programmer writing a program:
-  - An object can only use data it has access to — if it queries or receives from another object, state that explicitly.
-  - Platform objects are passive — they never initiate actions or make decisions. Another object always triggers them.
-  - When consecutive steps describe alternative paths (one for a matched condition, another for the unmatched case), express them as explicit branching (if/otherwise).
-  - Every output must have a traceable input — if an object sends updates, state which object provides the data and which platform object delivers it.
-  - Every step that mentions an object receiving data must name the sending object. "[X] receives [what]" is always wrong — write "[X] receives [what] from [Y]" or "[Y] sends [what] to [X]".
-  - Every object referenced in `steps` must appear in the `objects` array. Never introduce an object in steps that wasn't declared in Phase 1.
-
-  You must still instantiate all placeholders per the base instructions above.
+  **Correctness**:
+  - Every `target` must be a valid `object_id` from the `objects` array
+  - The `text` must contain only information that arrives with the external trigger — not data the objects will look up themselves

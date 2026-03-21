@@ -1,0 +1,36 @@
+name: proactive-event
+description: >
+  Test that an external email event (Sarah going vegan) causes the shopping list
+  to remove meat items and reject future meat additions.
+
+steps:
+  # 1. Add steaks to the shopping list
+  - action: send
+    target: shopping-list
+    content: "Add 2 steaks at $10 each to the shopping list"
+
+  # 2. Email arrives: Sarah is going vegan
+  - action: event
+    target: email-monitor
+    content: "New email from Sarah: 'I've decided to go vegan! Please remove all meat from the shopping list.'"
+
+  # 3. Try to add chicken (should be rejected)
+  - action: send
+    target: shopping-list
+    content: "Add 1 package of chicken wings for $10"
+
+assertions:
+  # Steaks should have been removed after the vegan event
+  - type: state
+    target: shopping-list
+    condition: "The shopping list does NOT contain steaks or any meat items"
+
+  # Vegan constraint should be remembered
+  - type: state
+    target: shopping-list
+    condition: "There is a vegan or no-meat dietary constraint active"
+
+  # Chicken should have been rejected
+  - type: state
+    target: shopping-list
+    condition: "The shopping list does NOT contain chicken wings"

@@ -1,0 +1,30 @@
+name: affirmative-event
+description: >
+  Test that an affirmative non-conflicting event ("ok to eat meat" when the list
+  already has meat) does not cause unnecessary state changes.
+
+steps:
+  # 1. Add meat items
+  - action: send
+    target: shopping-list
+    content: "Add 2 steaks at $10 each"
+
+  - action: send
+    target: shopping-list
+    content: "Add 1 chicken breast at $5"
+
+  # 2. Send affirmative email that doesn't conflict with current state
+  - action: event
+    target: email-monitor
+    content: "New email from Sarah: 'Just confirming - it's totally fine to buy meat products.'"
+
+assertions:
+  # Meat items should still be present (not removed)
+  - type: state
+    target: shopping-list
+    condition: "The shopping list still contains steaks and chicken"
+
+  # No vegan/vegetarian constraints should have been added
+  - type: state
+    target: shopping-list
+    condition: "There are NO vegan or vegetarian or no-meat dietary constraints"

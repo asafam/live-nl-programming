@@ -81,6 +81,8 @@ When a guest checks out, update availability and process billing.
 
 The H1 heading is slugified into the `object_id` ("Guest Manager" becomes `guest-manager`). Only `## Role` is required.
 
+For a complete guide on creating objects, writing definitions, messaging patterns, and using the CLI, see the **[Programming Guide](docs/programming-guide.md)**.
+
 ## Usage
 
 ### Library API
@@ -208,16 +210,35 @@ src/lnl/
 
 ## Tests
 
+### Unit tests (no API key needed)
+
 ```bash
 pytest tests/test_object.py tests/test_bus.py tests/test_parser.py tests/test_runtime.py tests/test_mocks.py tests/test_benchmark.py -v
 ```
 
-All tests use `MockBrain` — no API keys needed.
+All unit tests use `MockBrain` — deterministic, fast, no API calls.
 
-## Legacy System
+### Scenario tests (requires `OPENAI_API_KEY`)
 
-The original actor-based system is in `src/system/` and can still be run:
+Integration tests that make real LLM calls and use LLM-as-judge assertions:
 
 ```bash
-python -m src.app --provider openai --model gpt-4o-mini
+# Run all scenario tests (-s shows LLM responses as they stream)
+pytest tests/test_scenario.py -v -s
+
+# Run a single scenario
+pytest tests/test_scenario.py::TestProactiveEvent -v -s
 ```
+
+Available scenarios:
+
+| Test | What it verifies |
+|------|-----------------|
+| `TestProactiveEvent` | Email "going vegan" removes steaks, stores constraint, rejects chicken |
+| `TestIrrelevantEvent` | "Nice weather" leaves shopping list and budget unchanged |
+| `TestAffirmativeEvent` | "Ok to eat meat" when already having meat causes no changes |
+| `TestBudgetInteraction` | Adding items chains notifications to budget manager, cumulative tracking |
+| `TestPeerContractModification` | Live modification of peer contract changes notification behavior |
+
+These tests are automatically skipped if `OPENAI_API_KEY` is not set.
+

@@ -16,34 +16,35 @@ Requires a `.env` file with `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY`.
 ## Common Commands
 
 ```bash
-# Run interactive actor system
-python -m src.app --provider openai --model gpt-4o-mini
-python -m src.app --provider anthropic --model claude-3-5-sonnet-latest
+# Run tests (unit — no API key needed)
+pytest tests/test_object.py tests/test_bus.py tests/test_parser.py tests/test_runtime.py tests/test_mocks.py tests/test_benchmark.py -v
 
-# Run tests
-pytest tests/ -v
-pytest tests/test_mediator.py::test_mediator_basic -v  # single test
+# Run scenario tests (requires OPENAI_API_KEY)
+pytest tests/test_scenario.py -v -s
 
-# Data generation pipeline (two stages)
-python -m src.data.generate_samples -i data/zapier/raw/templates.yaml --samples-per-template 1
-python -m src.data.generate_test_cases -i outputs/data/zapier/generated/samples.jsonl --scenario-count 1
+# CLI
+python -m src.lnl.cli --provider openai load programs/hotel/objects/
+python -m src.lnl.cli --provider openai send guest-manager "Check in Alice"
+
+# Data generation pipeline
+python -m src.data.pipeline -i data/zapier/raw/templates.yaml --target-dir outputs/my-run
+python -m src.data.pipeline -i data/zapier/raw/templates.yaml --target-dir outputs/my-run  # continues if samples.jsonl exists
+python -m src.data.pipeline --samples outputs/data/zapier/templates_samples_object.jsonl  # skip stage 1 explicitly
 ```
 
 ## Architecture
 
-This project has two main subsystems:
+### LNL Runtime (`src/lnl/`)
 
-### Actor System (`src/system/`)
+LLM-objects communicate via natural language messages through a message bus. Definitions are written in Markdown and can be modified at runtime while state persists.
 
-An actor-based message bus where actors communicate via natural language. All domain logic is LLM-driven, not hardcoded.
+- **LLMObject** (`object.py`) — Definition + brain + mutable NL state string. Processes messages via LLM.
+- **MessageBus** (`bus.py`) — Routes messages between objects. Supports peer-to-peer (with peer validation), pub/sub, broadcast, and synchronous chaining with depth limit.
+- **LLMBrain** (`brain.py`) — Abstract LLM interface. OpenAI, Anthropic, and Mock implementations.
+- **Runtime** (`runtime.py`) — Library API: load, send, modify, inspect objects.
+- **Parser** (`parser.py`) — Markdown ↔ ObjectDefinition serializer.
 
-- **MessageBus** (`message_bus.py`) — Routes REQUEST, EVENT, and RESPONSE messages between actors. Supports pub/sub subscriptions by topic and broadcast.
-- **CoordinatorActor** (`actors/coordinator_actor.py`) — The entry point actor. Dynamically creates other actors and mediators from natural language requests, routes tasks to them.
-- **Actor** (`actors/base.py`) — Base class. Each actor has a name, state dict, LLM instance, and system prompt. `receive()` processes messages → LLM generates structured responses with `{response, state_updates, messages}`.
-- **MediatorActor** (`actors/mediator_actor.py`) — Subscribes to events, evaluates rules semantically via LLM, dispatches requests to target actors. Holds orchestration logic, not domain data.
-- **LLM clients** (`llm/`) — `AbstractLLM` interface with OpenAI and Anthropic implementations. Both support structured output via JSON schema.
-
-**Flow:** User → Coordinator → creates actors via MessageBus → actors exchange NL messages → LLM generates structured responses → state updates applied.
+**Flow:** `Runtime.send(target, msg)` → `MessageBus.send()` → `LLMObject.process_message()` → LLM returns `{updated_state, reply, outgoing_messages}` → bus recursively delivers outgoing messages.
 
 ### Data Generation Pipeline (`src/data/`)
 
@@ -60,8 +61,7 @@ Key design: `mod_type` and `ambiguity` are **script-controlled**, not LLM-genera
 
 ## Configuration
 
-- `config/system.yaml` — LLM model, temperature, seed, heartbeat, feature flags (proactivity, self_reflection)
-- `config/prompts/system/` — Actor, coordinator, mediator system prompts
+- `config/prompts/lnl/object.yaml` — System prompt template for LLM-objects
 - `config/prompts/data-gen/` — Data generation prompt templates (use `{PLACEHOLDER}` substitution)
 
 ## Skills
@@ -72,5 +72,5 @@ Key design: `mod_type` and `ambiguity` are **script-controlled**, not LLM-genera
 
 - Never hardcode domain-specific logic — keep code generic, configurable, LLM-driven
 - Prefer YAML configs over hardcoded values
-- Maintain clean actor separation with message passing via MessageBus
+- Maintain clean object separation with message passing via MessageBus
 - All domain behavior should be configurable or user-specified

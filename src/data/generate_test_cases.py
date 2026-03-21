@@ -75,13 +75,35 @@ MODIFICATION_TYPES = {
 
 
 def format_sample(sample: Sample) -> str:
-    """Format a sample instance for the prompt."""
-    steps = "\n".join(f"- {step}" for step in sample.steps)
+    """Format a sample instance for the prompt, including object definitions."""
+    # Format object definitions
+    objects_lines = []
+    for obj in sample.objects:
+        objects_lines.append(f"  - `{obj.object_id}`: {obj.role}")
+        objects_lines.append(f"    State: {obj.state_description}")
+        objects_lines.append(f"    Behavior: {obj.behavior}")
+        if obj.peers:
+            peers_str = ", ".join(
+                f"{p.object_id} ({p.relationship})" for p in obj.peers
+            )
+            objects_lines.append(f"    Peers: {peers_str}")
+        if obj.skills:
+            objects_lines.append(f"    Skills: {', '.join(obj.skills)}")
+        if obj.subscriptions:
+            objects_lines.append(f"    Subscriptions: {', '.join(obj.subscriptions)}")
+    objects_str = "\n".join(objects_lines)
+
+    steps = "\n".join(
+        f"- [{step.target}] {step.text}" for step in sample.steps
+    )
     return f"""ID: {sample.id}
 Name: {sample.name}
 Domain: {sample.domain}
 Source: {sample.source_type}
 Link: {sample.link}
+
+Objects:
+{objects_str}
 
 Steps:
 {steps}"""
@@ -102,18 +124,22 @@ def format_prompt(
 ) -> str:
     """Format prompt template with sample data and parameters."""
     sample_str = format_sample(sample)
-    return prompt_template.format(
-        SAMPLE=sample_str,
-        SCENARIO_COUNT=scenario_count,
-        EVENTS_BEFORE_COUNT=events_before,
-        EVENTS_AFTER_COUNT=events_after,
-        EVENTS_UNRELATED_COUNT=events_unrelated,
-        MODIFICATION_TYPE=modification_type,
-        MODIFICATION_TYPE_DESCRIPTION=modification_type_description,
-        MODS_PER_SCENARIO=mods_per_scenario,
-        AMBIGUITY_CONSTRAINT=ambiguity_constraint,
-        AMBIGUITY_DESCRIPTION=ambiguity_description,
-    )
+    substitutions = {
+        "SAMPLE": sample_str,
+        "SCENARIO_COUNT": str(scenario_count),
+        "EVENTS_BEFORE_COUNT": str(events_before),
+        "EVENTS_AFTER_COUNT": str(events_after),
+        "EVENTS_UNRELATED_COUNT": str(events_unrelated),
+        "MODIFICATION_TYPE": modification_type,
+        "MODIFICATION_TYPE_DESCRIPTION": modification_type_description,
+        "MODS_PER_SCENARIO": str(mods_per_scenario),
+        "AMBIGUITY_CONSTRAINT": ambiguity_constraint,
+        "AMBIGUITY_DESCRIPTION": ambiguity_description,
+    }
+    result = prompt_template
+    for key, value in substitutions.items():
+        result = result.replace(f"{{{key}}}", value)
+    return result
 
 
 def scenario_to_test_case(
@@ -130,13 +156,15 @@ def scenario_to_test_case(
         domain=sample.domain,
         source_type=sample.source_type,
         link=sample.link,
+        objects=sample.objects,
         steps=sample.steps,
         modifications=modifications,
         events=scenario.events,
     )
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for generate_test_cases."""
     parser = argparse.ArgumentParser(
         description="Generate test cases from sample instances",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -218,16 +246,22 @@ Examples:
         help="Ambiguity level for modifications (default: random). Use 'random' for random assignment per iteration.",
     )
     add_common_args(parser)
+    return parser
 
-    args = parser.parse_args()
 
+def default_output_path(input_path: Path, mod_type: str | None, ambiguity: str) -> Path:
+    """Derive the default output path from input file, mod-type, and ambiguity."""
+    input_stem = input_path.stem
+    mod_part = mod_type or "all"
+    output_name = f"{input_stem}__{mod_part}__{ambiguity}.jsonl"
+    return Path("outputs/data/zapier") / output_name
+
+
+def run(args: argparse.Namespace) -> Path:
+    """Run test case generation. Returns the output path."""
     # Derive default output path from input file, mod-type, and ambiguity
     if args.output is None:
-        input_stem = args.input.stem  # e.g. "samples"
-        mod_part = args.mod_type or "all"
-        ambiguity_part = args.ambiguity
-        output_name = f"{input_stem}__{mod_part}__{ambiguity_part}.jsonl"
-        args.output = Path("outputs/data/zapier") / output_name
+        args.output = default_output_path(args.input, args.mod_type, args.ambiguity)
 
     # Infer provider from model if not specified
     if args.provider is None:
@@ -262,7 +296,7 @@ Examples:
 
     if not pending:
         print("All samples already generated. Use --force to regenerate.")
-        return
+        return args.output
 
     if completed:
         print(f"Resuming: {len(completed)} already completed, {len(pending)} remaining")
@@ -309,7 +343,7 @@ Examples:
     total_iterations = len(pending) * len(mod_types_to_generate)
 
     with open(args.output, file_mode) as f:
-        with tqdm(total=total_iterations, desc="Generating") as pbar:
+        with tqdm(total=total_iterations, desc="Generating test cases") as pbar:
             for sample in pending:
                 for mod_type in mod_types_to_generate:
                     # Resolve mod types for each modification in the scenario
@@ -379,6 +413,12 @@ Examples:
     print()
     print(f"Complete. Output: {args.output}")
     print(f"Test cases generated: {success_count} (failed: {fail_count})")
+    return args.output
+
+
+def main():
+    args = build_parser().parse_args()
+    run(args)
 
 
 if __name__ == "__main__":

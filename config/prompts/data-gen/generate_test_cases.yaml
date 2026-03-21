@@ -18,10 +18,18 @@ user_prompt: |
   - One or more modifications (natural language rule changes)
   - Events that validate the modifications
 
-  **Critical**: Modifications and events must be grounded in the actual `steps`. 
-  Only reference entities, behaviors, and logic that exist in the instance.
+  **Critical**: Modifications and events must be grounded in the actual objects and their behaviors.
+  Only reference entities, rules, and logic that exist in the instance.
+  Events must be the same kind of external trigger as the sample's `steps` — not internal consequences.
 
   Do not invent concepts (like dollar thresholds) that are not part of the automation.
+
+  ## Object Definitions
+
+  The sample includes object definitions with their roles, behaviors, peers, and communication contracts.
+  Use these to understand what each object does and how the automation flows — but do NOT reproduce that flow in events.
+
+  When generating modifications, set `target` to the `object_id` of the object whose behavior is being modified.
 
   ---
 
@@ -31,40 +39,52 @@ user_prompt: |
   ```yaml
   modifications:
     - id: "M001"
+      call_type: "send"
+      source: "__user__"
+      target: "ticket-router"
       when: "W02-1T10:30"
       intent: "The natural language instruction as a user would say it"
     - id: "M002"
+      call_type: "send"
+      source: "__user__"
+      target: "notification-manager"
       when: "W02-2T14:00"
       intent: "Another rule change that builds on or interacts with M001"
   ```
 
   ### Events
 
-  Events are external inputs that trigger the automation. They are NOT:
-  - System outputs (e.g., "Approver receives Slack notification")
-  - Internal workflow steps (e.g., "System creates ticket")
-  - Results of prior events
+  Events are **external triggers only** — inputs that arrive from outside the system and start the automation. They mirror the `steps` in the sample: the same kinds of things that enter the system from the outside world.
 
-  Each event must be something that enters the system from outside.
+  Events are NOT:
+  - System outputs (e.g., "Approver receives Slack notification")
+  - Internal actions (e.g., "System looks up manager", "Object routes ticket")
+  - Consequences of other events (e.g., "HubSpot record updated after approval")
+
+  The `recipient` is the object that receives the external trigger directly — the same entry-point object targeted in the sample's `steps`. It is never a business logic object that only acts after receiving a chained message.
+
+  `call_type`: always `"send_event"` for external system triggers, `"send"` for direct user messages.
+  `source`: `"__external__"` for system-originated events, `"__user__"` for user messages.
 
   Each test case may include:
   - **Before events**: Trigger the SAME logic the modification will change. Shows "before" behavior.
-    Example: If modification is "skip Sarah in rotation", the before event should be one that
-    would assign to Sarah under normal rules → expect: assigned to Sarah
-  - **After events**: Same type of input, but now the modification applies. Shows "after" behavior.
-    Example: Same ticket type → expect: assigned to someone else (Sarah skipped)
-  - **Unrelated events**: Exercise different logic entirely, unaffected by the modification
+    Example: If modification is "skip Sarah in approval rotation", send a quote that would route to Sarah → expect: routed to Sarah
+  - **After events**: Same type of external trigger, but now the modification applies. Shows "after" behavior.
+    Example: Same type of quote → expect: routed to someone else (Sarah skipped)
+  - **Unrelated events**: A different external trigger that exercises logic unaffected by the modification
   - If multiple modifications: events between modifications to test intermediate states
 
   ```yaml
   events:
     - id: "E001"
-      source: "HubSpot"
+      call_type: "send_event"
+      source: "__external__"
+      recipient: "hubspot"
       when: "W02-1T09:00"
-      input: "Natural language payload with only vital information"
+      input: "New quote Q-1234 created by Alice: 10% discount requested"
       expect:
-        action: "What the system should do"
-        reason: "Why—which rule or logic applies"
+        action: "What the system should ultimately do (the observable outcome)"
+        reason: "Which rule or object behavior drives that outcome"
   ```
 
   ---

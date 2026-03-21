@@ -1,0 +1,35 @@
+name: irrelevant-event
+description: >
+  Test that an irrelevant message ("the weather is nice today") does not cause
+  any state changes in the shopping list or budget manager.
+
+steps:
+  # 1. Set budget
+  - action: send
+    target: budget-manager
+    content: "Set the budget to $50"
+
+  # 2. Add items
+  - action: send
+    target: shopping-list
+    content: "Add 2 apples at $1 each"
+
+  - action: send
+    target: shopping-list
+    content: "Add 1 milk at $4"
+
+  # 3. Send irrelevant message
+  - action: send
+    target: shopping-list
+    content: "The weather is nice today"
+
+assertions:
+  # Shopping list should still have the same items
+  - type: state
+    target: shopping-list
+    condition: "The shopping list contains apples and milk"
+
+  # Budget should be unchanged
+  - type: state
+    target: budget-manager
+    condition: "The budget is $50"
