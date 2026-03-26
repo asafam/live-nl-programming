@@ -211,6 +211,11 @@ class Runtime:
         """Process all pending mailbox messages until the system is quiescent."""
         results: list[ProcessingResult] = []
         total = 0
+        # Track which objects are awaiting replies from which peers.
+        # Only replies from awaited peers are routed back. This prevents ack
+        # cascades: write services (email, slack) should not reply at all;
+        # read services reply with data that is routed back once per query.
+        awaiting_reply: dict[str, set[str]] = {}  # object_id -> set of peer_ids
 
         while total < self._max_chain_depth:
             # Poll event sources and deliver to mailboxes
@@ -238,6 +243,40 @@ class Runtime:
             results.append(result)
             self._bus.record_processing(result)
 
+            logger.debug(
+                "[%d/%d] %s processed msg from %s (%s) → reply=%s, outgoing=%s",
+                total, self._max_chain_depth,
+                obj.object_id,
+                result.in_reply_to,
+                result.source_message_type.value if result.source_message_type else "?",
+                repr(result.reply[:80]) if result.reply else "(empty)",
+                [o.recipient for o in result.outgoing_messages],
+            )
+
+            # Route reply back to sender ONLY if the sender is awaiting a reply
+            # from this object (prevents ack storms from write-service objects).
+            if (
+                result.reply
+                and result.in_reply_to
+                and result.source_message_type != MessageType.REPLY
+                and result.in_reply_to not in ("__user__", "__system__", "__external__", "__code__")
+                and result.in_reply_to in self._bus.objects
+                and obj.object_id in awaiting_reply.get(result.in_reply_to, set())
+            ):
+                reply_msg = Message(
+                    sender=obj.object_id,
+                    recipient=result.in_reply_to,
+                    type=MessageType.REPLY,
+                    content=result.reply,
+                )
+                self._bus.deliver(reply_msg)
+                # Clear the awaited flag — reply delivered
+                awaiting_reply[result.in_reply_to].discard(obj.object_id)
+                logger.debug(
+                    "  ↩ reply routed: %s → %s",
+                    obj.object_id, result.in_reply_to,
+                )
+
             # Deliver outgoing peer messages
             for out in result.outgoing_messages:
                 chained = Message(
@@ -247,6 +286,20 @@ class Runtime:
                     content=out.content,
                 )
                 self._bus.deliver(chained)
+                logger.debug(
+                    "  → outgoing: %s → %s: %s",
+                    obj.object_id, out.recipient, repr(out.content[:80]),
+                )
+                # Always await replies from outgoing messages. Cascades are
+                # prevented at the source: write services produce empty replies.
+                awaiting_reply.setdefault(obj.object_id, set()).add(out.recipient)
+
+        if total >= self._max_chain_depth:
+            pending = [o.object_id for o in self._bus.objects.values() if o.has_pending]
+            logger.warning(
+                "Chain depth limit reached (%d). Still pending: %s",
+                self._max_chain_depth, pending,
+            )
 
         return results
 
@@ -450,6 +503,10 @@ class Runtime:
                 item.done.set()
 
     # --- Metrics ---
+
+    def set_message_listener(self, callback) -> None:
+        """Set a callback invoked on every message delivery: callback(Message)."""
+        self._bus.on_message = callback
 
     @property
     def metrics(self) -> BusMetrics:

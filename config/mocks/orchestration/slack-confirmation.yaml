@@ -1,0 +1,20 @@
+name: slack-confirmation-workflow
+time_scale: 0.01
+
+triggers:
+  # When the agent sends a Slack message to an approvals channel, a human replies
+  - tool: slack_send_message
+    match:
+      channel: ".*approv.*"
+    reactions:
+      - after_minutes: 1
+        source: slack
+        message: "[Slack] @reviewer replied in #{channel}: Looks good, approved."
+
+  # When the agent sends any Slack message, delivery is confirmed immediately
+  - tool: slack_send_message
+    match: {}
+    reactions:
+      - after_seconds: 2
+        source: slack
+        message: "[Slack] Message delivered to #{channel}."

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from typing import Callable, Optional
+
 from .object import LLMObject
 from .types import (
     Message,
@@ -32,6 +34,7 @@ class MessageBus:
         self._strict_peers = strict_peers
         self._log: list[MessageLog] = []
         self._metrics = BusMetrics()
+        self.on_message: Optional[Callable[[Message], None]] = None
 
     # --- Registration ---
 
@@ -79,6 +82,8 @@ class MessageBus:
         for obj in recipients:
             obj.deliver(message)
             self._log.append(MessageLog(message=message, delivered=True))
+            if self.on_message:
+                self.on_message(message)
 
         return recipients
 

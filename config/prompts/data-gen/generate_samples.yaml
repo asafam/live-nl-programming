@@ -41,13 +41,13 @@ prompt: |
 
   Use these categories as conceptual framing — they guide how you design objects, but `category` is not a schema field.
 
-  1. **Service objects** — represent external systems the automation interacts with (Active Directory, Slack, HubSpot, databases, email, etc.). Named by brand or function as a slug (e.g., `slack`, `active-directory`, `hubspot`). One object per external system — never split a system into separate read and write objects. Service objects come in two flavors:
-     - **Read services** have seeded state containing reference data (e.g., `active-directory` with `state_description: "Users: Sarah (manager: Bob, department: Engineering), ..."`). Their behavior is to respond to queries about their data.
-     - **Write services** have initially empty state and record what they receive (e.g., `slack` with behavior: "Record all received messages in state"). Their state becomes the audit trail.
+  1. **Service objects** — represent external systems the automation interacts with (databases, messaging platforms, CRM, directory services, email, etc.). Named by brand or function as a slug (e.g., `slack`, `active-directory`, `crm`). One object per external system — never split a system into separate read and write objects. Service objects come in two flavors:
+     - **Read services** have seeded reference data. Their behavior is to respond to queries about their data. Read services MUST reply with the requested data — the reply is the only way the caller receives the answer back. Read services MUST set `seed_data` (field 9) with concrete data for the scenario.
+     - **Write services** record what they receive and have initially empty state. Their state becomes the audit trail. Write services set `reply` to empty in their responses — they are fire-and-forget sinks. Their `behavior` field should end with: "Do not reply to incoming messages." IMPORTANT: "Do not reply" means the `reply` field in the JSON response is empty — it does NOT mean removing peer declarations. Entry-point write services (those with `event_sources`) still MUST declare peers to forward events to business logic objects.
      Both reads and writes happen through normal peer messages — no special mechanism needed.
-  2. **Business logic objects** — one per distinct area of responsibility that involves decision-making, processing, routing, or orchestration. Named as domain slugs (nouns), not actions (verbs) (e.g., `support-triage`, `ticket-router`). Each business logic object owns its own business data and state internally. It interacts with external systems by sending messages to service objects via peer declarations.
+  2. **Business logic objects** — one per distinct area of responsibility that involves decision-making, processing, routing, or orchestration. Named as domain slugs (nouns), not actions (verbs). Each business logic object owns its own business data and state internally. It interacts with external systems by sending messages to service objects via peer declarations.
 
-  Each domain gets exactly one object. Never split a domain into multiple objects (e.g., "FAQ Table" + "FAQ Logic" should be one `faq` object; "Retrospectives" + "RetroDataStore" should be one `retrospectives` object). Never name objects by implementation role (Table, Store, Logic, Handler, Manager, Processor) — name them after the domain they represent. Look at the template `name` field for the core domain concept.
+  Each domain gets exactly one object. Never split a domain into multiple objects (e.g., "FAQ Table" + "FAQ Logic" → one `faq` object; "Retrospectives" + "RetroDataStore" → one `retrospectives` object). Never name objects by implementation role (Table, Store, Logic, Handler, Manager, Processor) — name them after the domain they represent. Look at the template `name` field for the core domain concept.
 
   An object is only valid if it has independently modifiable behavior — its own way of reading, writing, formatting, or processing that can change without affecting other objects. If an object has no such behavior, fold it into the object that uses it.
 
@@ -63,11 +63,13 @@ prompt: |
   4. `behavior` — domain logic rules only, using when/then patterns. Do NOT include communication instructions here — peers handle that. Example: "When a new request arrives, classify by urgency. When urgency is high, escalate immediately. When a request is unresolved for 24h, flag for review."
   5. `peers` — **directional**: only objects this one SENDS messages to. Each peer has:
      - `object_id` — slug of the target object
-     - `relationship` — communication contract describing WHAT and WHEN to send (e.g., "Notify with ticket details and priority when a new unresolved request arrives")
-     Interactions with external systems are modeled as peers pointing to service objects (e.g., `{object_id: "active-directory", relationship: "Query for employee org structure when approval routing is needed"}`). This replaces skills like "look up manager" — the lookup is a message to a service object.
+     - `relationship` — communication contract describing WHAT and WHEN to send (e.g., "Notify with item details and priority when a new unresolved request arrives")
+     Interactions with external systems are modeled as peers pointing to service objects. This replaces skills like "look up X" — the lookup is a message to a service object.
+     **Entry-point service objects must have peers too.** If a service object has `event_sources` and its events need processing by a business logic object, it MUST declare that business logic object as a peer. Without this peer, incoming events dead-end at the service object and never reach the processor. Example: if an external system receives a webhook and a domain object handles the workflow, then the external system object needs a peer pointing to that domain object. Similarly, if the external system receives response/callback events the domain object must act on, it too needs that peer. Peers are directional — trace the flow from every event source to the object that processes it.
   6. `skills` — purely internal capabilities that do NOT require external system calls (e.g., `calculate-totals`, `format-report`). If a capability involves reading from or writing to an external system, model it as a peer to a service object instead. Omit if none.
   7. `subscriptions` — topics this object listens to (e.g., `new-ticket`, `escalation-needed`). Omit if none.
   8. `event_sources` — external triggers this object receives from outside the system boundary (e.g., `Slack webhook: incoming messages`, `HubSpot: new quote created`). Only for service objects or entry-point objects that receive external triggers. Omit if none.
+  9. `seed_data` — **read services only**: static reference data as a JSON object. This is immutable ground truth the object answers queries from — it is NOT the object's mutable state. Use specific names, values, and rules that match the scenario — invent realistic but unique names for this scenario. The structure depends on what the object stores: an org chart stores employees and reporting lines; a product catalog stores items with prices and categories; a policy table stores rules and thresholds. Whatever the object's `state_description` says it tracks, populate it with concrete values. Write services and business logic objects leave this as `{}`. If omitted, the object starts with no knowledge and will hallucinate answers.
 
   Output all objects in the `objects` array before writing any steps.
 
@@ -83,17 +85,17 @@ prompt: |
   - `target` — the `object_id` of the LLM-object that receives the external trigger
   - `text` — the natural language content of the trigger (what arrived from outside)
   - `expect` — the expected outcome when the system runs with **no modifications applied**:
-    - `action` — specific, observable terminal output (e.g., "Approval email sent to Sarah Chen")
-    - `reason` — the rule or peer relationship that produces it (e.g., "org-directory rule: discount >10% requires manager approval")
+    - `action` — specific, observable terminal output: what was sent, recorded, or produced, and to whom
+    - `reason` — the rule or peer relationship that produces it
 
   **What IS a step**:
-  - A new record created in an external system → `{"target": "hubspot", "text": "New quote Q-2847 created by John Smith: 15% discount and extended payment terms requested", "expect": {"action": "Approval email sent to Sarah Chen (manager)", "reason": "org-directory rule: discount >10% requires manager approval"}}`
-  - An inbound message or webhook → `{"target": "slack", "text": "Message in #support: our integration is broken, urgent", "expect": {"action": "Support ticket created and assigned to on-call engineer", "reason": "support-triage behavior: urgent messages trigger immediate ticket creation"}}`
-  - A scheduled or time-based event → `{"target": "quote-approvals", "text": "Daily check: identify quotes pending approval for more than 24 hours"}`
+  - An external system creates a record that triggers the automation (e.g., a new item submitted via webhook)
+  - An inbound message that the system must act on (e.g., a message received on a platform the system monitors)
+  - A scheduled or time-based trigger (e.g., a daily check or heartbeat)
 
   **What is NOT a step** (these are internal — handled by object behavior and peer chaining):
-  - An object querying another object (e.g., looking up a manager in org-directory)
-  - An object sending a notification or email
+  - An object querying another object for data
+  - An object sending a notification, email, or downstream message
   - An object updating a record in response to another object
   - Any action that is a consequence of a prior step
 
@@ -103,3 +105,5 @@ prompt: |
   - Every `target` must be a valid `object_id` from the `objects` array
   - Every `target` must be an object whose `event_sources` list is non-empty — only objects that listen for external triggers can receive steps
   - The `text` must contain only information that arrives with the external trigger — not data the objects will look up themselves
+  - Steps run sequentially on a shared runtime — each step's `expect` must be valid given the accumulated state from all prior steps. Do not write an `expect` whose precondition is negated by a prior step (e.g., a "check for pending items" step after a prior step already resolved all items).
+  - Omit `expect` entirely when the outcome depends on transient state (scheduled checks, polls, heartbeats).

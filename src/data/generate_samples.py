@@ -29,6 +29,7 @@ load_dotenv()
 from src.data.schema import Samples
 from src.data.llm import create_llm
 from src.lnl.parser import slugify
+from src.data.llm.base import ChatMessage
 from src.data.utils import (
     infer_provider,
     load_prompt_template,
@@ -40,6 +41,31 @@ from src.data.utils import (
     setup_output,
     print_run_info,
 )
+
+
+def _seed_initial_state(llm, state_description: str) -> dict:
+    """Convert a state_description text into a concrete JSON initial_state dict."""
+    from pydantic import BaseModel
+    class _State(BaseModel):
+        state: dict
+
+    messages = [
+        ChatMessage(
+            role="user",
+            content=(
+                "Convert the following natural-language state description into a concrete "
+                "JSON object representing the initial state of this read-service object. "
+                "Include all specific names, values, rules, and relationships mentioned. "
+                "Return only the JSON object that would be stored as the object's state.\n\n"
+                f"State description: {state_description}"
+            ),
+        )
+    ]
+    try:
+        result = llm.generate_structured(messages=messages, response_model=_State)
+        return result.state if result else {}
+    except Exception:
+        return {}
 
 
 def format_template(template: dict) -> str:
@@ -219,6 +245,20 @@ def run(args: argparse.Namespace) -> Path:
                             peer.object_id = slugify(peer.object_id)
                     for step in sample.steps:
                         step.target = slugify(step.target)
+
+                # Post-process: seed seed_data for read services that left it empty.
+                # A read service has no peers and no event_sources but has state_description.
+                for sample in result.samples:
+                    for obj in sample.objects:
+                        if (
+                            not obj.seed_data
+                            and not obj.peers
+                            and not obj.event_sources
+                            and obj.state_description.strip()
+                        ):
+                            seeded = _seed_initial_state(llm, obj.state_description)
+                            if seeded:
+                                obj.seed_data = seeded
 
                 for sample in result.samples:
                     f.write(sample.model_dump_json() + "\n")

@@ -78,7 +78,7 @@ class AnthropicChatLLM(AbstractLLM):
         including nested $defs.
         """
         if schema.get("type") == "object":
-            schema.setdefault("additionalProperties", False)
+            schema["additionalProperties"] = False
         for key in ("properties", "$defs"):
             if key in schema:
                 for sub in schema[key].values():

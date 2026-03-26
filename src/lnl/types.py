@@ -11,6 +11,7 @@ class MessageType(Enum):
     DOMAIN = "domain"
     ADMIN = "admin"
     EVENT = "event"
+    REPLY = "reply"
 
 
 @dataclass
@@ -31,6 +32,7 @@ class ObjectDefinition:
     skills: list[str] = field(default_factory=list)
     subscriptions: list[str] = field(default_factory=list)
     event_sources: list[str] = field(default_factory=list)
+    seed_data: dict = field(default_factory=dict)  # static reference data; never mutated at runtime
 
 
 @dataclass
@@ -67,6 +69,15 @@ class ToolResult:
 
 
 @dataclass
+class ExternalAction:
+    """A structured action directed at an external system (Slack, Email, Jira, etc.)."""
+    system: str    # e.g. "slack", "email", "jira"
+    action: str    # e.g. "send_message", "send", "create_issue"
+    content: str   # NL content: message body, email text, ticket description, etc.
+    params: dict = field(default_factory=dict)  # structured params: channel, to, subject, project, etc.
+
+
+@dataclass
 class LLMResponse:
     """Structured response returned by an LLM brain."""
     updated_state: dict
@@ -74,6 +85,7 @@ class LLMResponse:
     outgoing_messages: list[OutgoingMessage] = field(default_factory=list)
     reasoning: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
+    external_actions: list[ExternalAction] = field(default_factory=list)
 
 
 @dataclass
@@ -94,6 +106,9 @@ class ProcessingResult:
     state_before: dict = field(default_factory=dict)
     state_after: dict = field(default_factory=dict)
     metrics: Optional[InferenceMetrics] = None
+    in_reply_to: Optional[str] = None  # sender of the message that was processed
+    source_message_type: Optional[MessageType] = None  # type of the message that was processed
+    external_actions: list[ExternalAction] = field(default_factory=list)
 
 
 @dataclass

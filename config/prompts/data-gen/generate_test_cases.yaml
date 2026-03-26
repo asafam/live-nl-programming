@@ -57,9 +57,9 @@ user_prompt: |
   Events are **external triggers only** — inputs that arrive from outside the system and start the automation. They mirror the `steps` in the sample: the same kinds of things that enter the system from the outside world.
 
   Events are NOT:
-  - System outputs (e.g., "Approver receives Slack notification")
-  - Internal actions (e.g., "System looks up manager", "Object routes ticket")
-  - Consequences of other events (e.g., "HubSpot record updated after approval")
+  - System outputs (e.g., "downstream system receives notification")
+  - Internal actions (e.g., "system looks up data", "object routes message")
+  - Consequences of other events (e.g., "record updated after processing")
 
   The `recipient` is the object that receives the external trigger directly — the same entry-point object targeted in the sample's `steps`. It must be an object whose `event_sources` list is non-empty in the sample's object definitions. It is never a business logic object that only acts after receiving a chained message.
 
@@ -68,48 +68,43 @@ user_prompt: |
 
   Each test case may include:
   - **Before events**: Trigger the SAME logic the modification will change. Shows "before" behavior.
-    Example: If modification is "skip Sarah in approval rotation", send a quote that would route to Sarah → expect: routed to Sarah
+    Example: If modification is "skip <person> in approval rotation", send a trigger that would route to <person> → expect: routed to <person>
   - **After events**: Same type of external trigger, but now the modification applies. Shows "after" behavior.
-    Example: Same type of quote → expect: routed to someone else (Sarah skipped)
+    Example: Same type of trigger → expect: routed to someone else (<person> skipped)
   - **Unrelated events**: A different external trigger that exercises logic unaffected by the modification
   - If multiple modifications: events between modifications to test intermediate states
 
   **Rules for writing assertable events:**
 
   1. **Ambiguity applies to the modification intent, never to `expect.action`.**
-     Even when a modification is vague (e.g., "Sarah is out for a while"), `expect.action`
+     Even when a modification is vague (e.g., "<person> is out for a while"), `expect.action`
      must commit to a specific, observable outcome — which object acted, what it sent or
      recorded, to whom. Take the most natural interpretation of the vague intent and state
      it concretely. Never hedge with words like "appropriately", "as needed", or "if applicable".
 
   2. **`expect.action` describes terminal observable output, not internal routing.**
-     Write what would appear in a write-service state, a reply, or an external system record:
-     "Approval email sent to Michael Johnson (manager)", "HubSpot quote Q-1234 marked Approved",
-     "Slack message posted to #deal-desk". Not "system routes to approver" or "object handles request".
+     Write what would appear in a write-service state, a reply, or an external system record — what was sent, recorded, or produced and to whom. Not "system routes to approver" or "object handles request".
 
   3. **For removal modifications, specify the fallback.**
      After-events must state both (a) what no longer happens, AND (b) what happens instead —
      or explicitly that the trigger completes without that action and the workflow continues
-     normally through another channel. Example: "No approval email sent; approval request
-     delivered via Slack channel instead."
+     normally through another channel.
 
   4. **Before-events must test the exact condition the modification will change.**
-     If the modification will change how quotes above 10% discount are routed, the before-event
-     must include a quote above 10% discount and expect the pre-modification routing. A generic
-     passing scenario is not a regression test.
+     The before-event must exercise the precise rule or behavior the modification targets, and
+     expect the pre-modification outcome. A generic passing scenario is not a regression test.
 
   5. **`expect.reason` must name the specific rule, behavior clause, or peer relationship**
-     that produces the outcome (e.g., "org-directory rule: combined concessions require finance
-     director approval"). Not a description of the modification's ambiguity.
+     that produces the outcome. Not a description of the modification's ambiguity.
 
   ```yaml
   events:
     - id: "E001"
       call_type: "send_event"
       source: "__external__"
-      recipient: "hubspot"
+      recipient: "<entry-point object from sample>"
       when: "W02-1T09:00"
-      input: "New quote Q-1234 created by Alice: 10% discount requested"
+      input: "<external trigger content matching the sample's step pattern>"
       expect:
         action: "What the system should ultimately do (the observable outcome)"
         reason: "Which rule or object behavior drives that outcome"

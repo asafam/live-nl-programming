@@ -29,7 +29,7 @@ class LLMObject:
     ) -> None:
         self._definition = definition
         self._brain = brain
-        self._state: dict = {}
+        self._state: dict = {}  # mutable runtime state; seed_data is static and kept on definition
         self._history: list[Message] = []
         self._mailbox: deque[Message] = deque()
         self._tool_registry = tool_registry
@@ -129,6 +129,9 @@ class LLMObject:
             state_before=state_before,
             state_after=self._state,
             metrics=total_metrics,
+            in_reply_to=message.sender,
+            source_message_type=message.type,
+            external_actions=response.external_actions,
         )
 
 

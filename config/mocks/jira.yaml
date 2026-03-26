@@ -1,0 +1,21 @@
+system: jira
+tools:
+  - method: jira_create_issue
+    immediate:
+      template: "issue_id: PROJ-{tool_call_id}, created in project {project}: {summary}"
+    callback:
+      delay_seconds: 0.2
+      message_template: "[Jira] Issue PROJ-{tool_call_id} created and assigned"
+      source: jira
+
+  - method: jira_update_issue
+    immediate:
+      template: "issue {issue_id} updated to status: {status}"
+
+  - method: jira_get_issue
+    immediate:
+      template: '{"id": "{issue_id}", "status": "open", "summary": "(issue details)"}'
+
+  - method: jira_list_issues
+    immediate:
+      template: "[]"

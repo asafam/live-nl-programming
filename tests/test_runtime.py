@@ -104,11 +104,19 @@ class TestChainProcessing:
 
         results = rt.send("b", "start chain", sender="a")
 
-        assert len(results) == 2
+        # b processes first (direct recipient)
         assert results[0].object_id == "b"
-        assert results[1].object_id == "c"
         assert results[0].state_after == {"status": "b got it"}
-        assert results[1].state_after == {"status": "c got it"}
+        # b and c participate; b's reply to a is NOT routed because a didn't
+        # send via outgoing_messages (it was an external rt.send)
+        processed_ids = {r.object_id for r in results}
+        assert processed_ids == {"b", "c"}
+        # c eventually gets the forwarded message
+        c_result = next(r for r in results if r.object_id == "c")
+        assert c_result.state_after == {"status": "c got it"}
+        # c's reply IS routed back to b (b sent via outgoing_messages)
+        reply_results = [r for r in results if r.source_message_type == MessageType.REPLY]
+        assert len(reply_results) > 0
 
     def test_chain_depth_limit(self):
         """Chain exceeding max depth stops processing (no exception — just stops)."""
@@ -155,11 +163,18 @@ class TestChainProcessing:
 
         results = rt.send("a", "start")
 
-        assert len(results) == 3
+        # a processes first, then b and c, with replies interleaved
         assert results[0].object_id == "a"
-        # BFS: b and c process in registration order
-        assert results[1].object_id == "b"
-        assert results[2].object_id == "c"
+        # All three objects participate
+        processed_ids = {r.object_id for r in results}
+        assert processed_ids == {"a", "b", "c"}
+        # b and c both process (order may vary due to reply interleaving)
+        non_reply = [r for r in results if r.source_message_type != MessageType.REPLY]
+        assert non_reply[0].object_id == "a"
+        assert {r.object_id for r in non_reply[1:]} == {"b", "c"}
+        # Replies from b and c route back to a
+        reply_results = [r for r in results if r.source_message_type == MessageType.REPLY]
+        assert len(reply_results) > 0
 
 
 class TestInjectEvent:
@@ -197,9 +212,10 @@ class TestInjectEvent:
 
         results = rt.inject_event("slack", "urgent message")
 
-        assert len(results) == 2
         assert results[0].object_id == "slack"
         assert results[1].object_id == "triage"
+        # triage's reply routes back to slack
+        assert any(r.source_message_type == MessageType.REPLY for r in results)
 
 
 class TestEventRegistry:
@@ -380,9 +396,10 @@ class TestEventSources:
         source.fire("urgent message")
         results = rt.process_pending()
 
-        assert len(results) == 2
         assert results[0].object_id == "slack"
         assert results[1].object_id == "triage"
+        # triage's reply routes back to slack
+        assert any(r.source_message_type == MessageType.REPLY for r in results)
 
     def test_multiple_event_sources(self):
         """Object with multiple event_sources gets separate providers."""
@@ -450,7 +467,8 @@ class TestLiveMode:
         try:
             item = rt.submit("a", "start")
             item.done.wait(timeout=5.0)
-            assert len(item.results) == 2
+            # a→b chain + b's reply back to a = 3 results
+            assert len(item.results) == 3
         finally:
             rt.stop()
 

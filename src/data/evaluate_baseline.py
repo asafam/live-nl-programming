@@ -36,11 +36,13 @@ load_dotenv()
 from src.data.schema import (
     EvalSummary,
     EventResult,
+    MockScript,
     ModificationResult,
     ObjectDef,
     TestCase,
     TestCaseResult,
 )
+from src.data.mock_server import MockServer, resolve_mock_configs, resolve_orchestration
 from src.data.utils import (
     add_common_args,
     infer_provider,
@@ -91,14 +93,21 @@ def _format_components(objects: list[ObjectDef]) -> str:
     return "\n\n".join(parts)
 
 
-def build_system_prompt(tc: TestCase) -> str:
+def build_system_prompt(tc: TestCase, tool_list: Optional[list[str]] = None) -> str:
     """Build the single-agent system prompt from a TestCase."""
     config = _load_prompt_config()
     template = config["system_prompt"]
+
+    tools_section = ""
+    if tool_list:
+        tools_template = config.get("tools_section_template", "")
+        tools_section = tools_template.format(tool_list="\n".join(f"  - {t}" for t in tool_list))
+
     return template.format(
         workflow_name=tc.name,
         components=_format_components(tc.objects),
         current_state="(empty)",
+        tools_section=tools_section,
     )
 
 
@@ -114,10 +123,11 @@ def parse_when(when: str) -> int:
 
 # ── Evidence gathering ───────────────────────────────────────────────────────
 
-def gather_evidence(content: str) -> str:
+def gather_evidence(content: str, tool_calls: Optional[list[dict]] = None) -> str:
     """Collect observable evidence from an OpenClaw agent response.
 
     Tries to parse as JSON (structured response); falls back to raw text.
+    Optionally appends tool call records from the MockServer.
     """
     try:
         data = json.loads(content)
@@ -134,6 +144,15 @@ def gather_evidence(content: str) -> str:
         state = data.get("updated_state", {})
         if state:
             parts.append(f"State:\n{json.dumps(state, indent=2)}")
+
+        if tool_calls:
+            lines = []
+            for tc in tool_calls:
+                if tc.get("is_callback"):
+                    lines.append(f"  - [{tc['method']}] {tc['result']}")
+                else:
+                    lines.append(f"  - {tc['method']}({json.dumps(tc.get('args', {}))}) → {tc['result']}")
+            parts.append("Tool calls:\n" + "\n".join(lines))
 
         return "\n\n".join(parts) if parts else content
     except (json.JSONDecodeError, AttributeError):
@@ -209,10 +228,19 @@ def _execute_test_case_inner(
     tc: TestCase,
     agent: OpenClawAgent,
     harness,
+    mock_server: Optional["MockServer"] = None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase against an OpenClaw agent and return results."""
 
-    sys_prompt = build_system_prompt(tc)
+    tool_list: Optional[list[str]] = None
+    if mock_server and mock_server._state.mock_script:
+        tool_list = [
+            tool.method
+            for sys in mock_server._state.mock_script.systems
+            for tool in sys.tools
+        ]
+
+    sys_prompt = build_system_prompt(tc, tool_list=tool_list)
 
     # Build the ordered list of messages to send
     messages: list[dict[str, Any]] = []
@@ -242,6 +270,9 @@ def _execute_test_case_inner(
                 "content": f"[Administrative instruction at {item.when}]: {item.intent}",
             })
         else:
+            # Skip pre-scripted injection for events handled by orchestration
+            if mock_server and item.triggered_by is not None:
+                continue
             messages.append({
                 "kind": "event",
                 "item": item,
@@ -250,7 +281,19 @@ def _execute_test_case_inner(
 
     # Execute all messages through OpenClaw
     openclaw_messages = [{"content": m["content"]} for m in messages]
+
+    if mock_server:
+        mock_server.configure(agent._session_counter + 1)
+
     results = agent.run_session(sys_prompt, openclaw_messages)
+
+    # Collect MockServer call log (if active)
+    mock_log: list[dict] = []
+    if mock_server:
+        # Brief wait for any pending orchestration reactions to fire
+        import time as _time
+        _time.sleep(0.5)
+        mock_log = mock_server.get_log()
 
     # Map results back to event/mod results
     event_results: list[EventResult] = []
@@ -263,7 +306,7 @@ def _execute_test_case_inner(
         if msg_meta["kind"] == "step":
             expect = msg_meta["expect"]
             if expect is not None:
-                evidence = gather_evidence(content)
+                evidence = gather_evidence(content, tool_calls=mock_log if mock_server else None)
                 passed, reasoning = harness.evaluate_assertion(expect.action, evidence)
                 event_results.append(EventResult(
                     event_id=f"S{msg_meta['index']+1:03d}",
@@ -278,15 +321,34 @@ def _execute_test_case_inner(
                 latency_ms=latency_ms,
             ))
 
-        else:  # event
+        else:  # pre-scripted event (no triggered_by)
             item = msg_meta["item"]
-            evidence = gather_evidence(content)
+            evidence = gather_evidence(content, tool_calls=mock_log if mock_server else None)
             passed, reasoning = harness.evaluate_assertion(item.expect.action, evidence)
             event_results.append(EventResult(
                 event_id=item.id,
                 passed=passed,
                 reasoning=reasoning,
                 latency_ms=latency_ms,
+            ))
+
+    # Evaluate orchestration-triggered events against the full mock log as evidence
+    if mock_server:
+        orchestration_evidence = gather_evidence("{}", tool_calls=mock_log)
+        for evt in tc.events:
+            if evt.triggered_by is None:
+                continue
+            # Check whether the expected reaction appears in the log
+            reaction_log = [
+                e for e in mock_log
+                if e.get("is_orchestration") and evt.source in e.get("method", "")
+            ]
+            evidence = gather_evidence("{}", tool_calls=reaction_log) if reaction_log else "(no orchestration reaction fired)"
+            passed, reasoning = harness.evaluate_assertion(evt.expect.action, evidence)
+            event_results.append(EventResult(
+                event_id=evt.id,
+                passed=passed,
+                reasoning=reasoning,
             ))
 
     return event_results, mod_results
@@ -297,13 +359,14 @@ def execute_test_case(
     agent: OpenClawAgent,
     harness,
     timeout_s: Optional[float] = None,
+    mock_server: Optional[MockServer] = None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase with an optional wall-clock timeout."""
     if timeout_s is None:
-        return _execute_test_case_inner(tc, agent, harness)
+        return _execute_test_case_inner(tc, agent, harness, mock_server=mock_server)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_execute_test_case_inner, tc, agent, harness)
+        future = executor.submit(_execute_test_case_inner, tc, agent, harness, mock_server)
         try:
             return future.result(timeout=timeout_s)
         except concurrent.futures.TimeoutError:
@@ -400,6 +463,23 @@ def run(args: argparse.Namespace) -> Path:
         gateway_url=args.gateway_url,
     )
 
+    # Build MockServer (optional)
+    mock_server: Optional[MockServer] = None
+    if getattr(args, "mock_server", False):
+        openclaw_http_url = getattr(args, "openclaw_http_url", "http://localhost:18789")
+        mock_port = getattr(args, "mock_server_port", 18888)
+        llm_mode = getattr(args, "mock_llm_mode", False)
+        print(f"Mock server: enabled (port {mock_port}, {'LLM' if llm_mode else 'script'} mode)")
+        # Script will be resolved per test case; start with no script loaded
+        mock_server = MockServer(
+            openclaw_url=openclaw_http_url,
+            port=mock_port,
+            llm_mode=llm_mode,
+        )
+        mock_server.start()
+        mock_server.wait_ready()
+        print("Mock server: ready")
+
     # Judge uses an LLM brain
     judge_provider = args.judge_provider or "openai"
     judge_model = args.judge_model or "gpt-4o-mini"
@@ -419,12 +499,19 @@ def run(args: argparse.Namespace) -> Path:
 
     with open(args.output, "w") as f:
         for tc in test_cases:
+            # Load mock config for this test case (if mock server is active)
+            if mock_server is not None:
+                tc_mock_script = resolve_mock_configs(tc)
+                mock_server._state.mock_script = tc_mock_script
+                tc_orchestration = resolve_orchestration(tc)
+                mock_server._state.orchestration_script = tc_orchestration
+
             for run_idx in range(args.runs):
                 label = f"{tc.id} run={run_idx}"
                 print(f"  Evaluating {label} ...", end=" ", flush=True)
                 try:
                     event_results, mod_results = execute_test_case(
-                        tc, agent, harness, timeout_s
+                        tc, agent, harness, timeout_s, mock_server=mock_server
                     )
                     pass_rate = (
                         sum(1 for e in event_results if e.passed) / len(event_results)
@@ -450,6 +537,9 @@ def run(args: argparse.Namespace) -> Path:
     summary = _compute_summary(all_tc_results)
     with open(args.output, "a") as f:
         f.write(summary.model_dump_json() + "\n")
+
+    if mock_server is not None:
+        mock_server.stop()
 
     print()
     print(f"Complete. Output: {args.output}")
@@ -520,6 +610,29 @@ Examples:
         type=int,
         default=None,
         help="Process only the first N test cases",
+    )
+    parser.add_argument(
+        "--mock-server",
+        action="store_true",
+        default=False,
+        help="Enable mock external system integration (Slack, Email, Jira, etc.)",
+    )
+    parser.add_argument(
+        "--mock-server-port",
+        type=int,
+        default=18888,
+        help="Port for the mock server (default: 18888)",
+    )
+    parser.add_argument(
+        "--mock-llm-mode",
+        action="store_true",
+        default=False,
+        help="Use LLM to generate mock responses instead of YAML scripts",
+    )
+    parser.add_argument(
+        "--openclaw-http-url",
+        default="http://localhost:18789",
+        help="OpenClaw gateway HTTP URL for callback injection (default: http://localhost:18789)",
     )
     return parser
 

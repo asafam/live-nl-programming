@@ -1,0 +1,14 @@
+{
+  "name": "openclaw-mock-external",
+  "version": "1.0.0",
+  "description": "OpenClaw plugin: mock external system tools (Slack, Email, Jira, Webhook) for LNL baseline evaluation",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.0"
+  }
+}

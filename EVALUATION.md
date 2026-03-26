@@ -50,6 +50,23 @@ python -m src.data.evaluate \
     --model gpt-4o
 ```
 
+Use a separate model for the LLM judge (e.g., a stronger model to judge a cheaper object model):
+
+```bash
+python -m src.data.evaluate \
+    -i outputs/data/zapier/20260322_010211/test_cases.jsonl \
+    --model gpt-4o \
+    --judge-model claude-sonnet-4-6
+```
+
+Add `--verbose` / `-v` to see per-event details during the run — what the judge expected, the evidence it saw, and its reasoning:
+
+```bash
+python -m src.data.evaluate \
+    -i outputs/data/zapi    er/20260322_010211/test_cases.jsonl \
+    --model gpt-4o --verbose
+```
+
 Output: `test_cases_eval.jsonl` (next to input file)
 
 ### OpenClaw Baseline (single agent)
@@ -57,10 +74,43 @@ Output: `test_cases_eval.jsonl` (next to input file)
 ```bash
 python -m src.data.evaluate_baseline \
     -i outputs/data/zapier/20260322_010211/test_cases.jsonl \
+    --mock-server \
     --runs 3
 ```
 
 Output: `test_cases_baseline.jsonl` (next to input file)
+
+#### Mock external system integration (`--mock-server`)
+
+When `--mock-server` is passed, the runner automatically:
+
+1. **Starts a MockServer** (FastAPI, `localhost:18888`) before the first test case and stops it after the last.
+2. **Per test case**: scans object `skills` and `event_sources` for system keywords (`slack`, `email`, `jira`, `webhook`) and loads matching scripts from `config/mocks/`.
+3. **Per test case**: builds orchestration triggers from events that have `triggered_by` set — these events are injected into the agent session only when the agent actually calls the corresponding tool, not unconditionally.
+4. **The OpenClaw plugin** (`plugins/openclaw-mock-external`) must be installed once beforehand — it registers the mock tools with the OpenClaw agent.
+
+**One-time plugin install:**
+```bash
+cd plugins/openclaw-mock-external && npm install && npm run build
+openclaw plugin install .
+```
+
+**Mock system scripts** (`config/mocks/`): define boilerplate immediate responses per tool (delivery ACKs, channel listings, ticket IDs). Generic across test cases.
+
+**Orchestration** is derived from `Event.triggered_by` fields in each test case — the test-case-specific content (what Slack/email says back) lives in `Event.input`.
+
+**`time_scale`** compresses simulated delays: `0.01` means 1 simulated minute = 0.6 real seconds. Configured in `config/mocks/orchestration/*.yaml` or set on `OrchestratorScript`.
+
+```bash
+# Script-driven (default)
+python -m src.data.evaluate_baseline -i test_cases.jsonl --mock-server
+
+# LLM-powered mock responses
+python -m src.data.evaluate_baseline -i test_cases.jsonl --mock-server --mock-llm-mode
+
+# Custom OpenClaw gateway
+python -m src.data.evaluate_baseline -i test_cases.jsonl --mock-server --openclaw-http-url http://localhost:18789
+```
 
 ## CLI Flags
 
@@ -70,12 +120,13 @@ Output: `test_cases_baseline.jsonl` (next to input file)
 | `--output`, `-o` | Output path | Output path |
 | `--runs` | Runs per test case (default: 1) | Runs per test case (default: 1) |
 | `--timeout` | Seconds per run (default: 120) | Seconds per run (default: 120) |
-| `--model`, `-m` | Model for objects + judge | N/A (configured in OpenClaw) |
+| `--model`, `-m` | Model for LLM-objects | N/A (configured in OpenClaw) |
 | `--provider`, `-p` | `openai` or `anthropic` | N/A |
+| `--judge-model` | Judge model (default: same as `--model`) | Judge model (default: `gpt-4o-mini`) |
+| `--judge-provider` | Judge provider (inferred from model name) | Judge provider (default: `openai`) |
+| `--verbose`, `-v` | Print per-event evidence, expected, and judge reasoning | N/A |
 | `--agent-id` | N/A | OpenClaw agent ID (default: `lnl-baseline`) |
 | `--gateway-url` | N/A | OpenClaw gateway URL (default: auto-detect) |
-| `--judge-model` | N/A (same as `--model`) | Judge model (default: `gpt-4o-mini`) |
-| `--judge-provider` | N/A | Judge provider (default: `openai`) |
 | `--limit`, `-n` | First N test cases only | First N test cases only |
 
 ## Comparing Results
@@ -100,7 +151,7 @@ Key metrics in `EvalSummary`:
 | `mean_mod_output_tokens` | Average output tokens per modification |
 | `mean_mod_latency_ms` | Average latency per modification |
 
-Per-test-case results (`TestCaseResult` lines) include per-event pass/fail with reasoning and token costs.
+Per-test-case results (`TestCaseResult` lines) include per-event pass/fail with reasoning, token costs, the `expected` assertion condition, and the `evidence` text that was presented to the judge.
 
 ## How They Differ
 

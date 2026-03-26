@@ -12,6 +12,7 @@ from typing import Any, Optional, Sequence
 import yaml
 
 from .types import (
+    ExternalAction,
     InferenceMetrics,
     LLMResponse,
     Message,
@@ -57,6 +58,34 @@ LLM_RESPONSE_SCHEMA: dict[str, Any] = {
         "reasoning": {
             "type": "string",
             "description": "Brief internal reasoning about what you did and why.",
+        },
+        "external_actions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "system": {
+                        "type": "string",
+                        "description": "External system name, e.g. 'slack', 'email', 'jira'.",
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Action to perform, e.g. 'send_message', 'send', 'create_issue'.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "NL content: the message body, email text, ticket description, etc.",
+                    },
+                    "params": {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "description": "Structured parameters: channel, to, subject, project, etc.",
+                    },
+                },
+                "required": ["system", "action", "content"],
+                "additionalProperties": False,
+            },
+            "description": "Actions directed at external systems (Slack, Email, Jira, etc.). Use instead of outgoing_messages for external integrations.",
         },
     },
     "required": ["updated_state", "reply", "outgoing_messages", "reasoning"],
@@ -149,6 +178,7 @@ def build_system_prompt(
         event_sources=event_sources or "(none)",
         tools=tools or "(none)",
         state_description=definition.state_description or "(none)",
+        seed_data=json.dumps(definition.seed_data, indent=2) if definition.seed_data else "(none)",
         current_state=json.dumps(current_state, indent=2) if current_state else "(empty)",
     )
 
@@ -257,7 +287,7 @@ class OpenAIBrain(LLMBrain):
             model=self.model,
         )
 
-        raw = json.loads(resp.choices[0].message.content or "{}")
+        raw = _safe_json_loads(resp.choices[0].message.content or "{}")
         return _parse_llm_result(raw), metrics
 
     def process(
@@ -319,7 +349,7 @@ class AnthropicBrain(LLMBrain):
     def _enforce_strict_schema(schema: dict) -> None:
         """Recursively set additionalProperties: false on all object types."""
         if schema.get("type") == "object":
-            schema.setdefault("additionalProperties", False)
+            schema["additionalProperties"] = False
         for key in ("properties", "$defs"):
             if key in schema:
                 for sub in schema[key].values():
@@ -372,7 +402,7 @@ class AnthropicBrain(LLMBrain):
             if hasattr(block, "text"):
                 content_str += block.text
 
-        raw = json.loads(content_str or "{}")
+        raw = _safe_json_loads(content_str or "{}")
         return _parse_llm_result(raw), metrics
 
     def process(
@@ -489,6 +519,31 @@ class MockBrain(LLMBrain):
         )
 
 
+def _safe_json_loads(text: str) -> dict:
+    """Parse JSON from LLM output, tolerating trailing extra data."""
+    text = text.strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        if "Extra data" in str(e):
+            # Try to parse just the first JSON object via decoder
+            decoder = json.JSONDecoder()
+            result, _ = decoder.raw_decode(text)
+            return result
+        raise
+
+
+def _ensure_str(value: Any) -> str:
+    """Coerce a value to string — handles cases where the LLM returns a dict instead of a string."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return json.dumps(value)
+
+
 def _parse_llm_result(result: Any) -> LLMResponse:
     """Parse the raw LLM result (dict or StructuredResponse) into LLMResponse."""
     if isinstance(result, dict):
@@ -516,10 +571,23 @@ def _parse_llm_result(result: Any) -> LLMResponse:
         elif isinstance(tc, ToolCall):
             tool_calls.append(tc)
 
+    external_actions = []
+    for ea in data.get("external_actions", []):
+        if isinstance(ea, dict):
+            external_actions.append(ExternalAction(
+                system=ea["system"],
+                action=ea["action"],
+                content=ea["content"],
+                params=ea.get("params", {}),
+            ))
+        elif isinstance(ea, ExternalAction):
+            external_actions.append(ea)
+
     return LLMResponse(
         updated_state=data.get("updated_state") or {},
-        reply=data.get("reply", ""),
+        reply=_ensure_str(data.get("reply", "")),
         outgoing_messages=outgoing,
         reasoning=data.get("reasoning", ""),
         tool_calls=tool_calls,
+        external_actions=external_actions,
     )

@@ -8,12 +8,14 @@ Usage:
     python -m src.data.evaluate \\
         -i outputs/data/zapier/20260322_120000/test_cases.jsonl \\
         --runs 3 \\
-        --model claude-sonnet-4-6
+        --model gpt-4o --judge-model claude-sonnet-4-6
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
+import logging
 import statistics
 import sys
 import time
@@ -58,25 +60,50 @@ def gather_evidence(rt, results, recipient: str) -> str:
     parts: list[str] = []
 
     # Replies from the chain triggered by this event
-    replies = [r.reply for r in results if r.reply.strip()]
+    replies = [r for r in results if r.reply and str(r.reply).strip()]
     if replies:
-        parts.append("Replies:\n" + "\n".join(f"  [{r.object_id}]: {r.reply}" for r in results if r.reply.strip()))
+        parts.append("Replies:\n" + "\n".join(f"  [{r.object_id}]: {r.reply}" for r in replies))
+
+    # External actions declared by objects (Slack, Email, Jira, etc.)
+    ext_actions = [ea for r in results for ea in r.external_actions]
+    if ext_actions:
+        action_lines = []
+        for ea in ext_actions:
+            params_str = ", ".join(f"{k}={v}" for k, v in ea.params.items()) if ea.params else ""
+            line = f"  [{ea.system}.{ea.action}]"
+            if params_str:
+                line += f" ({params_str})"
+            line += f": {ea.content}"
+            action_lines.append(line)
+        parts.append("External actions:\n" + "\n".join(action_lines))
 
     # State of all objects (captures write-service audit trails)
     for obj_id, obj in rt._bus.objects.items():
-        state = obj.state.strip()
-        if state:
-            parts.append(f"State of [{obj_id}]:\n{state}")
+        state = obj.state
+        if isinstance(state, dict):
+            state_str = json.dumps(state, indent=2) if state else "(empty)"
+        else:
+            state_str = str(state).strip() or "(empty)"
+        parts.append(f"State of [{obj_id}]:\n{state_str}")
 
     return "\n\n".join(parts) if parts else "(no observable state)"
 
 
 # ── Core execution ─────────────────────────────────────────────────────────────
 
+def _print_message(msg) -> None:
+    """Print a message exchange between LLM-objects."""
+    arrow = "↩" if msg.type.value == "reply" else "→"
+    content = msg.content[:120].replace("\n", " ")
+    print(f"      {msg.sender} {arrow} {msg.recipient} ({msg.type.value}): {content}")
+
+
 def _execute_test_case_inner(
     tc: TestCase,
     brain,
     harness,
+    debug_messages: bool = False,
+    timeout_s: Optional[float] = None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase and return event + modification results."""
     from src.lnl.gateway import EventGateway
@@ -88,6 +115,8 @@ def _execute_test_case_inner(
     tool_registry.register("execute_code", CodeExecutor())
 
     rt = Runtime(brain, strict_peers=False, tool_registry=tool_registry)
+    if debug_messages:
+        rt.set_message_listener(_print_message)
     gw = EventGateway(rt)
 
     for obj_def in tc.objects:
@@ -97,9 +126,22 @@ def _execute_test_case_inner(
     rt.start()
 
     try:
-        return _run_test_case_timeline(tc, rt, gw, harness)
+        return _run_test_case_timeline(tc, rt, gw, harness, timeout_s=timeout_s)
     finally:
         rt.stop()
+
+
+def _run_with_timeout(fn, timeout_s: Optional[float]):
+    """Run fn() with an optional per-step timeout. Returns (result, timed_out)."""
+    if timeout_s is None:
+        return fn(), False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fn)
+        try:
+            return future.result(timeout=timeout_s), False
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return [], True
 
 
 def _run_test_case_timeline(
@@ -107,6 +149,7 @@ def _run_test_case_timeline(
     rt,
     gw,
     harness,
+    timeout_s: Optional[float] = None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Execute steps and timeline events against a live runtime."""
     event_results: list[EventResult] = []
@@ -115,22 +158,36 @@ def _run_test_case_timeline(
     # 2. Run steps — initialize state and assert default (no-modification) behavior
     for i, step in enumerate(tc.steps):
         t0 = time.monotonic()
-        results = gw.dispatch(step.target, step.text)
+        results, timed_out = _run_with_timeout(
+            lambda s=step: gw.dispatch(s.target, s.text), timeout_s,
+        )
         latency_ms = (time.monotonic() - t0) * 1000
 
         if step.expect is not None:
-            in_tok = sum(r.metrics.input_tokens for r in results if r.metrics)
-            out_tok = sum(r.metrics.output_tokens for r in results if r.metrics)
-            evidence = gather_evidence(rt, results, step.target)
-            passed, reasoning = harness.evaluate_assertion(step.expect.action, evidence)
-            event_results.append(EventResult(
-                event_id=f"S{i+1:03d}",
-                passed=passed,
-                reasoning=reasoning,
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                latency_ms=latency_ms,
-            ))
+            if timed_out:
+                event_results.append(EventResult(
+                    event_id=f"S{i+1:03d}",
+                    passed=False,
+                    reasoning=f"Timeout after {timeout_s}s",
+                    expected=step.expect.action,
+                    latency_ms=latency_ms,
+                ))
+            else:
+                in_tok = sum(r.metrics.input_tokens for r in results if r.metrics)
+                out_tok = sum(r.metrics.output_tokens for r in results if r.metrics)
+                evidence = gather_evidence(rt, results, step.target)
+                condition = step.expect.action
+                passed, reasoning = harness.evaluate_assertion(condition, evidence)
+                event_results.append(EventResult(
+                    event_id=f"S{i+1:03d}",
+                    passed=passed,
+                    reasoning=reasoning,
+                    expected=condition,
+                    evidence=evidence,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    latency_ms=latency_ms,
+                ))
 
     # 3. Build sorted timeline: tag each item with its type and when-ordinal
     timeline: list[tuple[int, str, object]] = []
@@ -143,40 +200,65 @@ def _run_test_case_timeline(
     for _, kind, item in timeline:
         if kind == "mod":
             t0 = time.monotonic()
-            results = rt.send(item.target, item.intent, sender=item.source)
+            results, timed_out = _run_with_timeout(
+                lambda it=item: rt.send(it.target, it.intent, sender=it.source),
+                timeout_s,
+            )
             latency_ms = (time.monotonic() - t0) * 1000
-            in_tok = sum(r.metrics.input_tokens for r in results if r.metrics)
-            out_tok = sum(r.metrics.output_tokens for r in results if r.metrics)
-            mod_results.append(ModificationResult(
-                mod_id=item.id,
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                latency_ms=latency_ms,
-            ))
+            if timed_out:
+                mod_results.append(ModificationResult(mod_id=item.id, latency_ms=latency_ms))
+            else:
+                in_tok = sum(r.metrics.input_tokens for r in results if r.metrics)
+                out_tok = sum(r.metrics.output_tokens for r in results if r.metrics)
+                mod_results.append(ModificationResult(
+                    mod_id=item.id,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    latency_ms=latency_ms,
+                ))
 
         else:  # event
             t0 = time.monotonic()
             if item.call_type == "send_event":
-                results = gw.dispatch(item.recipient, item.input, source=item.source)
+                # Wrap as structured JSON envelope so the object receives a typed external event
+                payload = json.dumps({"system": item.source, "content": item.input})
+                results, timed_out = _run_with_timeout(
+                    lambda it=item, p=payload: gw.dispatch(it.recipient, p, source=it.source),
+                    timeout_s,
+                )
             else:
-                results = rt.send(item.recipient, item.input, sender=item.source)
+                results, timed_out = _run_with_timeout(
+                    lambda it=item: rt.send(it.recipient, it.input, sender=it.source),
+                    timeout_s,
+                )
             latency_ms = (time.monotonic() - t0) * 1000
 
-            in_tok = sum(r.metrics.input_tokens for r in results if r.metrics)
-            out_tok = sum(r.metrics.output_tokens for r in results if r.metrics)
+            if timed_out:
+                event_results.append(EventResult(
+                    event_id=item.id,
+                    passed=False,
+                    reasoning=f"Timeout after {timeout_s}s",
+                    expected=item.expect.action,
+                    latency_ms=latency_ms,
+                ))
+            else:
+                in_tok = sum(r.metrics.input_tokens for r in results if r.metrics)
+                out_tok = sum(r.metrics.output_tokens for r in results if r.metrics)
 
-            evidence = gather_evidence(rt, results, item.recipient)
-            condition = item.expect.action
-            passed, reasoning = harness.evaluate_assertion(condition, evidence)
+                evidence = gather_evidence(rt, results, item.recipient)
+                condition = item.expect.action
+                passed, reasoning = harness.evaluate_assertion(condition, evidence)
 
-            event_results.append(EventResult(
-                event_id=item.id,
-                passed=passed,
-                reasoning=reasoning,
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                latency_ms=latency_ms,
-            ))
+                event_results.append(EventResult(
+                    event_id=item.id,
+                    passed=passed,
+                    reasoning=reasoning,
+                    expected=condition,
+                    evidence=evidence,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    latency_ms=latency_ms,
+                ))
 
     return event_results, mod_results
 
@@ -186,35 +268,18 @@ def execute_test_case(
     brain,
     harness,
     timeout_s: Optional[float] = None,
+    debug_messages: bool = False,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
-    """Run a single TestCase with an optional wall-clock timeout (seconds).
+    """Run a single TestCase with a per-event timeout (seconds).
 
-    If the timeout is exceeded, all pending events are marked as failed and
-    pending modifications are recorded with zero cost.
+    Each step, modification, and event gets its own timeout. If a single
+    step times out, it is marked as failed and execution continues.
     """
-    if timeout_s is None:
-        return _execute_test_case_inner(tc, brain, harness)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_execute_test_case_inner, tc, brain, harness)
-        try:
-            return future.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            # Mark all events as failed, record mods with zero cost
-            event_results = [
-                EventResult(
-                    event_id=evt.id,
-                    passed=False,
-                    reasoning=f"Timeout after {timeout_s}s",
-                )
-                for evt in tc.events
-            ]
-            mod_results = [
-                ModificationResult(mod_id=mod.id)
-                for mod in tc.modifications
-            ]
-            return event_results, mod_results
+    return _execute_test_case_inner(
+        tc, brain, harness,
+        debug_messages=debug_messages,
+        timeout_s=timeout_s,
+    )
 
 
 # ── Output path ────────────────────────────────────────────────────────────────
@@ -223,10 +288,28 @@ def default_output_path(input_path: Path) -> Path:
     return input_path.parent / f"{input_path.stem}_eval.jsonl"
 
 
+# ── Verbose output ────────────────────────────────────────────────────────────
+
+def _print_verbose(tc_result: TestCaseResult) -> None:
+    """Print detailed per-event breakdown to console."""
+    for ev in tc_result.events:
+        status = "PASS" if ev.passed else "FAIL"
+        print(f"    [{status}] {ev.event_id}")
+        print(f"      Expected: {ev.expected}")
+        if ev.evidence:
+            # Indent evidence lines for readability
+            indented = ev.evidence.replace("\n", "\n        ")
+            print(f"      Evidence: {indented}")
+        print(f"      Judge:    {ev.reasoning}")
+        print()
+
+
 # ── Main runner ────────────────────────────────────────────────────────────────
 
 def run(args: argparse.Namespace) -> Path:
     """Run evaluation. Returns the output path."""
+    logging.basicConfig(level=logging.WARNING)
+
     if args.output is None:
         args.output = default_output_path(args.input)
 
@@ -245,26 +328,35 @@ def run(args: argparse.Namespace) -> Path:
     timeout_s: Optional[float] = getattr(args, "timeout", None)
 
     print(f"Loaded {len(test_cases)} test cases from {args.input}")
+    judge_model = args.judge_model or args.model
+    judge_provider = args.judge_provider or infer_provider(judge_model)
+    extra_info = {
+        "Runs per test case": str(args.runs),
+        "Timeout per event": f"{timeout_s}s" if timeout_s else "none",
+    }
+    if args.judge_model:
+        extra_info["Judge"] = f"{judge_provider}/{judge_model}"
     print_run_info(
         args.provider,
         args.model,
         getattr(args, "seed", None),
-        {
-            "Runs per test case": str(args.runs),
-            "Timeout per run": f"{timeout_s}s" if timeout_s else "none",
-        },
+        extra_info,
     )
 
-    # Build LNL brain and harness
-    if args.provider == "openai":
-        from src.lnl.brain import OpenAIBrain
-        brain = OpenAIBrain(model=args.model)
-    else:
-        from src.lnl.brain import AnthropicBrain
-        brain = AnthropicBrain(model=args.model)
+    # Build LNL brain (for objects) and judge brain (for assertions)
+    def _make_brain(provider, model):
+        if provider == "openai":
+            from src.lnl.brain import OpenAIBrain
+            return OpenAIBrain(model=model)
+        else:
+            from src.lnl.brain import AnthropicBrain
+            return AnthropicBrain(model=model)
+
+    brain = _make_brain(args.provider, args.model)
+    judge_brain = _make_brain(judge_provider, judge_model) if args.judge_model else None
 
     from src.lnl.benchmark import BenchmarkHarness
-    harness = BenchmarkHarness(brain=brain)
+    harness = BenchmarkHarness(brain=brain, judge=judge_brain)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -276,7 +368,10 @@ def run(args: argparse.Namespace) -> Path:
                 label = f"{tc.id} run={run_idx}"
                 print(f"  Evaluating {label} ...", end=" ", flush=True)
                 try:
-                    event_results, mod_results = execute_test_case(tc, brain, harness, timeout_s)
+                    event_results, mod_results = execute_test_case(
+                        tc, brain, harness, timeout_s,
+                        debug_messages=getattr(args, "debug_messages", False),
+                    )
                     pass_rate = (
                         sum(1 for e in event_results if e.passed) / len(event_results)
                         if event_results else 1.0
@@ -294,6 +389,8 @@ def run(args: argparse.Namespace) -> Path:
                     f.flush()
                     all_tc_results.append(tc_result)
                     print(f"pass_rate={pass_rate:.2f}")
+                    if args.verbose:
+                        _print_verbose(tc_result)
                 except Exception as e:
                     print(f"FAILED: {e}", file=sys.stderr)
 
@@ -358,6 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   python -m src.data.evaluate -i outputs/data/zapier/20260322_120000/test_cases.jsonl
   python -m src.data.evaluate -i test_cases.jsonl --runs 3 --model claude-sonnet-4-6
+  python -m src.data.evaluate -i test_cases.jsonl --model gpt-4o --judge-model claude-sonnet-4-6
 """,
     )
     parser.add_argument(
@@ -381,9 +479,32 @@ Examples:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=120.0,
+        default=60.0,
         metavar="SECONDS",
-        help="Wall-clock timeout per test case run; exceeded runs are marked as failed (default: 120)",
+        help="Wall-clock timeout per step/event (not per test case); timed-out steps are marked failed and execution continues (default: 60)",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        default=False,
+        help="Print detailed per-event evidence, expected conditions, and judge reasoning",
+    )
+    parser.add_argument(
+        "--debug-messages",
+        action="store_true",
+        default=False,
+        help="Print messages exchanged between LLM-objects during evaluation",
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="Model for LLM-as-judge (default: same as --model). Provider is inferred from model name.",
+    )
+    parser.add_argument(
+        "--judge-provider",
+        choices=["openai", "anthropic"],
+        default=None,
+        help="Provider for judge model (inferred from judge-model if not specified)",
     )
     add_common_args(parser)
     return parser

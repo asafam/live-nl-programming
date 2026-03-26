@@ -23,6 +23,18 @@ class EventExpect(BaseModel):
     action: str
     reason: str
 
+class EventTrigger(BaseModel):
+    """Declares which tool call should cause this event to be injected.
+
+    When set, evaluate_baseline auto-builds an orchestration rule:
+    if the agent calls `tool` (with args matching `match`), this event's
+    `input` is injected back into the session after the specified delay.
+    """
+    tool: str                           # e.g. "email_send"
+    match: dict[str, str] = Field(default_factory=dict)  # arg key → regex (empty = always)
+    after_minutes: float = 0.0          # simulated delay (scaled by time_scale)
+    after_seconds: float = 0.0          # real-time delay (also scaled by time_scale)
+
 class Event(BaseModel):
     id: str
     call_type: str       # "send" or "send_event"
@@ -31,6 +43,7 @@ class Event(BaseModel):
     input: str
     when: str  # Same format as modification: "W02-1T09:00"
     expect: EventExpect
+    triggered_by: Optional[EventTrigger] = None  # if set, this event is an orchestration reaction
 
 class GeneratedModification(BaseModel):
     """LLM output schema — mod_type and ambiguity are set by the script, not the LLM."""
@@ -71,6 +84,7 @@ class ObjectDef(BaseModel):
     skills: list[str] = Field(default_factory=list)
     subscriptions: list[str] = Field(default_factory=list)
     event_sources: list[str] = Field(default_factory=list)
+    seed_data: dict = Field(default_factory=dict, description="Static reference data for read services (org chart, price list, policy table, etc.). Never mutated at runtime. Write services and business logic objects leave this as {}.")
 
     @field_validator("object_id")
     @classmethod
@@ -135,6 +149,8 @@ class EventResult(BaseModel):
     event_id: str
     passed: bool
     reasoning: str
+    expected: str = ""
+    evidence: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
     latency_ms: float = 0.0
@@ -171,6 +187,66 @@ class EvalSummary(BaseModel):
     mean_mod_latency_ms: float
 
 
+# ── Mock external system schemas ─────────────────────────────────────────────
+
+class MockImmediateResponse(BaseModel):
+    """Synchronous response returned to the tool caller."""
+    template: str   # e.g. "message_id: {tool_call_id}, delivered to #{channel}"
+    status: str = "ok"
+
+class MockCallback(BaseModel):
+    """Optional follow-up message injected back into the agent session."""
+    delay_seconds: float = 0.5
+    message_template: str   # interpolated with tool call args; ignored in LLM mode
+    source: str             # e.g. "slack" — for log grouping
+
+class MockMethodDef(BaseModel):
+    """Behaviour definition for one tool method."""
+    method: str                          # e.g. "slack_send_message"
+    immediate: MockImmediateResponse
+    callback: Optional[MockCallback] = None
+    llm_persona: Optional[str] = None   # if set, use LLM mode for this method
+
+class MockSystemDef(BaseModel):
+    """Complete mock definition for one external system."""
+    system: str
+    tools: list[MockMethodDef]
+
+class MockScript(BaseModel):
+    """Collection of mock system definitions for one evaluation run."""
+    systems: list[MockSystemDef]
+
+    def get_method(self, method: str) -> Optional[MockMethodDef]:
+        for sys in self.systems:
+            for tool in sys.tools:
+                if tool.method == method:
+                    return tool
+        return None
+
+
+# ── Orchestration schemas ─────────────────────────────────────────────────────
+
+class OrchestratorReaction(BaseModel):
+    """A single action to fire after a trigger matches."""
+    source: str                         # e.g. "slack", "email" — appears in injection prefix
+    message: str                        # template with {arg} interpolation from tool call args
+    after_seconds: float = 0.0          # real-time delay (scaled by time_scale)
+    after_minutes: float = 0.0          # simulated minutes (scaled by time_scale)
+
+class OrchestratorTrigger(BaseModel):
+    """Rule: when tool `tool` fires and args match `match`, schedule `reactions`."""
+    tool: str                           # tool method name, e.g. "email_send"
+    match: dict[str, str] = Field(default_factory=dict)  # arg key → regex pattern (empty = match all)
+    reactions: list[OrchestratorReaction]
+    fire_once: bool = True              # if True, fires only on the first matching call per session
+
+class OrchestratorScript(BaseModel):
+    """Named scenario script defining cross-system event chains."""
+    name: str
+    time_scale: float = 1.0             # compress time: 0.01 → 1 simulated min = 0.6 real sec
+    triggers: list[OrchestratorTrigger]
+
+
 def to_lnl_definition(obj: ObjectDef) -> ObjectDefinition:
     """Convert Pydantic ObjectDef to dataclass ObjectDefinition."""
     return ObjectDefinition(
@@ -185,4 +261,5 @@ def to_lnl_definition(obj: ObjectDef) -> ObjectDefinition:
         skills=list(obj.skills),
         subscriptions=list(obj.subscriptions),
         event_sources=list(obj.event_sources),
+        seed_data=dict(obj.seed_data),
     )

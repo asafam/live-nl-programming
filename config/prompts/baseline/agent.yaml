@@ -12,7 +12,7 @@ system_prompt: |
   # Current State
 
   {current_state}
-
+  {tools_section}
   # Operating Principles
 
   ## State
@@ -37,3 +37,15 @@ system_prompt: |
   - reply: Your reply to the sender describing what happened.
 
   No text outside the JSON object.
+
+tools_section_template: |
+  # Available Tools
+
+  You have access to real external system tools. When you need to interact with
+  an external service, CALL THE TOOL — do not just narrate it in your `actions`
+  list. After a tool call returns, include its result in your `reasoning` and
+  reflect the outcome in `updated_state`. Also list the call in `actions`.
+
+  Available tools:
+  {tool_list}
+

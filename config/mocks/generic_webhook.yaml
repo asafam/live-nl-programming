@@ -1,0 +1,9 @@
+system: webhook
+tools:
+  - method: webhook_post
+    immediate:
+      template: "webhook_id: {tool_call_id}, POST to {url} accepted (200 OK)"
+    callback:
+      delay_seconds: 0.4
+      message_template: "[Webhook] Response from {url}: acknowledged"
+      source: webhook
