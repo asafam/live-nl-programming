@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .brain import LLMBrain, MockBrain
+from .brain import LLMBrain
+from .judge import LLMJudge, SubstringJudge
 from .mocks import MockRegistry
 from .runtime import Runtime
 from .types import LLMResponse, Message, MessageType, ProcessingResult
@@ -67,11 +68,11 @@ class BenchmarkHarness:
 
     def __init__(
         self,
-        brain: LLMBrain,
-        judge: Optional[LLMBrain] = None,
+        brain: Optional[LLMBrain] = None,
+        judge: Optional[LLMJudge] = None,
     ) -> None:
         self._brain = brain
-        self._judge = judge or brain
+        self._judge: LLMJudge = judge or SubstringJudge()
 
     def load_scenario(self, path: str | Path) -> Scenario:
         """Load a scenario from a directory."""
@@ -119,6 +120,8 @@ class BenchmarkHarness:
 
     def run_scenario(self, scenario: Scenario) -> ScenarioResult:
         """Run a scenario and evaluate assertions."""
+        if self._brain is None:
+            raise ValueError("BenchmarkHarness requires a brain to run scenarios")
         rt = Runtime(self._brain, strict_peers=False)
         registry = MockRegistry()
 
@@ -199,56 +202,9 @@ class BenchmarkHarness:
                 results.append(self.run_scenario(scenario))
         return results
 
-    def evaluate_assertion(
-        self, condition: str, actual: str
-    ) -> tuple[bool, str]:
-        """Evaluate an assertion condition against actual value.
-
-        Uses LLM-as-judge for semantic evaluation, falls back to substring
-        matching if the judge is a MockBrain.
-        """
-        if isinstance(self._judge, MockBrain):
-            # Simple deterministic evaluation for testing
-            passed = condition.lower() in actual.lower()
-            return passed, f"Substring match: '{condition}' in actual"
-
-        # LLM-as-judge
-        from .types import Message, MessageType
-        judge_msg = Message(
-            sender="__system__",
-            recipient="__judge__",
-            type=MessageType.ADMIN,
-            content=(
-                f"Evaluate whether the following condition is met.\n\n"
-                f"Condition: {condition}\n\n"
-                f"Actual value: {actual}\n\n"
-                f"Respond with JSON: {{\"passed\": true/false, \"reasoning\": \"...\"}}"
-            ),
-        )
-
-        from .types import ObjectDefinition
-        judge_defn = ObjectDefinition(
-            object_id="__judge__",
-            role="You evaluate assertions. Return JSON with 'passed' (bool) and 'reasoning' (str).",
-        )
-
-        response, _ = self._judge.process(
-            definition=judge_defn,
-            current_state="",
-            message=judge_msg,
-            history=[],
-        )
-
-        # Parse the response
-        import json
-        try:
-            result = json.loads(response.reply)
-            return result.get("passed", False), result.get("reasoning", "")
-        except (json.JSONDecodeError, AttributeError):
-            # Fallback: check if "passed" or "true" appears
-            lower = response.reply.lower()
-            passed = "passed" in lower or '"passed": true' in lower
-            return passed, response.reply
+    def evaluate_assertion(self, condition: str, actual: str) -> tuple[bool, str]:
+        """Evaluate an assertion condition against actual evidence using the judge."""
+        return self._judge.evaluate(condition, actual)
 
     def _gather_actual(
         self,

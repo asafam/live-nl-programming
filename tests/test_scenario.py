@@ -50,7 +50,10 @@ def _llm_assert(state: str, condition: str, error_msg: str = "Assertion failed")
         type=MessageType.ADMIN,
         content=f"State:\n{state}\n\nCondition: {condition}",
     )
-    response, _ = brain.process(judge_defn, "", judge_msg, [])
+    from src.lnl.brain import LLM_RESPONSE_SCHEMA, build_system_prompt, _build_chat_messages
+    sys_prompt = build_system_prompt(judge_defn, {})
+    messages = _build_chat_messages(sys_prompt, [], judge_msg)
+    response, _ = brain.call(messages, LLM_RESPONSE_SCHEMA)
     answer = response.reply.strip().lower().rstrip(".")
     assert answer == "yes", f"{error_msg}\n  Condition: {condition}\n  State: {state}\n  Judge said: {response.reply}"
 

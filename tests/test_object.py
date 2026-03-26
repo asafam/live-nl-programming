@@ -84,7 +84,8 @@ class TestLLMObjectBasics:
         obj.process_message(_user_msg("hello"))
 
         assert len(brain.call_log) == 1
-        assert brain.call_log[0].current_state == {"status": "initial"}
+        # The current state is serialised into the system prompt (first message)
+        assert '"status": "initial"' in brain.call_log[0].messages[0]["content"]
 
     def test_outgoing_messages(self):
         brain = MockBrain()
@@ -146,7 +147,8 @@ class TestModifyDefinition:
         obj.modify_definition(role="New role text.")
         obj.process_message(_user_msg("test"))
 
-        assert brain.call_log[-1].definition.role == "New role text."
+        # The updated role is serialised into the system prompt (first message)
+        assert "New role text." in brain.call_log[-1].messages[0]["content"]
 
     def test_invalid_field_raises(self):
         brain = MockBrain()

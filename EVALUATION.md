@@ -63,11 +63,95 @@ Add `--verbose` / `-v` to see per-event details during the run — what the judg
 
 ```bash
 python -m src.data.evaluate \
-    -i outputs/data/zapi    er/20260322_010211/test_cases.jsonl \
+    -i outputs/data/zapier/20260322_010211/test_cases.jsonl \
     --model gpt-4o --verbose
 ```
 
+Debug specific test cases:
+
+```bash
+# Run test case at position 3 (1-based index), full run (steps + modifications + events)
+python -m src.data.evaluate \
+    -i outputs/data/zapier/20260322_010211/test_cases.jsonl \
+    --tc 3 --verbose --debug-messages --model gpt-4o
+
+# Run multiple test cases by index or ID
+python -m src.data.evaluate \
+    -i outputs/data/zapier/20260322_010211/test_cases.jsonl \
+    --tc 1 3 5 TC007 --verbose --model gpt-4o
+
+# Run only steps (no modifications/events) for baseline behavior
+python -m src.data.evaluate \
+    -i outputs/data/zapier/20260322_010211/test_cases.jsonl \
+    --tc 1 --steps-only --debug-messages --model gpt-4o
+```
+
 Output: `test_cases_eval.jsonl` (next to input file)
+
+#### Mock tool execution
+
+The LNL evaluator supports **in-process mock tools** — scripted implementations of external APIs (Slack, Email, HubSpot, Jira, etc.) that LLM-objects call directly via `tool_calls`, bypassing the message bus.
+
+Mock tools are wired automatically when a test case has events with `triggered_by` set: the evaluator derives a `MockToolDef` for each unique tool name, and when an LLM-object calls that tool, the corresponding event input is injected into the target object via `inject_event`. All tool calls are logged and included as evidence for the judge.
+
+For additional tool coverage, pass one or more YAML mock config files:
+
+```bash
+python -m src.data.evaluate \
+    -i test_cases.jsonl \
+    --model gpt-4o \
+    --mock-config config/mocks/lnl/email.yaml \
+    --mock-config config/mocks/lnl/slack.yaml
+```
+
+**Priority order** (highest wins on `tool_name` collision):
+
+| Layer | Source | When to use |
+|---|---|---|
+| `tc.mock_tools` | Inline in each TestCase | Per-test-case scripted responses |
+| `--mock-config` | Shared YAML files | Reusable boilerplate responses |
+| `triggered_by` auto-derived | `Event.triggered_by` fields | Orchestration: tool call → event injection |
+
+Any tool the LLM calls that isn't covered by the above layers hits a **PassthroughExecutor** fallback — it returns a generic success and logs the call for judge evidence, so evaluation never errors on unknown tools.
+
+**Mock config YAML format** (`config/mocks/lnl/*.yaml`):
+
+```yaml
+tools:
+  - tool_name: email.send
+    description: Send an email to a recipient.
+    arguments_schema:
+      type: object
+      properties:
+        to: {type: string, description: Recipient email address}
+        subject: {type: string, description: Subject line}
+        body: {type: string, description: Email body}
+      required: [to, subject, body]
+    response_template: "Email sent to {to} (subject: '{subject}'). Message queued."
+    # scripted_responses: consumed FIFO per call; {call_index} = 1-based call number
+    # triggers: dispatch events to other objects when the tool fires
+    triggers:
+      - target_object_id: slack-notifier
+        message_template: "[Email Sent] To: {to} | Subject: {subject}"
+        source: email
+```
+
+#### Test case selection and debugging
+
+**`--tc N [N2 ...]`** — Run specific test cases by 1-based index or ID:
+- `--tc 3` — run test case at position 3
+- `--tc 1 3 5` — run test cases 1, 3, and 5
+- `--tc TC007 TC015` — run test cases by ID
+- `--tc 2 TC010 5` — mix indices and IDs
+
+Overrides `--limit`. Useful for isolating flaky or incomplete test cases.
+
+**`--steps-only`** — Run only the steps (baseline behavior section); skip modifications and events. Useful for:
+- Testing initialization behavior without scenario changes
+- Debugging what happens when external systems first contact the objects
+- Verifying that seed_data and object definitions are correct before applying test logic
+
+**`--debug-messages`** — Print all messages flowing through the message bus, including JSON envelopes for external events and internal peer communication. Shows sender, recipient, message type, and content.
 
 ### OpenClaw Baseline (single agent)
 
@@ -119,15 +203,19 @@ python -m src.data.evaluate_baseline -i test_cases.jsonl --mock-server --opencla
 | `--input`, `-i` | Test cases JSONL (required) | Test cases JSONL (required) |
 | `--output`, `-o` | Output path | Output path |
 | `--runs` | Runs per test case (default: 1) | Runs per test case (default: 1) |
-| `--timeout` | Seconds per run (default: 120) | Seconds per run (default: 120) |
+| `--timeout` | Wall-clock seconds per step/event (default: 60) | Seconds per run (default: 120) |
 | `--model`, `-m` | Model for LLM-objects | N/A (configured in OpenClaw) |
 | `--provider`, `-p` | `openai` or `anthropic` | N/A |
-| `--judge-model` | Judge model (default: same as `--model`) | Judge model (default: `gpt-4o-mini`) |
+| `--judge-model` | Judge model (default: same as `--model`; strongly prefer a separate stronger model) | Judge model (default: `gpt-4o-mini`) |
 | `--judge-provider` | Judge provider (inferred from model name) | Judge provider (default: `openai`) |
 | `--verbose`, `-v` | Print per-event evidence, expected, and judge reasoning | N/A |
 | `--agent-id` | N/A | OpenClaw agent ID (default: `lnl-baseline`) |
 | `--gateway-url` | N/A | OpenClaw gateway URL (default: auto-detect) |
 | `--limit`, `-n` | First N test cases only | First N test cases only |
+| `--tc` | Specific test cases by 1-based index or ID (overrides `--limit`) | N/A |
+| `--steps-only` | Run only steps; skip modifications and events | N/A |
+| `--debug-messages` | Print messages exchanged between LLM-objects | N/A |
+| `--mock-config` | YAML file(s) with shared mock tool definitions (repeatable) | N/A |
 
 ## Comparing Results
 

@@ -13,6 +13,7 @@ from .types import (
     ToolResult,
 )
 from .brain import AnthropicBrain, LLMBrain, MockBrain, OpenAIBrain
+from .judge import AnthropicJudge, LLMJudge, OpenAIJudge, SubstringJudge
 from .bus import MessageBus
 from .events import (
     EventEnvelope,
@@ -44,6 +45,11 @@ __all__ = [
     "LLMBrain",
     "MockBrain",
     "OpenAIBrain",
+    # Judge
+    "AnthropicJudge",
+    "LLMJudge",
+    "OpenAIJudge",
+    "SubstringJudge",
     # Core
     "EventGateway",
     "LLMObject",

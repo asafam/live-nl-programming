@@ -13,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import json
 import logging
 import statistics
@@ -23,13 +22,17 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+import yaml
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 load_dotenv()
 
 from src.data.schema import (
     EvalSummary,
     EventResult,
+    MockConfig,
+    MockToolDef,
     ModificationResult,
     TestCase,
     TestCaseResult,
@@ -41,6 +44,92 @@ from src.data.utils import (
     load_jsonl,
     print_run_info,
 )
+
+
+# ── Mock config loading ────────────────────────────────────────────────────────
+
+def load_mock_config(path: Path) -> MockConfig:
+    """Load a MockConfig from a YAML file."""
+    data = yaml.safe_load(path.read_text())
+    return MockConfig.model_validate(data)
+
+
+def merge_mock_tools(
+    global_tools: list[MockToolDef],
+    tc_tools: list[MockToolDef],
+) -> list[MockToolDef]:
+    """Merge two tool lists. Right side wins on tool_name collision."""
+    merged = {t.tool_name: t for t in global_tools}
+    merged.update({t.tool_name: t for t in tc_tools})
+    return list(merged.values())
+
+
+def _derive_tools_from_skills(tc: "TestCase") -> list[MockToolDef]:
+    """Derive MockToolDef entries from skills declared on each object.
+
+    Skills expose internal capabilities as callable tools so they appear in
+    the {tools} system-prompt section. The LLM can invoke them via tool_calls;
+    if no scripted mock overrides them, PassthroughExecutor handles the call
+    and logs it for judge evidence.
+
+    This is the lowest-priority layer — per-event triggered_by derivation,
+    --mock-config files, and tc.mock_tools all override these entries.
+    """
+    seen: set[str] = set()
+    result: list[MockToolDef] = []
+    for obj in tc.objects:
+        for skill in obj.skills:
+            if skill in seen:
+                continue
+            seen.add(skill)
+            label = skill.replace("-", " ").replace("_", " ")
+            result.append(MockToolDef(
+                tool_name=skill,
+                description=f"Perform {label}.",
+                arguments_schema={"type": "object", "additionalProperties": True},
+                response_template=f"[mock] {skill} completed.",
+            ))
+    return result
+
+
+def _derive_mock_tools_from_events(tc: "TestCase") -> list[MockToolDef]:
+    """Auto-derive MockToolDef entries from events that have triggered_by set.
+
+    For each unique tool name found in event.triggered_by, creates one MockToolDef
+    whose triggers dispatch the event's input to the event's recipient when the tool
+    is called. This requires no manual YAML configs — the test case structure is
+    sufficient.
+
+    Multiple events that share the same triggered_by.tool are grouped under one
+    MockToolDef with multiple triggers (all fire on every matching tool call).
+    """
+    from src.data.schema import MockToolTrigger
+
+    tools_map: dict[str, dict] = {}
+    for event in tc.events:
+        if event.triggered_by is None:
+            continue
+        tb = event.triggered_by
+        tool_name = tb.tool
+        if tool_name not in tools_map:
+            tools_map[tool_name] = {"triggers": []}
+        tools_map[tool_name]["triggers"].append(MockToolTrigger(
+            target_object_id=event.recipient,
+            message_template=event.input,
+            source=event.source,
+        ))
+
+    result = []
+    for name, config in tools_map.items():
+        label = name.replace("_", " ").replace(".", " ")
+        result.append(MockToolDef(
+            tool_name=name,
+            description=f"Perform {label} operation.",
+            arguments_schema={"type": "object", "additionalProperties": True},
+            response_template=f"[mock] {name} executed successfully.",
+            triggers=config["triggers"],
+        ))
+    return result
 
 
 # ── Timestamp parsing ──────────────────────────────────────────────────────────
@@ -55,38 +144,80 @@ def parse_when(when: str) -> int:
 
 # ── Evidence gathering ─────────────────────────────────────────────────────────
 
-def gather_evidence(rt, results, recipient: str) -> str:
-    """Collect observable evidence after an event for the LLM judge."""
-    parts: list[str] = []
+def gather_evidence(
+    rt,
+    results,
+    recipient: str,
+    bus_messages: "list | None" = None,
+    tool_calls: "list[list[dict]] | None" = None,
+) -> str:
+    """Collect observable evidence after an event for the LLM judge.
+
+    Evidence is structured in two sections:
+    - THIS EVENT: everything that happened during this invocation —
+      tool calls made (primary), bus messages exchanged, external actions,
+      and replies. Tool calls are authoritative; external_actions are legacy.
+    - OBJECT STATES: each object's updated_state after the event
+      (may be empty; use THIS EVENT as authoritative evidence).
+    """
+    this_event_parts: list[str] = []
+
+    # Tool calls (primary evidence when mock tools are in use)
+    if tool_calls:
+        flat = [entry for per_ex in tool_calls for entry in per_ex]
+        if flat:
+            lines = []
+            for entry in flat:
+                idx = entry.get("call_index", "?")
+                line = f"  [{entry['tool']}] call#{idx} {json.dumps(entry['arguments'])}"
+                if "response" in entry:
+                    line += f"\n    ← {entry['response'][:100]}"
+                for t in entry.get("triggered", []):
+                    line += f"\n    → dispatched to [{t['target']}]: {t['message'][:120]}"
+                lines.append(line)
+            this_event_parts.append("Tool calls:\n" + "\n".join(lines))
+
+    # Bus messages: the full message flow visible in --debug-messages
+    if bus_messages:
+        lines = []
+        for ml in bus_messages:
+            msg = ml.message
+            arrow = "↩" if msg.type.value == "reply" else "→"
+            sender = f"[{msg.sender}]" if msg.type.value == "event" else msg.sender
+            lines.append(f"  {sender} {arrow} {msg.recipient} ({msg.type.value}): {msg.content[:200]}")
+        this_event_parts.append("Message bus activity:\n" + "\n".join(lines))
+
+    # External actions declared by objects (email.send, slack.send_message, etc.)
+    ext_lines = []
+    for r in results:
+        for ea in getattr(r, "external_actions", []):
+            params_str = json.dumps(ea.params) if ea.params else "{}"
+            ext_lines.append(f"  [{r.object_id}] {ea.system}.{ea.action}: {ea.content[:300]} params={params_str}")
+    if ext_lines:
+        this_event_parts.append("External actions:\n" + "\n".join(ext_lines))
 
     # Replies from the chain triggered by this event
     replies = [r for r in results if r.reply and str(r.reply).strip()]
     if replies:
-        parts.append("Replies:\n" + "\n".join(f"  [{r.object_id}]: {r.reply}" for r in replies))
+        this_event_parts.append("Replies:\n" + "\n".join(f"  [{r.object_id}]: {r.reply}" for r in replies))
 
-    # External actions declared by objects (Slack, Email, Jira, etc.)
-    ext_actions = [ea for r in results for ea in r.external_actions]
-    if ext_actions:
-        action_lines = []
-        for ea in ext_actions:
-            params_str = ", ".join(f"{k}={v}" for k, v in ea.params.items()) if ea.params else ""
-            line = f"  [{ea.system}.{ea.action}]"
-            if params_str:
-                line += f" ({params_str})"
-            line += f": {ea.content}"
-            action_lines.append(line)
-        parts.append("External actions:\n" + "\n".join(action_lines))
-
-    # State of all objects (captures write-service audit trails)
+    # Object states after this event (what each object recorded/knows)
+    state_parts: list[str] = []
     for obj_id, obj in rt._bus.objects.items():
         state = obj.state
         if isinstance(state, dict):
             state_str = json.dumps(state, indent=2) if state else "(empty)"
         else:
             state_str = str(state).strip() or "(empty)"
-        parts.append(f"State of [{obj_id}]:\n{state_str}")
+        state_parts.append(f"  [{obj_id}]:\n{state_str}")
 
-    return "\n\n".join(parts) if parts else "(no observable state)"
+    sections: list[str] = []
+    if this_event_parts:
+        sections.append("=== THIS EVENT ===\n" + "\n\n".join(this_event_parts))
+    if state_parts:
+        sections.append("=== OBJECT STATES ===\n" + "\n\n".join(state_parts))
+
+    return "\n\n".join(sections) if sections else "(no observable state)"
 
 
 # ── Core execution ─────────────────────────────────────────────────────────────
@@ -95,7 +226,9 @@ def _print_message(msg) -> None:
     """Print a message exchange between LLM-objects."""
     arrow = "↩" if msg.type.value == "reply" else "→"
     content = msg.content[:120].replace("\n", " ")
-    print(f"      {msg.sender} {arrow} {msg.recipient} ({msg.type.value}): {content}")
+    # Mark external event sources clearly to distinguish from LLM-object IDs
+    sender = f"[{msg.sender}]" if msg.type.value == "event" else msg.sender
+    print(f"      {sender} {arrow} {msg.recipient} ({msg.type.value}): {content}")
 
 
 def _execute_test_case_inner(
@@ -104,44 +237,102 @@ def _execute_test_case_inner(
     harness,
     debug_messages: bool = False,
     timeout_s: Optional[float] = None,
+    steps_only: bool = False,
+    max_chain_depth: int = 20,
+    global_mock_tools: "list[MockToolDef] | None" = None,
+    progress_callback=None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase and return event + modification results."""
     from src.lnl.gateway import EventGateway
     from src.lnl.runtime import Runtime
-    from src.lnl.tools import CodeExecutor, ToolRegistry
+    from src.lnl.tools import CodeExecutor, MockInProcessExecutor, PassthroughExecutor, ToolRegistry
 
-    # 1. Create Runtime, EventGateway, and start the live environment
-    tool_registry = ToolRegistry()
-    tool_registry.register("execute_code", CodeExecutor())
+    # 1. Build ToolRegistry with three-layer priority merge (lowest → highest):
+    #    events-derived < --mock-config global < tc.mock_tools
+    #
+    # Skills are intentionally NOT included here — they are internal computations
+    # (the generate_samples prompt marks them as "purely internal, no external system
+    # calls"). Registering them as tools would tell the LLM to call them externally.
+    events_derived = _derive_mock_tools_from_events(tc)
+    final_mock_tools = merge_mock_tools(
+        merge_mock_tools(events_derived, global_mock_tools or []),
+        tc.mock_tools,
+    )
 
-    rt = Runtime(brain, strict_peers=False, tool_registry=tool_registry)
-    if debug_messages:
+    # Only enable the tool machinery (and LLM_RESPONSE_SCHEMA_WITH_TOOLS) when there
+    # are actual mock tools to wire up. Without mock tools, pass tool_registry=None so
+    # objects use LLM_RESPONSE_SCHEMA (no tool_calls field) and the LLM won't try to
+    # call peer objects as tools via the PassthroughExecutor fallback.
+    mock_executors: list = []
+    passthrough = PassthroughExecutor()
+    tool_registry: "ToolRegistry | None" = None
+
+    if final_mock_tools:
+        tool_registry = ToolRegistry()
+        tool_registry.register("execute_code", CodeExecutor())
+        tool_registry.register_fallback(passthrough)
+        for mock_tool in final_mock_tools:
+            executor = MockInProcessExecutor(mock_tool)
+            tool_registry.register(mock_tool.tool_name, executor, spec=executor.spec)
+            mock_executors.append(executor)
+
+    # 2. Create Runtime and EventGateway — synchronous mode (no rt.start()).
+    # The evaluator dispatches one event at a time and waits; the background
+    # run-loop is not needed and would break _run_with_timeout (ThreadPoolExecutor
+    # shutdown(wait=True) hangs when the foreground thread is blocked on item.done).
+    rt = Runtime(brain, strict_peers=False, tool_registry=tool_registry, max_chain_depth=max_chain_depth)
+    if debug_messages and progress_callback:
+        rt.set_message_listener(lambda msg: (_print_message(msg), progress_callback(msg)))
+    elif debug_messages:
         rt.set_message_listener(_print_message)
+    elif progress_callback:
+        rt.set_message_listener(progress_callback)
     gw = EventGateway(rt)
 
     for obj_def in tc.objects:
         rt.create_object(to_lnl_definition(obj_def))
 
-    # Start the runtime — objects are now live instances
-    rt.start()
-
-    try:
-        return _run_test_case_timeline(tc, rt, gw, harness, timeout_s=timeout_s)
-    finally:
-        rt.stop()
+    return _run_test_case_timeline(
+        tc, rt, gw, harness,
+        timeout_s=timeout_s,
+        steps_only=steps_only,
+        mock_executors=mock_executors + [passthrough] if final_mock_tools else [],
+    )
 
 
 def _run_with_timeout(fn, timeout_s: Optional[float]):
-    """Run fn() with an optional per-step timeout. Returns (result, timed_out)."""
+    """Run fn() with an optional per-step timeout. Returns (result, timed_out).
+
+    Uses a daemon thread so an abandoned timed-out thread never blocks process exit.
+    ThreadPoolExecutor is avoided because its shutdown(wait=True) hangs when the
+    worker is blocked on I/O (e.g. waiting for an LLM API response).
+    """
     if timeout_s is None:
         return fn(), False
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(fn)
+    import threading
+    result_box: list = [None]
+    exc_box: list = [None]
+    def worker():
         try:
-            return future.result(timeout=timeout_s), False
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            return [], True
+            result_box[0] = fn()
+        except Exception as e:
+            exc_box[0] = e
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+    if t.is_alive():
+        return [], True
+    if exc_box[0] is not None:
+        raise exc_box[0]
+    return result_box[0] or [], False
+
+
+def _snapshot_logs(mock_executors: list) -> list[int]:
+    return [len(ex.call_log) for ex in mock_executors]
+
+
+def _new_tool_calls(mock_executors: list, snapshots: list[int]) -> list[list[dict]]:
+    return [ex.call_log[s:] for ex, s in zip(mock_executors, snapshots)]
 
 
 def _run_test_case_timeline(
@@ -150,16 +341,23 @@ def _run_test_case_timeline(
     gw,
     harness,
     timeout_s: Optional[float] = None,
+    steps_only: bool = False,
+    mock_executors: "list | None" = None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Execute steps and timeline events against a live runtime."""
     event_results: list[EventResult] = []
     mod_results: list[ModificationResult] = []
 
+    execs = mock_executors or []
+
     # 2. Run steps — initialize state and assert default (no-modification) behavior
     for i, step in enumerate(tc.steps):
+        log_snapshot = len(rt.message_log)
+        exec_snap = _snapshot_logs(execs)
         t0 = time.monotonic()
+        step_payload = json.dumps({"system": step.source, "content": step.text})
         results, timed_out = _run_with_timeout(
-            lambda s=step: gw.dispatch(s.target, s.text), timeout_s,
+            lambda s=step, p=step_payload: gw.dispatch(s.target, p, source=s.source), timeout_s,
         )
         latency_ms = (time.monotonic() - t0) * 1000
 
@@ -175,7 +373,9 @@ def _run_test_case_timeline(
             else:
                 in_tok = sum(r.metrics.input_tokens for r in results if r.metrics)
                 out_tok = sum(r.metrics.output_tokens for r in results if r.metrics)
-                evidence = gather_evidence(rt, results, step.target)
+                bus_msgs = rt.message_log[log_snapshot:]
+                new_calls = _new_tool_calls(execs, exec_snap)
+                evidence = gather_evidence(rt, results, step.target, bus_messages=bus_msgs, tool_calls=new_calls)
                 condition = step.expect.action
                 passed, reasoning = harness.evaluate_assertion(condition, evidence)
                 event_results.append(EventResult(
@@ -188,6 +388,9 @@ def _run_test_case_timeline(
                     output_tokens=out_tok,
                     latency_ms=latency_ms,
                 ))
+
+    if steps_only:
+        return event_results, mod_results
 
     # 3. Build sorted timeline: tag each item with its type and when-ordinal
     timeline: list[tuple[int, str, object]] = []
@@ -218,6 +421,8 @@ def _run_test_case_timeline(
                 ))
 
         else:  # event
+            log_snapshot = len(rt.message_log)
+            exec_snap = _snapshot_logs(execs)
             t0 = time.monotonic()
             if item.call_type == "send_event":
                 # Wrap as structured JSON envelope so the object receives a typed external event
@@ -244,8 +449,9 @@ def _run_test_case_timeline(
             else:
                 in_tok = sum(r.metrics.input_tokens for r in results if r.metrics)
                 out_tok = sum(r.metrics.output_tokens for r in results if r.metrics)
-
-                evidence = gather_evidence(rt, results, item.recipient)
+                bus_msgs = rt.message_log[log_snapshot:]
+                new_calls = _new_tool_calls(execs, exec_snap)
+                evidence = gather_evidence(rt, results, item.recipient, bus_messages=bus_msgs, tool_calls=new_calls)
                 condition = item.expect.action
                 passed, reasoning = harness.evaluate_assertion(condition, evidence)
 
@@ -269,16 +475,29 @@ def execute_test_case(
     harness,
     timeout_s: Optional[float] = None,
     debug_messages: bool = False,
+    steps_only: bool = False,
+    max_chain_depth: int = 20,
+    global_mock_tools: "list[MockToolDef] | None" = None,
+    progress_callback=None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase with a per-event timeout (seconds).
 
     Each step, modification, and event gets its own timeout. If a single
     step times out, it is marked as failed and execution continues.
+
+    Args:
+        global_mock_tools: Shared mock tool definitions loaded from --mock-config files.
+            Merged with tc.mock_tools; per-TestCase entries override shared ones.
+        progress_callback: Optional callable(msg) invoked on every bus message delivery.
     """
     return _execute_test_case_inner(
         tc, brain, harness,
         debug_messages=debug_messages,
         timeout_s=timeout_s,
+        steps_only=steps_only,
+        max_chain_depth=max_chain_depth,
+        global_mock_tools=global_mock_tools,
+        progress_callback=progress_callback,
     )
 
 
@@ -290,18 +509,22 @@ def default_output_path(input_path: Path) -> Path:
 
 # ── Verbose output ────────────────────────────────────────────────────────────
 
-def _print_verbose(tc_result: TestCaseResult) -> None:
-    """Print detailed per-event breakdown to console."""
+def _print_event_result(ev, show_evidence: bool = False) -> None:
+    """Print a single event result. Evidence is optional (verbose mode only)."""
+    status = "PASS" if ev.passed else "FAIL"
+    print(f"    [{status}] {ev.event_id}")
+    print(f"      Expected: {ev.expected}")
+    if show_evidence and ev.evidence:
+        indented = ev.evidence.replace("\n", "\n        ")
+        print(f"      Evidence: {indented}")
+    print(f"      Judge:    {ev.reasoning}")
+    print()
+
+
+def _print_verbose(tc_result: TestCaseResult, show_evidence: bool = False) -> None:
+    """Print per-event breakdown to console."""
     for ev in tc_result.events:
-        status = "PASS" if ev.passed else "FAIL"
-        print(f"    [{status}] {ev.event_id}")
-        print(f"      Expected: {ev.expected}")
-        if ev.evidence:
-            # Indent evidence lines for readability
-            indented = ev.evidence.replace("\n", "\n        ")
-            print(f"      Evidence: {indented}")
-        print(f"      Judge:    {ev.reasoning}")
-        print()
+        _print_event_result(ev, show_evidence=show_evidence)
 
 
 # ── Main runner ────────────────────────────────────────────────────────────────
@@ -322,20 +545,38 @@ def run(args: argparse.Namespace) -> Path:
 
     test_cases = load_jsonl(args.input, TestCase)
 
-    if args.limit:
+    if getattr(args, "tc", None):
+        # Select test cases by 1-based index or ID; preserve order of appearance in file
+        selected: list[TestCase] = []
+        for selector in args.tc:
+            if selector.isdigit():
+                idx = int(selector) - 1
+                if idx < 0 or idx >= len(test_cases):
+                    print(f"Error: --tc {selector} out of range (file has {len(test_cases)} test cases)", file=sys.stderr)
+                    sys.exit(1)
+                selected.append(test_cases[idx])
+            else:
+                matched = [tc for tc in test_cases if tc.id == selector]
+                if not matched:
+                    print(f"Error: --tc {selector!r} not found. Available IDs: {[tc.id for tc in test_cases[:5]]}...", file=sys.stderr)
+                    sys.exit(1)
+                selected.extend(matched)
+        test_cases = selected
+    elif args.limit:
         test_cases = test_cases[: args.limit]
 
     timeout_s: Optional[float] = getattr(args, "timeout", None)
 
     print(f"Loaded {len(test_cases)} test cases from {args.input}")
+    # Use a dedicated judge model if specified; otherwise fall back to the object model.
+    # SubstringJudge is insufficient for test cases with NL assertion conditions.
     judge_model = args.judge_model or args.model
-    judge_provider = args.judge_provider or infer_provider(judge_model)
+    judge_provider = infer_provider(judge_model) if args.judge_model else args.provider
     extra_info = {
         "Runs per test case": str(args.runs),
         "Timeout per event": f"{timeout_s}s" if timeout_s else "none",
+        "Judge": f"{judge_provider}/{judge_model}",
     }
-    if args.judge_model:
-        extra_info["Judge"] = f"{judge_provider}/{judge_model}"
     print_run_info(
         args.provider,
         args.model,
@@ -343,7 +584,7 @@ def run(args: argparse.Namespace) -> Path:
         extra_info,
     )
 
-    # Build LNL brain (for objects) and judge brain (for assertions)
+    # Build LNL brain (for objects) and judge (for assertions)
     def _make_brain(provider, model):
         if provider == "openai":
             from src.lnl.brain import OpenAIBrain
@@ -352,47 +593,80 @@ def run(args: argparse.Namespace) -> Path:
             from src.lnl.brain import AnthropicBrain
             return AnthropicBrain(model=model)
 
+    def _make_judge(provider, model):
+        if provider == "openai":
+            from src.lnl.judge import OpenAIJudge
+            return OpenAIJudge(model=model)
+        else:
+            from src.lnl.judge import AnthropicJudge
+            return AnthropicJudge(model=model)
+
     brain = _make_brain(args.provider, args.model)
-    judge_brain = _make_brain(judge_provider, judge_model) if args.judge_model else None
+    judge = _make_judge(judge_provider, judge_model)
 
     from src.lnl.benchmark import BenchmarkHarness
-    harness = BenchmarkHarness(brain=brain, judge=judge_brain)
+    harness = BenchmarkHarness(brain=brain, judge=judge)
+
+    # Load shared mock tool configs from --mock-config files
+    global_mock_tools: list[MockToolDef] = []
+    for mc_path in getattr(args, "mock_config", None) or []:
+        mc = load_mock_config(mc_path)
+        global_mock_tools.extend(mc.tools)
+        print(f"  Loaded mock config: {mc_path} ({len(mc.tools)} tools)")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     all_tc_results: list[TestCaseResult] = []
+    total_runs = len(test_cases) * args.runs
 
     with open(args.output, "w") as f:
-        for tc in test_cases:
-            for run_idx in range(args.runs):
-                label = f"{tc.id} run={run_idx}"
-                print(f"  Evaluating {label} ...", end=" ", flush=True)
-                try:
-                    event_results, mod_results = execute_test_case(
-                        tc, brain, harness, timeout_s,
-                        debug_messages=getattr(args, "debug_messages", False),
-                    )
-                    pass_rate = (
-                        sum(1 for e in event_results if e.passed) / len(event_results)
-                        if event_results else 1.0
-                    )
-                    tc_result = TestCaseResult(
-                        tc_id=tc.id,
-                        name=tc.name,
-                        domain=tc.domain,
-                        run_index=run_idx,
-                        events=event_results,
-                        modifications=mod_results,
-                        pass_rate=pass_rate,
-                    )
-                    f.write(tc_result.model_dump_json() + "\n")
-                    f.flush()
-                    all_tc_results.append(tc_result)
-                    print(f"pass_rate={pass_rate:.2f}")
-                    if args.verbose:
-                        _print_verbose(tc_result)
-                except Exception as e:
-                    print(f"FAILED: {e}", file=sys.stderr)
+        with tqdm(total=total_runs, unit="run", desc="Evaluating") as pbar:
+            for tc in test_cases:
+                for run_idx in range(args.runs):
+                    label = f"{tc.id} run={run_idx}" if args.runs > 1 else tc.id
+                    pbar.set_postfix_str(label, refresh=True)
+                    msg_count = [0]
+                    tc_start = time.monotonic()
+
+                    def _on_message(_msg, _label=label, _count=msg_count, _start=tc_start):
+                        _count[0] += 1
+                        elapsed = time.monotonic() - _start
+                        pbar.set_postfix_str(
+                            f"{_label}  msgs={_count[0]}  {elapsed:.0f}s", refresh=True
+                        )
+
+                    try:
+                        event_results, mod_results = execute_test_case(
+                            tc, brain, harness, timeout_s,
+                            debug_messages=getattr(args, "debug_messages", False),
+                            steps_only=getattr(args, "steps_only", False),
+                            max_chain_depth=args.max_chain_depth,
+                            global_mock_tools=global_mock_tools or None,
+                            progress_callback=_on_message,
+                        )
+                        pass_rate = (
+                            sum(1 for e in event_results if e.passed) / len(event_results)
+                            if event_results else 1.0
+                        )
+                        tc_result = TestCaseResult(
+                            tc_id=tc.id,
+                            name=tc.name,
+                            domain=tc.domain,
+                            run_index=run_idx,
+                            events=event_results,
+                            modifications=mod_results,
+                            pass_rate=pass_rate,
+                        )
+                        f.write(tc_result.model_dump_json() + "\n")
+                        f.flush()
+                        all_tc_results.append(tc_result)
+                        pbar.set_postfix_str(f"{label} pass={pass_rate:.2f}", refresh=True)
+                        if args.verbose:
+                            tqdm.write("")
+                            _print_verbose(tc_result, show_evidence=True)
+                    except Exception as e:
+                        tqdm.write(f"FAILED {label}: {e}", file=sys.stderr)
+                    pbar.update(1)
 
     # Write summary
     summary = _compute_summary(all_tc_results)
@@ -487,13 +761,26 @@ Examples:
         "--verbose", "-v",
         action="store_true",
         default=False,
-        help="Print detailed per-event evidence, expected conditions, and judge reasoning",
+        help="Also print per-event evidence (expected/status/judge always shown)",
     )
     parser.add_argument(
         "--debug-messages",
         action="store_true",
         default=False,
         help="Print messages exchanged between LLM-objects during evaluation",
+    )
+    parser.add_argument(
+        "--tc",
+        nargs="+",
+        default=None,
+        metavar="N_OR_ID",
+        help="Run specific test cases by 1-based index or ID (e.g. --tc 2 5 TC007). Overrides --limit.",
+    )
+    parser.add_argument(
+        "--steps-only",
+        action="store_true",
+        default=False,
+        help="Run only the steps (baseline behavior); skip modifications and events",
     )
     parser.add_argument(
         "--judge-model",
@@ -505,6 +792,24 @@ Examples:
         choices=["openai", "anthropic"],
         default=None,
         help="Provider for judge model (inferred from judge-model if not specified)",
+    )
+    parser.add_argument(
+        "--max-chain-depth",
+        type=int,
+        default=20,
+        help="Max message chain depth per event (default: 20). Increase for workflows with many round-trips.",
+    )
+    parser.add_argument(
+        "--mock-config",
+        type=Path,
+        action="append",
+        default=None,
+        metavar="YAML",
+        help=(
+            "YAML file with shared MockToolDef entries (can be specified multiple times). "
+            "Loaded tools are merged with per-TestCase mock_tools; TestCase entries win on collision. "
+            "Example: --mock-config config/mocks/lnl/email.yaml --mock-config config/mocks/lnl/slack.yaml"
+        ),
     )
     add_common_args(parser)
     return parser

@@ -95,12 +95,44 @@ class Step(BaseModel):
     """A single workflow step: an NL text addressed to a specific LLM-object."""
     text: str        # Natural language message to send to the target object
     target: str      # object_id of the LLM-object this step addresses
+    source: str = "__external__"  # external system originating this step (e.g. "slack", "hubspot")
     expect: Optional[EventExpect] = None  # Expected default-behavior outcome (no modifications applied)
 
     @field_validator("target")
     @classmethod
     def slugify_target(cls, v: str) -> str:
         return slugify(v)
+
+
+# ── In-process mock tool schemas ─────────────────────────────────────────────
+
+class MockToolTrigger(BaseModel):
+    """When a tool fires (with optional arg matching), dispatch an event to another LNL object."""
+    target_object_id: str
+    message_template: str   # {arg_name} interpolation from tool call arguments
+    source: str = "external"
+
+class MockToolDef(BaseModel):
+    """Mock definition for one external tool used during LNL evaluation."""
+    tool_name: str              # e.g. "email.send", "slack.send_message"
+    description: str            # shown in system prompt
+    arguments_schema: dict      # JSON schema for tool arguments
+    response_template: str      # default response when scripted_responses is exhausted ({arg_name} interpolation)
+    scripted_responses: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ordered list of responses consumed one-per-call (FIFO). "
+            "Supports {arg_name} and {call_index} interpolation. "
+            "When exhausted, falls back to response_template."
+        ),
+    )
+    match: dict[str, str] = Field(default_factory=dict)  # arg key → regex to gate triggers
+    triggers: list[MockToolTrigger] = Field(default_factory=list)
+
+class MockConfig(BaseModel):
+    """Collection of mock tool definitions — loadable from YAML at evaluation time."""
+    tools: list[MockToolDef]
+
 
 class TestCase(BaseModel):
     id: str
@@ -112,6 +144,7 @@ class TestCase(BaseModel):
     steps: list[Step]
     modifications: list[Modification]
     events: list[Event]
+    mock_tools: list[MockToolDef] = Field(default_factory=list, description="Per-test-case mock tool overrides. Merged with --mock-config at eval time (these win on collision).")
 
 class TestCases(BaseModel):
     test_cases: list[TestCase]
@@ -187,7 +220,7 @@ class EvalSummary(BaseModel):
     mean_mod_latency_ms: float
 
 
-# ── Mock external system schemas ─────────────────────────────────────────────
+# ── Mock external system schemas (OpenClaw baseline) ─────────────────────────
 
 class MockImmediateResponse(BaseModel):
     """Synchronous response returned to the tool caller."""

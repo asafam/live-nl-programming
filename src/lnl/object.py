@@ -1,16 +1,22 @@
 """LLMObject — the single runtime entity in the LNL system."""
 from __future__ import annotations
 
+import json
 from collections import deque
 from dataclasses import asdict
 
-from .brain import LLMBrain
+from .brain import (
+    LLM_RESPONSE_SCHEMA,
+    LLM_RESPONSE_SCHEMA_WITH_TOOLS,
+    LLMBrain,
+    _build_chat_messages,
+    build_system_prompt,
+)
 from .tools import ToolRegistry
 from .types import (
     InferenceMetrics,
     Message,
     ObjectDefinition,
-    OutgoingMessage,
     ProcessingResult,
 )
 
@@ -19,6 +25,10 @@ class LLMObject:
     """An LLM-object: definition + brain + mutable NL state."""
 
     MAX_TOOL_ROUNDS = 5
+    # Maximum number of past messages kept in history. The object's state is
+    # the canonical summary of all prior processing, so old messages add noise
+    # without adding information. None means unbounded (kept for compatibility).
+    MAX_HISTORY = 6
 
     def __init__(
         self,
@@ -83,44 +93,52 @@ class LLMObject:
         message = self._mailbox.popleft()
         return self.process_message(message)
 
-    # --- Core Processing ---
+    # --- Core Processing (ReAct loop) ---
 
     def process_message(self, message: Message) -> ProcessingResult:
-        """Process an incoming message through the brain and update state."""
+        """Process an incoming message via a ReAct loop: think → act → observe → repeat."""
         state_before = self._state
 
-        response, metrics = self._brain.process(
-            definition=self._definition,
-            current_state=self._state,
-            message=message,
-            history=self._history,
-        )
+        # Assemble context once
+        schema = LLM_RESPONSE_SCHEMA_WITH_TOOLS if self._tool_registry else LLM_RESPONSE_SCHEMA
+        tools_desc = self._tool_registry.describe() if self._tool_registry else ""
+        sys_prompt = build_system_prompt(self._definition, self._state, tools=tools_desc)
+        messages = _build_chat_messages(sys_prompt, self._history, message)
 
-        # Tool execution loop
-        total_metrics = metrics
-        prior_exchanges = []
-        rounds = 0
+        total_metrics = InferenceMetrics(model="")
+        response = None
+        tool_rounds = 0
 
-        while response.tool_calls and self._tool_registry and rounds < self.MAX_TOOL_ROUNDS:
-            rounds += 1
-            context = self._tool_context_factory(self) if self._tool_context_factory else {}
-            tool_results = [
-                self._tool_registry.execute(tc, context)
-                for tc in response.tool_calls
-            ]
-            prior_exchanges.append((response, tool_results))
+        while True:
+            response, metrics = self._brain.call(messages, schema, object_id=self.object_id)
+            total_metrics = _accumulate_metrics(total_metrics, metrics)
 
-            response, cont_metrics = self._brain.process_continuation(
-                definition=self._definition,
-                current_state=self._state,
-                message=message,
-                history=self._history,
-                prior_exchanges=prior_exchanges,
+            if not response.tool_calls or not self._tool_registry or tool_rounds >= self.MAX_TOOL_ROUNDS:
+                break  # final response — no more tool calls (or limit reached)
+
+            tool_rounds += 1
+            # Execute tools and append results to the growing context
+            ctx = self._tool_context_factory(self) if self._tool_context_factory else {}
+            results = [self._tool_registry.execute(tc, ctx) for tc in response.tool_calls]
+
+            messages.append({"role": "assistant", "content": json.dumps({
+                "tool_calls": [
+                    {"id": tc.id, "tool": tc.tool, "arguments": tc.arguments}
+                    for tc in response.tool_calls
+                ],
+                "reasoning": response.reasoning,
+            })})
+            results_text = "\n".join(
+                f"[{r.id}] output: {r.output}" + (f"\nerror: {r.error}" if r.error else "")
+                for r in results
             )
-            total_metrics = _accumulate_metrics(total_metrics, cont_metrics)
+            messages.append({"role": "user", "content": f"[Tool results]:\n{results_text}"})
 
+        # Apply final response
         self._state = response.updated_state
         self._history.append(message)
+        if self.MAX_HISTORY is not None and len(self._history) > self.MAX_HISTORY:
+            self._history = self._history[-self.MAX_HISTORY:]
 
         return ProcessingResult(
             object_id=self.object_id,
@@ -133,7 +151,6 @@ class LLMObject:
             source_message_type=message.type,
             external_actions=response.external_actions,
         )
-
 
     # --- Live Modification ---
 

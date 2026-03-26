@@ -93,10 +93,18 @@ class Runtime:
         if self._tool_registry:
             def _make_context(obj: LLMObject) -> dict:
                 def push_event(content: str, source: str = "__code__") -> None:
+                    """Inject an event into the calling object's own event queue."""
                     self._event_sources.inject(obj.object_id, content, source)
                     if self._running.is_set():
                         self._work_queue.put(_WorkItem())  # wake run-loop
-                return {"push_event": push_event}
+
+                def inject_event(recipient: str, content: str, source: str = "__external__") -> None:
+                    """Inject an event to any object — used for cross-object orchestration."""
+                    self._event_sources.inject(recipient, content, source)
+                    if self._running.is_set():
+                        self._work_queue.put(_WorkItem())  # wake run-loop
+
+                return {"push_event": push_event, "inject_event": inject_event}
             tool_context_factory = _make_context
 
         obj = LLMObject(

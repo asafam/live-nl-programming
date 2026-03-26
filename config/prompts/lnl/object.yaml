@@ -42,6 +42,9 @@ system_prompt: |
   modified the default behavior (e.g., "Sarah's manager → EMEA
   manager"). Add fields as needed, don't drop fields unless
   instructed.
+  IMPORTANT: `updated_state` must contain only your business data.
+  Never put `reply`, `outgoing_messages`, `reasoning`, or `tool_calls`
+  inside `updated_state` — these are separate top-level response fields.
 
   ## Recency
   When any input conflicts with your current state or prior

@@ -2,7 +2,7 @@
 import pytest
 from pathlib import Path
 
-from src.lnl import LLMResponse, MockBrain
+from src.lnl import LLMResponse, MockBrain, SubstringJudge
 from src.lnl.benchmark import (
     Assertion,
     BenchmarkHarness,
@@ -20,7 +20,7 @@ def brain():
 
 @pytest.fixture
 def harness(brain):
-    return BenchmarkHarness(brain, judge=brain)
+    return BenchmarkHarness(brain, judge=SubstringJudge())
 
 
 class TestLoadScenario:
@@ -115,7 +115,7 @@ class TestRunScenario:
 
     def test_modify_step(self, brain, tmp_path):
         brain.set_default(LLMResponse(updated_state={"status": "has state"}, reply="ok"))
-        harness = BenchmarkHarness(brain, judge=brain)
+        harness = BenchmarkHarness(brain, judge=SubstringJudge())
 
         objects_dir = tmp_path / "objects"
         objects_dir.mkdir()
@@ -166,7 +166,7 @@ class TestRunDirectory:
 class TestMocksIntegration:
     def test_advance_fires_events(self, brain, tmp_path):
         brain.set_default(LLMResponse(updated_state={"status": "event received"}, reply="ok"))
-        harness = BenchmarkHarness(brain, judge=brain)
+        harness = BenchmarkHarness(brain, judge=SubstringJudge())
 
         objects_dir = tmp_path / "objects"
         objects_dir.mkdir()
