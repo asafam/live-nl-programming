@@ -185,12 +185,6 @@ def _format_components(objects: list[ObjectDef]) -> str:
     return "\n\n".join(parts)
 
 
-def _format_seed_data(objects: list[ObjectDef]) -> str:
-    """Collect and format seed_data from all objects into a single reference block."""
-    combined = {obj.object_id: obj.seed_data for obj in objects if obj.seed_data}
-    return json.dumps(combined, indent=2) if combined else "(none)"
-
-
 def build_system_prompt(tc: TestCase) -> str:
     """Build the single-agent system prompt from a TestCase."""
     config = _load_prompt_config()
@@ -199,7 +193,6 @@ def build_system_prompt(tc: TestCase) -> str:
     return template.format(
         workflow_name=tc.name,
         components=_format_components(tc.objects),
-        seed_data=_format_seed_data(tc.objects),
         current_state="(empty)",
     )
 

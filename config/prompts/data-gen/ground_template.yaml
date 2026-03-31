@@ -1,0 +1,40 @@
+prompt: |
+  # Task: Ground an Automation Template
+
+  You are given an abstract automation template that contains placeholder language.
+  Your ONLY job is to replace every abstract placeholder with a specific, concrete value.
+
+  ---
+
+  ## Template
+
+  {TEMPLATE}
+
+  ---
+
+  ## Instructions
+
+  Produce a grounded version of the template's steps by replacing every abstract placeholder with a specific value.
+
+  **Replace these kinds of placeholders:**
+  - "a designated channel" → a specific channel name (e.g., `#deals-emea`, `#support-escalations`)
+  - "a team" → a specific team name (e.g., "Revenue Operations", "Enterprise Sales")
+  - "a team member" → a specific role within the team (e.g., "Account Executive", "Sales Manager")
+  - "your [anything]" → a specific name (e.g., "your CRM" → "Salesforce", "your task tracker" → "Jira")
+  - "predefined options" or "a list of options" → list the actual options (e.g., "High, Medium, Low")
+  - "X or Y" → pick one specific value
+  - "a specific [thing]" → a concrete instance of that thing
+  - Any other vague or generic reference → the specific concrete equivalent
+
+  **Do not:**
+  - Invent individual people's names unless the placeholder explicitly refers to a person
+  - Add examples, parentheticals, or qualifications ("e.g.", "like", "such as")
+  - Add steps that are not in the original
+  - Remove steps from the original
+  - Change the meaning or intent of any step
+  - Add implementation details or technical specifics not implied by the template
+
+  **Output format:**
+  - `name`: A concrete, specific name for this automation (update the template name if it contains placeholders; otherwise keep it as-is)
+  - `domain`: Same as the template domain — do not change
+  - `grounded_steps`: The same number of steps as the original `raw_steps`, with all placeholders replaced. One string per step.

@@ -22,7 +22,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from src.data import generate_samples, generate_test_cases
+from src.data import generate_samples, generate_test_cases, generate_seed
 
 SAMPLES_FILENAME = "samples.jsonl"
 TEST_CASES_FILENAME = "test_cases.jsonl"
@@ -90,12 +90,6 @@ Examples:
         action="append",
         default=None,
         help="Only process template(s) with this ID (repeatable: --id foo --id bar)",
-    )
-    stage1.add_argument(
-        "--samples-prompt-template",
-        type=Path,
-        default=Path("config/prompts/data-gen/generate_samples.yaml"),
-        help="Prompt template for stage 1",
     )
 
     # --- Stage 2 args ---
@@ -167,8 +161,8 @@ Examples:
     )
     shared.add_argument(
         "--model", "-m",
-        default="claude-sonnet-4-5-20250929",
-        help="Model name (default: claude-sonnet-4-5-20250929)",
+        default="claude-sonnet-4-6",
+        help="Model name (default: claude-sonnet-4-6)",
     )
     shared.add_argument(
         "--seed", "-s",
@@ -250,7 +244,6 @@ Examples:
         stage1_args = argparse.Namespace(
             input=args.input,
             output=samples_path,  # None → derived by generate_samples.run()
-            prompt_template=args.samples_prompt_template,
             samples_per_template=args.samples_per_template,
             ids=args.ids,
             provider=args.provider,
@@ -286,7 +279,26 @@ Examples:
         force=args.force,
         limit=args.limit,
     )
-    output_path = generate_test_cases.run(stage2_args)
+    test_cases_path = generate_test_cases.run(stage2_args)
+
+    # --- Stage 3 ---
+    print()
+    print("=" * 60)
+    print("STAGE 3: Generate Seed Data + Expectations")
+    print("=" * 60)
+
+    stage3_args = argparse.Namespace(
+        input=test_cases_path,
+        samples=samples_path,
+        output=None,  # in-place by default
+        provider=args.provider,
+        model=args.model,
+        seed=args.seed,
+        temperature=args.temperature,
+        force=args.force,
+        limit=args.limit,
+    )
+    output_path = generate_seed.run(stage3_args)
 
     print()
     print("=" * 60)

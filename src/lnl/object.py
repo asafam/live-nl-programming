@@ -17,6 +17,7 @@ from .types import (
     InferenceMetrics,
     Message,
     ObjectDefinition,
+    PeerDeclaration,
     ProcessingResult,
     ReactFinish,
 )
@@ -25,28 +26,28 @@ from .types import (
 class LLMObject:
     """An LLM-object: definition + brain + mutable NL state."""
 
-    MAX_TOOL_ROUNDS = 5
-    # Maximum number of past messages kept in history. The object's state is
-    # the canonical summary of all prior processing, so old messages add noise
-    # without adding information. None means unbounded (kept for compatibility).
-    MAX_HISTORY = 6
-
     def __init__(
         self,
         definition: ObjectDefinition,
         brain: LLMBrain,
         tool_registry: ToolRegistry | None = None,
         tool_context_factory: object = None,
+        max_tool_rounds: int = 5,
+        max_history: int = 6,
+        react_cross_objects: bool = True,
     ) -> None:
         self._definition = definition
         self._brain = brain
-        self._state: dict = {}  # mutable runtime state; seed_data is static and kept on definition
+        self._state: dict = {}  # mutable runtime state
         self._history: list[Message] = []
         self._mailbox: deque[Message] = deque()
         self._tool_registry = tool_registry
         self._tool_context_factory = tool_context_factory
         self._lock = threading.Lock()   # guards _mailbox and _active
         self._active = False            # True while scheduled or running on pool
+        self._max_tool_rounds = max_tool_rounds
+        self._max_history = max_history
+        self._react_cross_objects = react_cross_objects
 
     # --- Properties ---
 
@@ -125,10 +126,14 @@ class LLMObject:
 
     def process_message(self, message: Message) -> ProcessingResult:
         """Process an incoming message via a ReAct loop: think → act → observe → repeat."""
-        state_before = self._state
+        state_before = dict(self._state)  # snapshot — state only committed after successful loop
 
         tools_desc = self._tool_registry.describe() if self._tool_registry else ""
-        sys_prompt = build_system_prompt(self._definition, self._state, tools=tools_desc)
+        sys_prompt = build_system_prompt(
+            self._definition, self._state,
+            tools=tools_desc,
+            react_cross_objects=self._react_cross_objects,
+        )
         messages = _build_chat_messages(sys_prompt, self._history, message)
 
         total_metrics = InferenceMetrics(model="")
@@ -144,7 +149,7 @@ class LLMObject:
                 break
 
             # action == "tool_call"
-            if tool_rounds >= self.MAX_TOOL_ROUNDS:
+            if tool_rounds >= self._max_tool_rounds:
                 # Hard stop — manufacture an empty finish to avoid infinite loops.
                 finish = ReactFinish(reply="", updated_state=self._state)
                 break
@@ -175,9 +180,11 @@ class LLMObject:
             finish = ReactFinish(reply="", updated_state=self._state)
 
         self._state = finish.updated_state
+        if finish.updated_definition:
+            self._apply_definition_update(finish.updated_definition)
         self._history.append(message)
-        if self.MAX_HISTORY is not None and len(self._history) > self.MAX_HISTORY:
-            self._history = self._history[-self.MAX_HISTORY:]
+        if len(self._history) > self._max_history:
+            self._history = self._history[-self._max_history:]
 
         return ProcessingResult(
             object_id=self.object_id,
@@ -200,6 +207,20 @@ class LLMObject:
             if not hasattr(self._definition, key):
                 raise AttributeError(f"ObjectDefinition has no field '{key}'")
             setattr(self._definition, key, value)
+
+    _PATCHABLE_DEFINITION_FIELDS = {"role", "behavior"}
+
+    def _apply_definition_update(self, patch: dict) -> None:
+        """Apply a definition patch from the LLM (admin-driven self-modification)."""
+        updates = {k: v for k, v in patch.items() if k in self._PATCHABLE_DEFINITION_FIELDS}
+        if "peers" in patch and isinstance(patch["peers"], list):
+            updates["peers"] = [
+                PeerDeclaration(object_id=p["object_id"], relationship=p["relationship"])
+                for p in patch["peers"]
+                if isinstance(p, dict)
+            ]
+        if updates:
+            self.modify_definition(**updates)
 
     # --- Testing / Debugging ---
 

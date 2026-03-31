@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .brain import AnthropicBrain, MockBrain, OpenAIBrain
-from .runtime import Runtime
+from .runtime import SystemConfig, Runtime
 
 
 def _make_brain(args: argparse.Namespace):
@@ -36,8 +36,12 @@ def main(argv: list[str] | None = None) -> None:
 
     sub = parser.add_subparsers(dest="command")
 
+    # live — listed first; primary mode for persistent objects
+    p_live = sub.add_parser("live", help="Start the runtime (recommended — objects stay live)")
+    p_live.add_argument("path", help="Directory containing .md files")
+
     # load
-    p_load = sub.add_parser("load", help="Load objects from directory")
+    p_load = sub.add_parser("load", help="Load objects from directory (one-shot; use 'live' for persistence)")
     p_load.add_argument("path", help="Directory containing .md files")
 
     # new
@@ -60,7 +64,6 @@ def main(argv: list[str] | None = None) -> None:
     p_modify.add_argument("object_id")
     p_modify.add_argument("--role", default=None)
     p_modify.add_argument("--behavior", default=None)
-    p_modify.add_argument("--state-description", default=None)
 
     # state
     p_state = sub.add_parser("state", help="Show object state")
@@ -81,10 +84,6 @@ def main(argv: list[str] | None = None) -> None:
     p_save.add_argument("object_id")
     p_save.add_argument("--path", default=None)
 
-    # live
-    p_live = sub.add_parser("live", help="Start a live runtime with interactive REPL")
-    p_live.add_argument("path", help="Directory containing .md files")
-
     # run
     p_run = sub.add_parser("run", help="Run a benchmark scenario")
     p_run.add_argument("path", help="Scenario directory or scenarios parent directory")
@@ -95,11 +94,14 @@ def main(argv: list[str] | None = None) -> None:
         parser.print_help()
         return
 
+    cfg = SystemConfig.load()
     brain = _make_brain(args)
     rt = Runtime(
         brain,
+        # CLI flag overrides config file if explicitly provided (argparse default is 10)
         max_chain_depth=args.max_chain_depth,
         strict_peers=args.strict_peers,
+        system_config=cfg,
     )
 
     if args.command == "load":
@@ -129,8 +131,7 @@ def main(argv: list[str] | None = None) -> None:
             updates["role"] = args.role
         if args.behavior:
             updates["behavior"] = args.behavior
-        if args.state_description:
-            updates["state_description"] = args.state_description
+
         if updates:
             rt.modify(args.object_id, **updates)
             print(f"Modified: {args.object_id}")

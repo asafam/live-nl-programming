@@ -1,0 +1,83 @@
+prompt: |
+  # Task: Write Event Expectations
+
+  For each event, write the **terminal observable output** — the final external action the system
+  produces. Use the reference data to name exact people and channels.
+
+  ---
+
+  ## Object System
+
+  {OBJECTS}
+
+  ---
+
+  ## Reference Data (exact values the read services will return)
+
+  {MOCK_DATA}
+
+  ---
+
+  ## Modifications
+
+  {MODIFICATIONS}
+
+  ---
+
+  ## Events
+
+  {EVENTS}
+
+  ---
+
+  ## How to reason
+
+  **Step 1 — Identify which behavior is triggered by this event.**
+  Look at the event's `recipient` and `input` to understand what kind of trigger it is.
+  Then find that object's behavior in the Object System to determine what it does.
+  The system responds to THIS event only — do NOT project forward to hypothetical future events
+  (e.g., an external actor responding to a request is a separate future event, not part of this event's output).
+
+  **Step 2 — Trace the behavior chain to the terminal external output.**
+  Follow the chain from the triggered behavior to its terminal external action(s):
+  the observable outputs that leave the system (message sent, record updated, notification triggered).
+  Stop at the first external outputs — do NOT include outputs from subsequent events.
+
+  **Step 3 — Determine routing logic from the Object System, not the Reference Data.**
+  Read each object's behavior description to understand WHO gets notified and under what conditions.
+  The Reference Data is NOT a source of routing rules — it is only a lookup table for names and
+  data values. If the Reference Data contains routing tables or thresholds, ignore them.
+
+  **Step 4 — Apply modifications by timestamp.**
+  A modification is active ONLY if the event occurs at or after the modification's `when` timestamp.
+  The `[active modifications: ...]` annotation on each event tells you exactly which apply.
+
+  **Step 5 — Look up exact names from the Reference Data.**
+  Use the Reference Data to find the actual entity that fills each role. Use exact names and identifiers.
+
+  ---
+
+  ## What to write
+
+  `action` = the last thing the system does that is visible outside itself:
+  - A message sent to a specific person or destination: "Message sent to Alex Rivera"
+  - A record written or updated: "Record Q-XXX status updated to approved"
+  - A notification triggered: "Notification sent to #channel tagging Alex Rivera"
+  - Multiple outputs: list all of them
+
+  **Do NOT name the internal object that performs the action.** Write what happens externally:
+  "Message sent to Alex Rivera" — NOT "Message sent to Alex Rivera via notification-service".
+  "Record updated in system X" — NOT "Message sent to record-writer".
+
+  `reason` = the rule or behavior clause that drives this outcome (one sentence).
+
+  **Do NOT describe internal steps.** Do not mention peer messages, object queries, routing
+  decisions, or intermediate states. Only the final output(s) that leave the system.
+
+  Respond with JSON only:
+  {
+    "expectations": [
+      {"event_id": "E001", "action": "...", "reason": "..."},
+      ...
+    ]
+  }

@@ -35,7 +35,9 @@ def _judge_system_prompt() -> str:
     return _load_judge_config()["system_prompt"].strip()
 
 
-def _user_msg(condition: str, evidence: str) -> str:
+def _user_msg(condition: str, evidence: str, context: str = "") -> str:
+    if context:
+        return f"Condition: {condition}\n\n{context}\n\nEvidence:\n{evidence}"
     return f"Condition: {condition}\n\nEvidence:\n{evidence}"
 
 
@@ -43,7 +45,7 @@ class LLMJudge(ABC):
     """Evaluate whether evidence satisfies a condition."""
 
     @abstractmethod
-    def evaluate(self, condition: str, evidence: str) -> tuple[bool, str]:
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
         """Return (passed, reasoning)."""
         ...
 
@@ -51,7 +53,7 @@ class LLMJudge(ABC):
 class SubstringJudge(LLMJudge):
     """Fallback judge using substring matching — no API call needed."""
 
-    def evaluate(self, condition: str, evidence: str) -> tuple[bool, str]:
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
         passed = condition.lower() in evidence.lower()
         return passed, f"Substring match: '{condition[:60]}' in evidence"
 
@@ -70,10 +72,10 @@ class OpenAIJudge(LLMJudge):
         self.model = model
         self._client = OpenAI(api_key=api_key or os.environ["OPENAI_API_KEY"])
 
-    def evaluate(self, condition: str, evidence: str) -> tuple[bool, str]:
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
         messages = [
             {"role": "system", "content": _judge_system_prompt()},
-            {"role": "user", "content": _user_msg(condition, evidence)},
+            {"role": "user", "content": _user_msg(condition, evidence, context)},
         ]
         resp = self._client.chat.completions.create(
             model=self.model,
@@ -99,13 +101,13 @@ class AnthropicJudge(LLMJudge):
         self.model = model
         self._client = _anthropic.Anthropic(api_key=api_key or os.environ["ANTHROPIC_API_KEY"])
 
-    def evaluate(self, condition: str, evidence: str) -> tuple[bool, str]:
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
         resp = self._client.messages.create(
             model=self.model,
             max_tokens=512,
             temperature=0.0,
             system=_judge_system_prompt(),
-            messages=[{"role": "user", "content": _user_msg(condition, evidence)}],
+            messages=[{"role": "user", "content": _user_msg(condition, evidence, context)}],
             output_config={"format": {"type": "json_schema", "schema": _JUDGE_SCHEMA}},
         )
         content_str = "".join(block.text for block in resp.content if hasattr(block, "text"))

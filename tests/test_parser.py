@@ -12,10 +12,6 @@ FULL_MD = """\
 
 Manages guest check-in and check-out at the hotel front desk.
 
-## State
-
-Track current guests, room assignments, and pending requests.
-
 ## Behavior
 
 When a guest checks in, assign them a room and notify housekeeping.
@@ -68,7 +64,6 @@ class TestParseObjectText:
         defn = parse_object_text(FULL_MD)
         assert defn.object_id == "guest-manager"
         assert "guest check-in" in defn.role
-        assert "current guests" in defn.state_description
         assert "checks in" in defn.behavior
         assert len(defn.peers) == 2
         assert defn.peers[0].object_id == "room-tracker"
@@ -82,7 +77,6 @@ class TestParseObjectText:
         defn = parse_object_text(MINIMAL_MD)
         assert defn.object_id == "simple-worker"
         assert defn.role == "Does simple work."
-        assert defn.state_description == ""
         assert defn.behavior == ""
         assert defn.peers == []
         assert defn.skills == []
@@ -106,7 +100,6 @@ class TestSerialize:
 
         assert roundtripped.object_id == original.object_id
         assert roundtripped.role == original.role
-        assert roundtripped.state_description == original.state_description
         assert roundtripped.behavior == original.behavior
         assert len(roundtripped.peers) == len(original.peers)
         for a, b in zip(roundtripped.peers, original.peers):

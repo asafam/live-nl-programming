@@ -68,34 +68,12 @@ user_prompt: |
 
   Each test case may include:
   - **Before events**: Trigger the SAME logic the modification will change. Shows "before" behavior.
-    Example: If modification is "skip <person> in approval rotation", send a trigger that would route to <person> → expect: routed to <person>
   - **After events**: Same type of external trigger, but now the modification applies. Shows "after" behavior.
-    Example: Same type of trigger → expect: routed to someone else (<person> skipped)
-  - **Unrelated events**: A different external trigger that exercises logic unaffected by the modification
-  - If multiple modifications: events between modifications to test intermediate states
+  - **Unrelated events**: A different external trigger that exercises logic unaffected by the modification.
+  - If multiple modifications: events between modifications to test intermediate states.
 
-  **Rules for writing assertable events:**
-
-  1. **Ambiguity applies to the modification intent, never to `expect.action`.**
-     Even when a modification is vague (e.g., "<person> is out for a while"), `expect.action`
-     must commit to a specific, observable outcome — which object acted, what it sent or
-     recorded, to whom. Take the most natural interpretation of the vague intent and state
-     it concretely. Never hedge with words like "appropriately", "as needed", or "if applicable".
-
-  2. **`expect.action` describes terminal observable output, not internal routing.**
-     Write exactly what external action was performed: which system was called, what was sent, and to whom. For example: "Email sent to <name> via email system" or "Slack message posted to #<channel>". Do NOT use UX concepts like "interface", "dashboard", "widget", "panel", or "form" — these are not observable external actions and cannot be verified. Do NOT say "system routes to approver" or "object handles request".
-
-  3. **For removal modifications, specify the fallback.**
-     After-events must state both (a) what no longer happens, AND (b) what happens instead —
-     or explicitly that the trigger completes without that action and the workflow continues
-     normally through another channel.
-
-  4. **Before-events must test the exact condition the modification will change.**
-     The before-event must exercise the precise rule or behavior the modification targets, and
-     expect the pre-modification outcome. A generic passing scenario is not a regression test.
-
-  5. **`expect.reason` must name the specific rule, behavior clause, or peer relationship**
-     that produces the outcome. Not a description of the modification's ambiguity.
+  Focus on writing high-quality `input` values — realistic external triggers that exercise the right
+  logic at the right time. Expectations are written in a separate pass and are not part of your output.
 
   ```yaml
   events:
@@ -105,9 +83,6 @@ user_prompt: |
       recipient: "<entry-point object from sample>"
       when: "W02-1T09:00"
       input: "<external trigger content matching the sample's step pattern>"
-      expect:
-        action: "What the system should ultimately do (the observable outcome)"
-        reason: "Which rule or object behavior drives that outcome"
   ```
 
   ---

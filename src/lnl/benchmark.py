@@ -202,9 +202,9 @@ class BenchmarkHarness:
                 results.append(self.run_scenario(scenario))
         return results
 
-    def evaluate_assertion(self, condition: str, actual: str) -> tuple[bool, str]:
+    def evaluate_assertion(self, condition: str, actual: str, context: str = "") -> tuple[bool, str]:
         """Evaluate an assertion condition against actual evidence using the judge."""
-        return self._judge.evaluate(condition, actual)
+        return self._judge.evaluate(condition, actual, context)
 
     def _gather_actual(
         self,

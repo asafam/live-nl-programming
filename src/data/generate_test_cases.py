@@ -24,7 +24,10 @@ from tqdm import tqdm
 # Load environment variables from .env file
 load_dotenv()
 
-from src.data.schema import Sample, Scenarios, TestCase, Modification, ModType, Ambiguity
+from src.data.schema import (
+    Sample, Scenarios, TestCase, Modification, ModType, Ambiguity,
+    Event, EventExpect, EventExpectations,
+)
 from src.data.llm import create_llm
 from src.data.utils import (
     infer_provider,
@@ -142,6 +145,77 @@ def format_prompt(
     return result
 
 
+def _rewrite_event_expectations(llm, test_case: TestCase, sample: Sample) -> None:
+    """Rewrite event expectations using the finalized mock data (mutates test_case.events).
+
+    The scenario generator writes events without expectations. This function writes them
+    using the actual data the read-service mocks will return at eval time, so names like
+    "the identified manager" are replaced with the real person from the org directory.
+    """
+    import yaml as _yaml
+
+    prompt_path = Path(__file__).parent.parent.parent / "config" / "prompts" / "data-gen" / "write_expectations.yaml"
+    with open(prompt_path) as f:
+        raw_prompt = _yaml.safe_load(f)["prompt"]
+
+    obj_lines = "\n\n".join(
+        f"[{obj.object_id}]\nRole: {obj.role}\nBehavior: {obj.behavior}"
+        for obj in sample.objects
+    )
+    mock_lines = "\n\n".join(
+        f"Tool: {t.tool_name}\n{t.response_template[:3000]}"
+        for t in test_case.mock_tools
+    ) or "(none)"
+    mod_lines = "\n".join(
+        f"{m.id} at {m.when} → {m.target}: {m.intent}"
+        for m in test_case.modifications
+    ) or "(none)"
+
+    def _ts_key(ts: str) -> tuple:
+        """Parse W{w}-{d}T{HH:MM} into a comparable tuple."""
+        import re as _re
+        m = _re.match(r"W(\d+)-(\d+)T(\d+):(\d+)", ts or "")
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else (0, 0, 0, 0)
+
+    mod_keys = [(_ts_key(m.when), m.id) for m in test_case.modifications]
+
+    def _active_mods(event_when: str) -> list[str]:
+        ek = _ts_key(event_when)
+        return [mid for mk, mid in mod_keys if ek >= mk]
+
+    event_lines_parts = []
+    for e in test_case.events:
+        active = _active_mods(e.when)
+        mod_note = f" [active modifications: {', '.join(active)}]" if active else " [no modifications active — use baseline behavior]"
+        event_lines_parts.append(
+            f"{e.id} | {e.when}{mod_note} | recipient={e.recipient} | input: {e.input}"
+        )
+    event_lines = "\n".join(event_lines_parts)
+
+    prompt = (raw_prompt
+        .replace("{OBJECTS}", obj_lines)
+        .replace("{MOCK_DATA}", mock_lines)
+        .replace("{MODIFICATIONS}", mod_lines)
+        .replace("{EVENTS}", event_lines)
+    )
+
+    result = generate_with_retries(
+        llm=llm,
+        prompt=prompt,
+        response_model=EventExpectations,
+        item_id=f"{test_case.id}-expectations",
+        validator=lambda r: len(r.expectations) > 0,
+    )
+    if not result:
+        return
+
+    expect_map = {item.event_id: item for item in result.expectations}
+    for evt in test_case.events:
+        if evt.id in expect_map:
+            item = expect_map[evt.id]
+            evt.expect = EventExpect(action=item.action, reason=item.reason)
+
+
 def scenario_to_test_case(
     sample: Sample, scenario, index: int, mod_types: list[ModType], ambiguity: Ambiguity,
 ) -> TestCase:
@@ -159,7 +233,8 @@ def scenario_to_test_case(
         objects=sample.objects,
         steps=sample.steps,
         modifications=modifications,
-        events=scenario.events,
+        events=[Event(**e.model_dump()) for e in scenario.events],
+        mock_tools=list(sample.mock_tools),
     )
 
 
@@ -402,7 +477,8 @@ def run(args: argparse.Namespace) -> Path:
 
                     if result:
                         # Convert scenarios to test cases and write each as a separate line
-                        for i, scenario in enumerate(result.scenarios, start=1):
+                        scenarios = result.scenarios[:args.scenario_count]
+                        for i, scenario in enumerate(scenarios, start=1):
                             test_case = scenario_to_test_case(
                                 sample, scenario, i,
                                 mod_types=[ModType(mt) for mt in resolved_mod_types],
@@ -410,7 +486,7 @@ def run(args: argparse.Namespace) -> Path:
                             )
                             f.write(test_case.model_dump_json() + "\n")
                         f.flush()
-                        success_count += len(result.scenarios)
+                        success_count += len(scenarios)
                     else:
                         fail_count += 1
 

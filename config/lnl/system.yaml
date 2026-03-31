@@ -1,0 +1,13 @@
+heartbeat:
+  enabled: true
+  interval_seconds: 30
+
+react_cross_objects: true
+
+limits:
+  # Maximum ReAct tool-call steps within a single object invocation (per-frame depth)
+  max_tool_rounds: 5
+  # Maximum message hops across objects — equivalent to call-stack depth
+  max_chain_depth: 10
+  # Messages kept in each object's history window
+  max_history: 6

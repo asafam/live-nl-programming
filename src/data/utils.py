@@ -149,8 +149,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model",
         "-m",
-        default="claude-sonnet-4-5-20250929",
-        help="Model name (default: claude-sonnet-4-5-20250929). Provider is inferred: claude-* → anthropic, gpt-*/o1-*/o3-* → openai",
+        default="claude-sonnet-4-6",
+        help="Model name (default: claude-sonnet-4-6). Provider is inferred: claude-* → anthropic, gpt-*/o1-*/o3-* → openai",
     )
     parser.add_argument(
         "--seed",

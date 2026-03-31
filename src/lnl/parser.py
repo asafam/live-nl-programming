@@ -78,7 +78,6 @@ def parse_object_text(text: str) -> ObjectDefinition:
     return ObjectDefinition(
         object_id=object_id,
         role=role,
-        state_description=sections.get("state", sections.get("state description", "")),
         behavior=sections.get("behavior", ""),
         peers=peers,
         skills=skills,
@@ -99,9 +98,6 @@ def serialize_object(defn: ObjectDefinition) -> str:
     parts = [f"# {title}"]
 
     parts.append(f"\n## Role\n\n{defn.role}")
-
-    if defn.state_description:
-        parts.append(f"\n## State\n\n{defn.state_description}")
 
     if defn.behavior:
         parts.append(f"\n## Behavior\n\n{defn.behavior}")

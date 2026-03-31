@@ -1,0 +1,55 @@
+prompt: |
+  # Task: Write External Trigger Steps
+
+  Given a concrete automation scenario and its object system, write the external trigger steps that start the automation.
+
+  ---
+
+  ## Automation
+
+  **Name:** {NAME}
+
+  **Scenario steps:**
+  {GROUNDED_STEPS}
+
+  ---
+
+  ## Object System
+
+  {OBJECTS}
+
+  ---
+
+  ## Instructions
+
+  Steps are **external triggers only** — events that arrive from outside the system boundary and cause the automation to run. They are NOT a trace of the internal workflow.
+
+  Once a trigger fires, the objects take over: each object's behavior and peer declarations determine what happens next automatically. Do not write steps for internal actions.
+
+  ### Each step has these fields:
+
+  - `target` — the `object_id` of the object that receives the external trigger. MUST be an object with a non-empty `event_sources` list.
+  - `source` — the external system sending this trigger (e.g., `"webhook"`, `"__external__"`). Use the actual system name if known.
+  - `text` — the natural language content of the trigger. Include only information that arrives with the external event — not data the objects will look up themselves. Use descriptive names for people and items (e.g., "James Brown, Account Executive" not "User #445").
+  - `expect` — what the system produces when run with no modifications:
+    - `action` — specific, observable terminal output: what was sent, recorded, or produced, and to whom. Describe only natural-language messages and data writes — NOT interactive UI elements (buttons, dropdowns, forms, widgets). LNL objects communicate via natural language; they cannot produce interactive UI components. **Use concrete names and destinations from the step `text`** — e.g., "notification sent to #channel mentioning Alex Rivera" not "notification sent to the designated channel". The judge verifies exact facts; abstract references cause false failures.
+    - `reason` — the rule or peer relationship that causes it
+
+  ### Rules
+
+  **What IS a step:**
+  - An external system creates a record that triggers the automation
+  - An inbound message the system must act on
+  - A scheduled or time-based trigger (heartbeat, daily check)
+
+  **What is NOT a step** (internal — handled by object behavior and peers):
+  - An object querying another object for data
+  - An object sending a notification or downstream message
+  - An object updating a record in response to another object
+  - Any action that is a consequence of a prior step
+
+  **Most automations have only 1–2 steps.** If you find yourself writing more, check: is each step truly an independent external trigger, or a consequence of a prior one?
+
+  **Consistency:** Names used in step `text` must be realistic and consistent — the pipeline will generate matching mock API data using these names.
+
+  **Shared state:** Steps run sequentially on a shared runtime. Each step's side effects carry forward. Before writing `expect` for any step N, ask: "Have prior steps already resolved the state this step depends on?" If yes, omit `expect` — the outcome is no longer deterministic. Omit `expect` entirely for scheduled/heartbeat triggers.

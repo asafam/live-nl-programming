@@ -1,6 +1,7 @@
 """Runtime — library API tying together parser, objects, bus, and brain."""
 from __future__ import annotations
 
+import datetime
 import logging
 import queue
 import threading
@@ -8,6 +9,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+
+import yaml
 
 from .brain import LLMBrain
 from .bus import BusMetrics, MessageBus
@@ -67,24 +70,72 @@ class _Transaction:
         self._done.wait()
 
 
+_SYSTEM_CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "lnl" / "system.yaml"
+
+
+@dataclass
+class SystemConfig:
+    """Runtime configuration loaded from config/lnl/system.yaml."""
+    # Heartbeat
+    heartbeat_enabled: bool = False
+    heartbeat_interval_seconds: float = 30.0
+    # Limits — analogous to call-stack depth settings
+    max_tool_rounds: int = 5     # ReAct tool steps per object invocation (per-frame depth)
+    max_chain_depth: int = 10    # message hops across objects (call-stack depth)
+    max_history: int = 6         # history window per object
+    # Cross-agent ReAct: include the Peer Interaction Loop section in system prompts
+    react_cross_objects: bool = True
+
+    @staticmethod
+    def load(path: Path | None = None) -> "SystemConfig":
+        """Load from config/lnl/system.yaml (or a custom path). Returns defaults on missing file."""
+        p = path or _SYSTEM_CONFIG_PATH
+        try:
+            with open(p) as f:
+                data = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            return SystemConfig()
+        hb = data.get("heartbeat", {})
+        lim = data.get("limits", {})
+        return SystemConfig(
+            heartbeat_enabled=bool(hb.get("enabled", False)),
+            heartbeat_interval_seconds=float(hb.get("interval_seconds", 30.0)),
+            max_tool_rounds=int(lim.get("max_tool_rounds", 5)),
+            max_chain_depth=int(lim.get("max_chain_depth", 10)),
+            max_history=int(lim.get("max_history", 6)),
+            react_cross_objects=bool(data.get("react_cross_objects", True)),
+        )
+
+
+# Keep the old name as an alias for backward compatibility
+HeartbeatConfig = SystemConfig
+
+
 class Runtime:
     """Single entry point for the LNL runtime."""
 
     def __init__(
         self,
         brain: LLMBrain,
-        max_chain_depth: int = 10,
+        max_chain_depth: int | None = None,
         strict_peers: bool = True,
         tool_registry: ToolRegistry | None = None,
         pool_size: int = 4,
+        heartbeat: "SystemConfig | None" = None,  # legacy param name; accepts SystemConfig
+        system_config: "SystemConfig | None" = None,
     ) -> None:
+        cfg = system_config or heartbeat or SystemConfig()
         self._brain = brain
         self._bus = MessageBus(strict_peers=strict_peers)
-        self._max_chain_depth = max_chain_depth
+        self._max_chain_depth = max_chain_depth if max_chain_depth is not None else cfg.max_chain_depth
+        self._max_tool_rounds = cfg.max_tool_rounds
+        self._max_history = cfg.max_history
+        self._react_cross_objects = cfg.react_cross_objects
         self._sources: dict[str, Path] = {}  # object_id -> file path
         self._modified: set[str] = set()  # object_ids with unsaved changes
         self._event_sources = EventSourceRegistry()
         self._tool_registry = tool_registry
+        self._heartbeat = cfg
 
         # Thread pool — shared across all objects; no per-object thread
         self._pool = ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="lnl-obj")
@@ -112,6 +163,7 @@ class Runtime:
         self._running = threading.Event()
         self._shutdown = threading.Event()
         self._thread: threading.Thread | None = None
+        self._heartbeat_thread: threading.Thread | None = None
 
         # Wire bus schedule callback — objects schedule themselves when mail arrives
         self._bus.set_schedule_callback(self._schedule_object)
@@ -175,6 +227,9 @@ class Runtime:
             definition, self._brain,
             tool_registry=self._tool_registry,
             tool_context_factory=tool_context_factory,
+            max_tool_rounds=self._max_tool_rounds,
+            max_history=self._max_history,
+            react_cross_objects=self._react_cross_objects,
         )
         self._bus.register(obj)
         if definition.event_sources:
@@ -513,6 +568,13 @@ class Runtime:
         self._shutdown.clear()
         self._running.set()
         self._on_result_callback = on_result
+        if self._heartbeat.heartbeat_enabled and self._heartbeat_thread is None:
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                args=(self._heartbeat.heartbeat_interval_seconds,),
+                daemon=True,
+            )
+            self._heartbeat_thread.start()
         try:
             self._run_loop(poll_interval)
         finally:
@@ -531,6 +593,13 @@ class Runtime:
             daemon=True,
         )
         self._thread.start()
+        if self._heartbeat.heartbeat_enabled:
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                args=(self._heartbeat.heartbeat_interval_seconds,),
+                daemon=True,
+            )
+            self._heartbeat_thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
         """Signal the run-loop to stop and wait for it to finish."""
@@ -538,6 +607,9 @@ class Runtime:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2.0)
+            self._heartbeat_thread = None
         self._pool.shutdown(wait=False)
 
     def submit(
@@ -568,6 +640,21 @@ class Runtime:
         self._event_sources.unbind_object(object_id)
         self._sources.pop(object_id, None)
         self._modified.discard(object_id)
+
+    def _heartbeat_loop(self, interval: float) -> None:
+        """Broadcast a heartbeat to all objects at a fixed interval (live mode only)."""
+        while not self._shutdown.wait(timeout=interval):
+            if not self._running.is_set():
+                continue
+            content = f"Heartbeat — {datetime.datetime.now().isoformat()}"
+            msg = Message(
+                sender="__system__",
+                recipient="__broadcast__",
+                type=MessageType.HEARTBEAT,
+                content=content,
+                depth_remaining=1,  # heartbeats do not cascade to peer chains
+            )
+            self._work_queue.put(_WorkItem(message=msg))
 
     def _run_loop(self, poll_interval: float) -> None:
         """Internal run-loop: dequeue work, dispatch transaction, repeat."""

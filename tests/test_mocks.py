@@ -1,4 +1,4 @@
-"""Tests for MockService and MockRegistry (Phase 5)."""
+"""Tests for MockService, MockRegistry, and MockInProcessExecutor."""
 from src.lnl.mocks import MockRegistry, MockService
 
 
@@ -96,3 +96,78 @@ class TestMockRegistry:
         recs = reg.all_recordings()
         assert len(recs["a"]) == 1
         assert len(recs["b"]) == 1
+
+
+# ── MockInProcessExecutor scripted_match_responses tests ──────────────────────
+
+class TestMockInProcessExecutorMatchResponses:
+    def _make_def(self, **kwargs):
+        from src.data.schema import MockToolDef
+        return MockToolDef(
+            tool_name="slack.send_message",
+            description="Send a Slack message.",
+            arguments_schema={"type": "object", "properties": {"channel": {"type": "string"}}},
+            response_template="fallback response",
+            **kwargs,
+        )
+
+    def _make_call(self, id="t1", args=None):
+        from src.lnl.types import ToolCall
+        return ToolCall(id=id, tool="slack.send_message", arguments=args or {"channel": "general"})
+
+    def test_arg_match_takes_priority_over_response_template(self):
+        from src.data.schema import ScriptedMatchResponse
+        from src.lnl.tools import MockInProcessExecutor
+        executor = MockInProcessExecutor(self._make_def(
+            scripted_match_responses=[
+                ScriptedMatchResponse(match={"channel": "urgent"}, response="URGENT handled"),
+            ],
+        ))
+        result = executor.execute(self._make_call(args={"channel": "urgent-alerts"}), {})
+        assert result.output == "URGENT handled"
+
+    def test_index_scripted_takes_priority_over_match(self):
+        from src.data.schema import ScriptedMatchResponse
+        from src.lnl.tools import MockInProcessExecutor
+        executor = MockInProcessExecutor(self._make_def(
+            scripted_responses=["scripted #1"],
+            scripted_match_responses=[
+                ScriptedMatchResponse(match={"channel": ".*"}, response="match response"),
+            ],
+        ))
+        result = executor.execute(self._make_call(args={"channel": "general"}), {})
+        assert result.output == "scripted #1"
+
+    def test_falls_back_to_response_template_when_no_match(self):
+        from src.data.schema import ScriptedMatchResponse
+        from src.lnl.tools import MockInProcessExecutor
+        executor = MockInProcessExecutor(self._make_def(
+            scripted_match_responses=[
+                ScriptedMatchResponse(match={"channel": "urgent"}, response="URGENT"),
+            ],
+        ))
+        result = executor.execute(self._make_call(args={"channel": "general"}), {})
+        assert result.output == "fallback response"
+
+    def test_first_matching_entry_wins(self):
+        from src.data.schema import ScriptedMatchResponse
+        from src.lnl.tools import MockInProcessExecutor
+        executor = MockInProcessExecutor(self._make_def(
+            scripted_match_responses=[
+                ScriptedMatchResponse(match={"channel": "deals"}, response="deals match"),
+                ScriptedMatchResponse(match={"channel": ".*"}, response="catch-all"),
+            ],
+        ))
+        result = executor.execute(self._make_call(args={"channel": "deals"}), {})
+        assert result.output == "deals match"
+
+    def test_match_response_interpolation(self):
+        from src.data.schema import ScriptedMatchResponse
+        from src.lnl.tools import MockInProcessExecutor
+        executor = MockInProcessExecutor(self._make_def(
+            scripted_match_responses=[
+                ScriptedMatchResponse(match={"channel": ".*"}, response="Sent to #{channel}"),
+            ],
+        ))
+        result = executor.execute(self._make_call(args={"channel": "deals"}), {})
+        assert result.output == "Sent to #deals"

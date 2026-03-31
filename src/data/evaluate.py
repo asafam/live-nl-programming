@@ -181,7 +181,16 @@ def gather_evidence(
             state_str = str(state).strip() or "(empty)"
         state_parts.append(f"  [{obj_id}]:\n{state_str}")
 
+    # Object registry — helps the judge map object IDs to external systems
+    registry_lines = []
+    for obj_id, obj in rt._bus.objects.items():
+        role = getattr(obj.definition, "role", "")
+        if role:
+            registry_lines.append(f"  [{obj_id}]: {role}")
+
     sections: list[str] = []
+    if registry_lines:
+        sections.append("=== OBJECT REGISTRY ===\n" + "\n".join(registry_lines))
     if this_event_parts:
         sections.append("=== THIS EVENT ===\n" + "\n\n".join(this_event_parts))
     if state_parts:
@@ -219,6 +228,10 @@ def _execute_test_case_inner(
 
     # 1. Build ToolRegistry — two-layer priority merge (lowest → highest):
     #    --mock-config global < tc.mock_tools
+    #
+    # Mock tools are declared explicitly in the test case or via --mock-config.
+    # Reference data (employee records, catalogs, etc.) lives in the mock tool
+    # response_template — not in ObjectDef. LLM-objects are never seeded with data.
     #
     # Skills are intentionally NOT included here — they are internal computations
     # (the generate_samples prompt marks them as "purely internal, no external system
@@ -296,6 +309,17 @@ def _run_with_timeout(fn, timeout_s: Optional[float]):
     return result_box[0] or [], False
 
 
+def _format_prior_state(rt) -> str:
+    """Snapshot all object states as a context string for the judge."""
+    lines = ["=== PRIOR STATE (resolved runtime values from previous steps) ==="]
+    for obj_id, obj in rt._bus.objects.items():
+        state = obj.state
+        if state:
+            state_str = json.dumps(state, indent=2) if isinstance(state, dict) else str(state)
+            lines.append(f"[{obj_id}]:\n{state_str}")
+    return "\n\n".join(lines)
+
+
 def _snapshot_logs(mock_executors: list) -> list[int]:
     return [len(ex.call_log) for ex in mock_executors]
 
@@ -319,6 +343,7 @@ def _run_test_case_timeline(
     mod_results: list[ModificationResult] = []
 
     execs = mock_executors or []
+    prior_context: str = ""
 
     # 2. Run steps — initialize state and assert default (no-modification) behavior
     for i, step in enumerate(tc.steps):
@@ -347,7 +372,7 @@ def _run_test_case_timeline(
                 new_calls = _new_tool_calls(execs, exec_snap)
                 evidence = gather_evidence(rt, results, step.target, bus_messages=bus_msgs, tool_calls=new_calls)
                 condition = step.expect.action
-                passed, reasoning = harness.evaluate_assertion(condition, evidence)
+                passed, reasoning = harness.evaluate_assertion(condition, evidence, prior_context)
                 event_results.append(EventResult(
                     event_id=f"S{i+1:03d}",
                     passed=passed,
@@ -358,6 +383,7 @@ def _run_test_case_timeline(
                     output_tokens=out_tok,
                     latency_ms=latency_ms,
                 ))
+        prior_context = _format_prior_state(rt)
 
     if steps_only:
         return event_results, mod_results
@@ -394,7 +420,7 @@ def _run_test_case_timeline(
         lat = (time.monotonic() - t0) * 1000
         return res, tout, lat, log_snap, exec_s
 
-    def _record_event_result(evt, res, timed_out, lat_ms, log_snap, exec_s):
+    def _record_event_result(evt, res, timed_out, lat_ms, log_snap, exec_s, ctx: str = ""):
         if timed_out:
             event_results.append(EventResult(
                 event_id=evt.id,
@@ -409,7 +435,7 @@ def _run_test_case_timeline(
             bus_msgs = rt.message_log[log_snap:]
             new_calls = _new_tool_calls(execs, exec_s)
             evidence = gather_evidence(rt, res, evt.recipient, bus_messages=bus_msgs, tool_calls=new_calls)
-            passed, reasoning = harness.evaluate_assertion(evt.expect.action, evidence)
+            passed, reasoning = harness.evaluate_assertion(evt.expect.action, evidence, ctx)
             event_results.append(EventResult(
                 event_id=evt.id,
                 passed=passed,
@@ -440,15 +466,20 @@ def _run_test_case_timeline(
                     output_tokens=out_tok,
                     latency_ms=latency_ms,
                 ))
+            prior_context = _format_prior_state(rt)
 
         else:  # event
             res, tout, lat, log_snap, exec_s = _dispatch_event(item)
-            _record_event_result(item, res, tout, lat, log_snap, exec_s)
+            if item.expect is not None:
+                _record_event_result(item, res, tout, lat, log_snap, exec_s, prior_context)
+            prior_context = _format_prior_state(rt)
 
             # Dispatch events triggered by this one (in declaration order)
             for triggered_evt in tmap.get(item.id, []):
                 tr, tt, tl, tls, tes = _dispatch_event(triggered_evt)
-                _record_event_result(triggered_evt, tr, tt, tl, tls, tes)
+                if triggered_evt.expect is not None:
+                    _record_event_result(triggered_evt, tr, tt, tl, tls, tes, prior_context)
+                prior_context = _format_prior_state(rt)
 
     return event_results, mod_results
 
@@ -738,7 +769,7 @@ Examples:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=60.0,
+        default=180.0,
         metavar="SECONDS",
         help="Wall-clock timeout per step/event (not per test case); timed-out steps are marked failed and execution continues (default: 60)",
     )

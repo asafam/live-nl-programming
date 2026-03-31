@@ -185,6 +185,27 @@ LLM_REACT_SCHEMA: dict[str, Any] = {
                         "additionalProperties": False,
                     },
                 },
+                "updated_definition": {
+                    "type": "object",
+                    "description": "Optional. Only include when responding to an Admin message that changes your behavior. Include only the fields that change: role, behavior, peers.",
+                    "properties": {
+                        "role": {"type": "string"},
+                        "behavior": {"type": "string"},
+                        "peers": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "object_id": {"type": "string"},
+                                    "relationship": {"type": "string"},
+                                },
+                                "required": ["object_id", "relationship"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "additionalProperties": False,
+                },
             },
             "required": ["reply", "updated_state"],
             "additionalProperties": False,
@@ -211,21 +232,36 @@ def _load_prompt_config() -> dict:
 
 def _message_label(msg: Message) -> str:
     """Return a human-readable label for a message, so the LLM knows its type."""
+    if msg.type == MessageType.HEARTBEAT:
+        return "Heartbeat"
     if msg.type == MessageType.EVENT:
         if msg.sender in ("__system__", "__external__"):
             return "External event"
         return f"Event from {msg.sender}"
     if msg.type == MessageType.ADMIN:
-        return "System"
+        return "Admin"
     if msg.sender == "__user__":
         return "User instruction"
     return f"Message from peer: {msg.sender}"
+
+
+_PEER_INTERACTION_LOOP = """
+  ## Peer Interaction Loop
+  When you need information from a peer before completing your work:
+  1. Finish your current step by sending the peer your question via outgoing_messages.
+  2. Record your intent in updated_state so you can resume on their reply:
+     {{"_pending_reply_from": "<peer_id>", "_pending_intent": "<goal>"}}
+  3. When their REPLY message arrives, check _pending_reply_from, resume your
+     reasoning using _pending_intent as context, then clear those fields from state
+     once the goal is complete.
+  This makes multi-step peer interactions explicit and traceable."""
 
 
 def build_system_prompt(
     definition: ObjectDefinition,
     current_state: dict,
     tools: str = "",
+    react_cross_objects: bool = True,
 ) -> str:
     """Build the system prompt from the YAML template and an ObjectDefinition."""
     config = _load_prompt_config()
@@ -246,14 +282,13 @@ def build_system_prompt(
     substitutions = {
         "object_id": definition.object_id,
         "role": definition.role,
-        "state_description": definition.state_description or "(none)",
         "behavior": definition.behavior or "(none)",
         "skills": skills_str or "(none)",
         "peers": peers or "(none)",
         "event_sources": event_sources or "(none)",
-        "seed_data": json.dumps(definition.seed_data, indent=2) if definition.seed_data else "(none)",
         "current_state": json.dumps(current_state, indent=2) if current_state else "(empty)",
         "tools": tools or "(none)",
+        "peer_interaction_loop": _PEER_INTERACTION_LOOP if react_cross_objects else "",
     }
     result = template
     for key, value in substitutions.items():
@@ -310,6 +345,7 @@ class LLMBrain(ABC):
         again until action == "finish".
         """
         ...
+
 
 
 class OpenAIBrain(LLMBrain):
@@ -455,7 +491,7 @@ class AnthropicBrain(LLMBrain):
         t0 = time.time()
         resp = self._client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=8192,
             temperature=self._temperature,
             system=sys_prompt,
             messages=user_messages,
@@ -498,7 +534,7 @@ class AnthropicBrain(LLMBrain):
         t0 = time.time()
         resp = self._client.messages.create(
             model=self.model,
-            max_tokens=4096,
+            max_tokens=8192,
             temperature=self._temperature,
             system=sys_prompt,
             messages=user_messages,
@@ -669,11 +705,20 @@ def _parse_react_step(raw: dict) -> ReactStep:
 
     # action == "finish"
     f_data = raw.get("finish") or {}
+    updated_state = dict(f_data.get("updated_state") or {})
+
+    # Safety net: LLMs sometimes put outgoing_messages / external_actions inside
+    # updated_state instead of at the finish level. Rescue them before they get lost.
+    state_msgs = updated_state.pop("outgoing_messages", None) or []
+    state_ext = updated_state.pop("external_actions", None) or []
+
+    raw_msgs = f_data.get("outgoing_messages", []) or state_msgs
     outgoing = [
         OutgoingMessage(recipient=m["recipient"], content=m["content"])
-        for m in f_data.get("outgoing_messages", [])
+        for m in raw_msgs
         if isinstance(m, dict)
     ]
+    raw_ext = f_data.get("external_actions", []) or state_ext
     external = [
         ExternalAction(
             system=ea["system"],
@@ -681,14 +726,18 @@ def _parse_react_step(raw: dict) -> ReactStep:
             content=ea["content"],
             params=ea.get("params", {}),
         )
-        for ea in f_data.get("external_actions", [])
+        for ea in raw_ext
         if isinstance(ea, dict)
     ]
+    updated_def = f_data.get("updated_definition") or None
+    if updated_def == {}:
+        updated_def = None
     finish = ReactFinish(
         reply=f_data.get("reply", ""),
-        updated_state=f_data.get("updated_state") or {},
+        updated_state=updated_state,
         outgoing_messages=outgoing,
         external_actions=external,
+        updated_definition=updated_def,
     )
     return ReactStep(thought=thought, action="finish", finish=finish)
 

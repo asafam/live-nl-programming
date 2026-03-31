@@ -19,7 +19,6 @@ def _make_definition(**overrides):
     defaults = dict(
         object_id="test-obj",
         role="A test object.",
-        state_description="Track a counter.",
     )
     defaults.update(overrides)
     return ObjectDefinition(**defaults)
@@ -248,8 +247,8 @@ class TestToolLoop:
         obj = LLMObject(_make_definition(), brain, tool_registry=reg)
         result = obj.process_message(_user_msg("go"))
 
-        # Should have stopped at MAX_TOOL_ROUNDS
-        assert len(mock_exec.call_log) == LLMObject.MAX_TOOL_ROUNDS
+        # Should have stopped at the default max_tool_rounds (5)
+        assert len(mock_exec.call_log) == 5
 
     def test_tool_context_factory(self):
         """Tool context factory is called and provides context to executor."""

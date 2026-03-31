@@ -12,6 +12,7 @@ class MessageType(Enum):
     ADMIN = "admin"
     EVENT = "event"
     REPLY = "reply"
+    HEARTBEAT = "heartbeat"
 
 
 @dataclass
@@ -26,13 +27,11 @@ class ObjectDefinition:
     """Complete definition of an LLM-object parsed from markdown."""
     object_id: str
     role: str
-    state_description: str = ""
     behavior: str = ""
     peers: list[PeerDeclaration] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     subscriptions: list[str] = field(default_factory=list)
     event_sources: list[str] = field(default_factory=list)
-    seed_data: dict = field(default_factory=dict)  # static reference data; never mutated at runtime
 
 
 @dataclass
@@ -121,6 +120,7 @@ class ReactFinish:
     updated_state: dict = field(default_factory=dict)
     outgoing_messages: list[OutgoingMessage] = field(default_factory=list)
     external_actions: list[ExternalAction] = field(default_factory=list)
+    updated_definition: Optional[dict] = None  # set when an ADMIN message triggers a definition change
 
 
 @dataclass

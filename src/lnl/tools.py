@@ -102,10 +102,20 @@ class MockInProcessExecutor:
         }
         self.call_log.append(log_entry)
 
-        # Pick response: consume scripted_responses FIFO, fall back to response_template
-        scripted = self._tool_def.scripted_responses
-        template = scripted[call_index - 1] if call_index <= len(scripted) else self._tool_def.response_template
+        # Pick response (priority order):
+        #   1. scripted_responses FIFO (index-based)
+        #   2. scripted_match_responses (first arg-pattern match)
+        #   3. response_template fallback
         interp_vars = {**args, "call_index": call_index}
+        scripted = self._tool_def.scripted_responses
+        if call_index <= len(scripted):
+            template = scripted[call_index - 1]
+        else:
+            template = next(
+                (smr.response for smr in self._tool_def.scripted_match_responses
+                 if self._arg_matches(args, smr.match)),
+                self._tool_def.response_template,
+            )
         try:
             response_text = template.format(**interp_vars)
         except KeyError:
@@ -131,6 +141,13 @@ class MockInProcessExecutor:
     def _matches(self, args: dict) -> bool:
         """Return True if all match conditions pass (empty match always passes)."""
         for key, pattern in self._tool_def.match.items():
+            if not re.search(pattern, str(args.get(key, ""))):
+                return False
+        return True
+
+    @staticmethod
+    def _arg_matches(args: dict, match: dict) -> bool:
+        for key, pattern in match.items():
             if not re.search(pattern, str(args.get(key, ""))):
                 return False
         return True

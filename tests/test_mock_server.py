@@ -140,11 +140,9 @@ class TestResolveMockConfigs:
         obj = ObjectDef(
             object_id="test-obj",
             role="test",
-            state_description="",
             behavior="",
             skills=skills or [],
             event_sources=event_sources or [],
-            seed_data={},
         )
         return TestCase(
             id="TC001",
@@ -239,7 +237,6 @@ class TestResolveOrchestration:
             state_description="",
             behavior="",
             skills=["Send email notifications"],
-            seed_data={},
         )
         return TestCase(
             id="TC-ORCH",

@@ -284,7 +284,6 @@ class TestPersistence:
         rt.create_object(ObjectDefinition(
             object_id="worker",
             role="Worker role.",
-            state_description="Track tasks.",
         ))
 
         path = rt.save_object("worker", tmp_path / "worker.md")
