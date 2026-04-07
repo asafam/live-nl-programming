@@ -173,7 +173,14 @@ class PassthroughExecutor:
             "call_index": call_index,
             "arguments": call.arguments,
         })
-        return ToolResult(id=call.id, output=f"[mock] {call.tool} executed successfully.")
+        # Data-lookup tools (by _data suffix convention) return an empty but valid
+        # JSON object so the LLM can handle missing data gracefully rather than
+        # treating the call as a hard failure.
+        if call.tool.endswith("_data"):
+            output = "{}"
+        else:
+            output = f"[mock] {call.tool} executed successfully."
+        return ToolResult(id=call.id, output=output)
 
 
 class ToolRegistry:

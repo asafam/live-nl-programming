@@ -143,7 +143,7 @@ class TestRuntimeEventProviderIntegration:
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={"status": "event handled"}, reply="ok"))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt._event_sources.register_factory(
             lambda desc: custom_source if "slack" in desc.lower() else None
         )
@@ -172,7 +172,7 @@ class TestRuntimeEventProviderIntegration:
         brain = MockBrain()
         brain.script("slack", LLMResponse(updated_state={"status": "injected"}, reply="ok"))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="slack",
             role="Slack service",
@@ -189,7 +189,7 @@ class TestRuntimeEventProviderIntegration:
         brain = MockBrain()
         brain.script("worker", LLMResponse(updated_state={"status": "got event"}, reply="ok"))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="worker",
             role="Worker",
@@ -201,7 +201,7 @@ class TestRuntimeEventProviderIntegration:
 
     def test_event_registry_reflects_bindings(self):
         brain = MockBrain()
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="slack",
             role="Slack",
@@ -229,7 +229,7 @@ class TestRuntimeEventProviderIntegration:
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={"status": "tracked"}, reply="ok"))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt._event_sources.register_factory(lambda desc: tracker if "hubspot" in desc.lower() else None)
 
         rt.create_object(ObjectDefinition(

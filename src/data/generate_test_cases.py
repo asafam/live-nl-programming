@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -145,6 +148,20 @@ def format_prompt(
     return result
 
 
+def _ts_key(ts: str) -> tuple:
+    """Parse 'W{w}-{d}T{HH:MM}' into a comparable tuple (week, day, hour, minute)."""
+    import re as _re
+    m = _re.match(r"W(\d+)-(\d+)T(\d+):(\d+)", ts or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else (0, 0, 0, 0)
+
+
+def _active_mods_for(event_when: str, modifications: list) -> list[str]:
+    """Return mod IDs that are active at event_when (mod.when <= event_when)."""
+    mod_keys = [(_ts_key(m.when), m.id) for m in modifications]
+    ek = _ts_key(event_when)
+    return [mid for mk, mid in mod_keys if ek >= mk]
+
+
 def _rewrite_event_expectations(llm, test_case: TestCase, sample: Sample) -> None:
     """Rewrite event expectations using the finalized mock data (mutates test_case.events).
 
@@ -171,21 +188,9 @@ def _rewrite_event_expectations(llm, test_case: TestCase, sample: Sample) -> Non
         for m in test_case.modifications
     ) or "(none)"
 
-    def _ts_key(ts: str) -> tuple:
-        """Parse W{w}-{d}T{HH:MM} into a comparable tuple."""
-        import re as _re
-        m = _re.match(r"W(\d+)-(\d+)T(\d+):(\d+)", ts or "")
-        return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else (0, 0, 0, 0)
-
-    mod_keys = [(_ts_key(m.when), m.id) for m in test_case.modifications]
-
-    def _active_mods(event_when: str) -> list[str]:
-        ek = _ts_key(event_when)
-        return [mid for mk, mid in mod_keys if ek >= mk]
-
     event_lines_parts = []
     for e in test_case.events:
-        active = _active_mods(e.when)
+        active = _active_mods_for(e.when, test_case.modifications)
         mod_note = f" [active modifications: {', '.join(active)}]" if active else " [no modifications active — use baseline behavior]"
         event_lines_parts.append(
             f"{e.id} | {e.when}{mod_note} | recipient={e.recipient} | input: {e.input}"
@@ -224,8 +229,20 @@ def scenario_to_test_case(
         Modification(**gen_mod.model_dump(), mod_type=mt, ambiguity=ambiguity)
         for gen_mod, mt in zip(scenario.modifications, mod_types)
     ]
+    events = [Event(**e.model_dump()) for e in scenario.events]
+    # Deterministic fix: clear triggered_by if it references a non-event ID
+    # (LLMs sometimes generate triggered_by='M001' referencing a modification ID)
+    event_ids = {e.id for e in events}
+    for e in events:
+        if e.triggered_by is not None and e.triggered_by not in event_ids:
+            e.triggered_by = None
+
+    # Include mod_type in TC ID so each (sample, mod_type) pair is unique and
+    # the completion cache (which keys by stripping "-TC{NNN}") can track them independently.
+    mod_type_slug = mod_types[0].value if mod_types else "mixed"
     return TestCase(
-        id=f"{sample.id}-TC{index:03d}",
+        id=f"{sample.id}-{mod_type_slug}-TC{index:03d}",
+        sample_id=sample.id,
         name=sample.name,
         domain=sample.domain,
         source_type=sample.source_type,
@@ -233,7 +250,7 @@ def scenario_to_test_case(
         objects=sample.objects,
         steps=sample.steps,
         modifications=modifications,
-        events=[Event(**e.model_dump()) for e in scenario.events],
+        events=events,
         mock_tools=list(sample.mock_tools),
     )
 
@@ -320,6 +337,20 @@ Examples:
         default="random",
         help="Ambiguity level for modifications (default: random). Use 'random' for random assignment per iteration.",
     )
+    parser.add_argument(
+        "--id",
+        dest="ids",
+        metavar="ID",
+        action="append",
+        default=None,
+        help="Only process sample(s) with this ID (repeatable: --id foo --id bar)",
+    )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=1,
+        help="Number of parallel workers (default: 1). One worker per (sample, mod-type) unit.",
+    )
     add_common_args(parser)
     return parser
 
@@ -352,6 +383,11 @@ def run(args: argparse.Namespace) -> Path:
     # Load data
     samples = load_jsonl(args.input, Sample)
     prompt_template = load_prompt_template(args.prompt_template)["user_prompt"]
+
+    # Apply ID filter if specified
+    if getattr(args, "ids", None):
+        id_set = set(args.ids)
+        samples = [s for s in samples if s.id in id_set]
 
     # Apply limit if specified (0 or None means no limit)
     if args.limit:
@@ -395,6 +431,7 @@ def run(args: argparse.Namespace) -> Path:
     # Concrete ambiguity values for random sampling
     ambiguity_values = [a.value for a in Ambiguity]
 
+    workers = getattr(args, "workers", 1)
     print_run_info(
         args.provider,
         args.model,
@@ -404,6 +441,7 @@ def run(args: argparse.Namespace) -> Path:
             "Modification types": ", ".join(mod_types_to_generate),
             "Ambiguity": args.ambiguity,
             "Events": f"{args.events_before} before, {args.events_after} after, {args.events_unrelated} unrelated",
+            "Workers": str(workers),
         },
     )
 
@@ -419,77 +457,96 @@ def run(args: argparse.Namespace) -> Path:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     success_count = 0
     fail_count = 0
+    write_lock = threading.Lock()
 
-    # Calculate total iterations for progress bar
-    total_iterations = len(pending) * len(mod_types_to_generate)
+    # Flatten (sample, mod_type) work units
+    work_units = [
+        (sample, mod_type)
+        for sample in pending
+        for mod_type in mod_types_to_generate
+    ]
+
+    def _process_unit(sample: Sample, mod_type: str) -> list[TestCase]:
+        """Generate test cases for one (sample, mod_type) pair."""
+        if mod_type == "mixed":
+            resolved_mod_types = [
+                random.choice(concrete_mod_types)
+                for _ in range(args.mods_per_scenario)
+            ]
+            mod_type_label = ", ".join(resolved_mod_types)
+            mod_description = "\n".join(
+                f"- Modification {i+1} ({mt}): {MODIFICATION_TYPES[mt]}"
+                for i, mt in enumerate(resolved_mod_types)
+            )
+        else:
+            resolved_mod_types = [mod_type] * args.mods_per_scenario
+            mod_type_label = mod_type
+            mod_description = MODIFICATION_TYPES[mod_type]
+
+        if args.ambiguity == "random":
+            ambiguity_constraint = random.choice(ambiguity_values)
+        else:
+            ambiguity_constraint = args.ambiguity
+        ambiguity_description = AMBIGUITY_DESCRIPTIONS[ambiguity_constraint]
+
+        prompt = format_prompt(
+            prompt_template,
+            sample,
+            args.scenario_count,
+            args.events_before,
+            args.events_after,
+            args.events_unrelated,
+            modification_type=mod_type_label,
+            modification_type_description=mod_description,
+            mods_per_scenario=args.mods_per_scenario,
+            ambiguity_constraint=ambiguity_constraint,
+            ambiguity_description=ambiguity_description,
+        )
+
+        result = generate_with_retries(
+            llm=llm,
+            prompt=prompt,
+            response_model=Scenarios,
+            item_id=f"{sample.id}-{mod_type}",
+            validator=lambda r: bool(r.scenarios),
+        )
+
+        if not result:
+            return []
+
+        scenarios = result.scenarios[:args.scenario_count]
+        return [
+            scenario_to_test_case(
+                sample, scenario, i,
+                mod_types=[ModType(mt) for mt in resolved_mod_types],
+                ambiguity=Ambiguity(ambiguity_constraint),
+            )
+            for i, scenario in enumerate(scenarios, start=1)
+        ]
 
     with open(args.output, file_mode) as f:
-        with tqdm(total=total_iterations, desc="Generating test cases") as pbar:
-            for sample in pending:
-                for mod_type in mod_types_to_generate:
-                    # Resolve mod types for each modification in the scenario
-                    if mod_type == "mixed":
-                        resolved_mod_types = [
-                            random.choice(concrete_mod_types)
-                            for _ in range(args.mods_per_scenario)
-                        ]
-                        # Build combined description for the prompt
-                        mod_type_label = ", ".join(resolved_mod_types)
-                        mod_description = "\n".join(
-                            f"- Modification {i+1} ({mt}): {MODIFICATION_TYPES[mt]}"
-                            for i, mt in enumerate(resolved_mod_types)
-                        )
-                    else:
-                        resolved_mod_types = [mod_type] * args.mods_per_scenario
-                        mod_type_label = mod_type
-                        mod_description = MODIFICATION_TYPES[mod_type]
-
-                    # Resolve ambiguity for this iteration
-                    if args.ambiguity == "random":
-                        ambiguity_constraint = random.choice(ambiguity_values)
-                    else:
-                        ambiguity_constraint = args.ambiguity
-                    ambiguity_description = AMBIGUITY_DESCRIPTIONS[ambiguity_constraint]
-
-                    # Format prompt
-                    prompt = format_prompt(
-                        prompt_template,
-                        sample,
-                        args.scenario_count,
-                        args.events_before,
-                        args.events_after,
-                        args.events_unrelated,
-                        modification_type=mod_type_label,
-                        modification_type_description=mod_description,
-                        mods_per_scenario=args.mods_per_scenario,
-                        ambiguity_constraint=ambiguity_constraint,
-                        ambiguity_description=ambiguity_description,
-                    )
-
-                    # Generate scenarios
-                    result = generate_with_retries(
-                        llm=llm,
-                        prompt=prompt,
-                        response_model=Scenarios,
-                        item_id=f"{sample.id}-{mod_type}",
-                        validator=lambda r: bool(r.scenarios),
-                    )
-
-                    if result:
-                        # Convert scenarios to test cases and write each as a separate line
-                        scenarios = result.scenarios[:args.scenario_count]
-                        for i, scenario in enumerate(scenarios, start=1):
-                            test_case = scenario_to_test_case(
-                                sample, scenario, i,
-                                mod_types=[ModType(mt) for mt in resolved_mod_types],
-                                ambiguity=Ambiguity(ambiguity_constraint),
-                            )
-                            f.write(test_case.model_dump_json() + "\n")
-                        f.flush()
-                        success_count += len(scenarios)
+        with tqdm(total=len(work_units), desc="Generating test cases") as pbar:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_process_unit, sample, mod_type): (sample.id, mod_type)
+                    for sample, mod_type in work_units
+                }
+                for future in as_completed(futures):
+                    sample_id, mod_type = futures[future]
+                    try:
+                        test_cases = future.result()
+                    except Exception as e:
+                        tqdm.write(f"  FAILED {sample_id}-{mod_type}: {e}", file=sys.stderr)
+                        test_cases = []
+                    with write_lock:
+                        for tc in test_cases:
+                            f.write(tc.model_dump_json() + "\n")
+                        if test_cases:
+                            f.flush()
+                    if test_cases:
+                        success_count += len(test_cases)
                     else:
                         fail_count += 1
-
                     pbar.update(1)
 
     print()

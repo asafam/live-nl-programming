@@ -18,14 +18,625 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
+import signal
+
 from src.data import generate_samples, generate_test_cases, generate_seed
+from src.data.validate_test_cases import (
+    validate_sample, validate_test_case, print_validation_report,
+    BLOCKING_VALIDATORS, WARNING_VALIDATORS,
+)
+from src.data.utils import load_jsonl
 
 SAMPLES_FILENAME = "samples.jsonl"
 TEST_CASES_FILENAME = "test_cases.jsonl"
+
+
+def _blocking_issues(issues_by_validator: dict) -> dict:
+    """Filter to only blocking-severity issues."""
+    return {k: v for k, v in issues_by_validator.items() if k in BLOCKING_VALIDATORS}
+
+
+def _warning_issues(issues_by_validator: dict) -> dict:
+    """Filter to only warning-severity issues."""
+    return {k: v for k, v in issues_by_validator.items() if k in WARNING_VALIDATORS}
+
+
+def _save_samples(path: Path, samples: list) -> None:
+    with open(path, "w") as f:
+        for s in samples:
+            f.write(s.model_dump_json() + "\n")
+
+
+def _invalidate_test_cases(test_cases_path: Path, sample_ids: set[str]) -> int:
+    """
+    Remove test cases whose sample_id is in sample_ids from test_cases_path.
+    Returns number of test cases removed.  No-op if the file doesn't exist.
+    """
+    if not test_cases_path or not test_cases_path.exists() or not sample_ids:
+        return 0
+    from src.data.schema import TestCase
+    tcs = load_jsonl(test_cases_path, TestCase)
+    kept = [tc for tc in tcs if tc.sample_id not in sample_ids]
+    removed = len(tcs) - len(kept)
+    if removed:
+        with open(test_cases_path, "w") as f:
+            for tc in kept:
+                f.write(tc.model_dump_json() + "\n")
+        print(f"  [validate] Invalidated {removed} stale test case(s) for {len(sample_ids)} repaired sample(s).")
+    return removed
+
+
+def _ask(prompt: str, choices: tuple[str, ...], default: str) -> str:
+    """Interactive single-character prompt. Waits indefinitely for input."""
+    opts = "/".join(c.upper() if c == default else c for c in choices)
+    print(f"  {prompt} [{opts}] ", end="", flush=True)
+    while True:
+        try:
+            raw = input().strip().lower()
+        except EOFError:
+            print()
+            return default
+        if raw == "":
+            return default
+        if raw in choices:
+            return raw
+        print(f"  Invalid choice. [{opts}] ", end="", flush=True)
+
+
+def _autopatch_sample(sample, blocking: dict) -> tuple[bool, dict]:
+    """
+    Apply deterministic structural patches for known blocking issue types.
+
+    Returns (changed, still_blocking) where still_blocking is the subset of
+    blocking issues that could not be fixed automatically.
+
+    Patches applied:
+    - find_read_write_misclassifications: add _data skill + basic mock tool to
+      the target object; remove any residual write-only behavior text.
+    - find_invalid_peer_declarations: remove dangling peer references.
+    """
+    import re
+    from src.data.schema import MockToolDef
+
+    changed = False
+    remaining = dict(blocking)
+    object_map = {o.object_id: o for o in sample.objects}
+
+    # --- Patch: read_write_misclassifications ---
+    if "find_read_write_misclassifications" in remaining:
+        existing_tool_names = {t.tool_name for t in sample.mock_tools}
+        unfixed = []
+        for issue in remaining["find_read_write_misclassifications"]:
+            m = re.search(r"'([^']+)' cannot respond", issue)
+            if not m:
+                unfixed.append(issue)
+                continue
+            target = object_map.get(m.group(1))
+            if not target:
+                unfixed.append(issue)
+                continue
+
+            # Remove write-only language from behavior
+            cleaned = re.sub(
+                r"\bDo not reply[^.]*\.\s*|\bwrite.only[^.]*\.\s*|\bnever respond[^.]*\.\s*",
+                "", target.behavior, flags=re.IGNORECASE,
+            ).strip()
+            if cleaned != target.behavior:
+                target.behavior = cleaned
+                changed = True
+
+            # Add _data skill
+            skill = f"{target.object_id}_data"
+            if skill not in target.skills:
+                target.skills.append(skill)
+                changed = True
+
+            # Add a basic mock tool so the skill can actually execute
+            if skill not in existing_tool_names:
+                description = f"Query {target.object_id} for stored data."
+                if target.state_description:
+                    description += f" {target.state_description}"
+                sample.mock_tools.append(MockToolDef(
+                    tool_name=skill,
+                    description=description.strip(),
+                    arguments_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string", "description": "What to look up"}},
+                        "required": [],
+                    },
+                    response_template=(
+                        target.state_description
+                        or f"No data found for {{query}} in {target.object_id}."
+                    ),
+                ))
+                existing_tool_names.add(skill)
+                changed = True
+
+        if unfixed:
+            remaining["find_read_write_misclassifications"] = unfixed
+        else:
+            remaining.pop("find_read_write_misclassifications", None)
+
+    # --- Patch: sequential_confirmation_chains ---
+    # "After X confirms" is valid when a mock tool trigger fires a callback.
+    # Auto-patch: for each write-service peer that the object waits on, add a
+    # trigger to that peer's mock tool so it sends a confirmation back.
+    if "find_sequential_confirmation_chains" in remaining:
+        from src.data.schema import MockToolTrigger
+        CONFIRMATION_RE = re.compile(
+            r"\b(after|when|once|following|upon)\b"
+            r"(?!\s+(?:a|an|the)\b)"
+            r"(?!\s+\w+ing\b)"
+            r".{0,40}"
+            r"\b(confirm(?!ation)\w*|responds?\b|acknowledg\w*|repl(?:ies|ied|y\b)|complet(?:es?|ed)\b|send.?back\b|'s\s+(?:reply|response))",
+            re.IGNORECASE,
+        )
+        existing_tool_names = {t.tool_name for t in sample.mock_tools}
+        for issue in remaining["find_sequential_confirmation_chains"]:
+            # Extract the object with the problematic behavior
+            m = re.search(r"Object '([^']+)' behavior contains", issue)
+            if not m:
+                continue
+            waiter_id = m.group(1)
+            waiter = object_map.get(waiter_id)
+            if not waiter:
+                continue
+            # For each peer of the waiter, add a trigger if one doesn't exist
+            for peer in waiter.peers:
+                peer_obj = object_map.get(peer.object_id)
+                if not peer_obj:
+                    continue
+                # Find or create a mock tool for this peer
+                peer_tool = next(
+                    (t for t in sample.mock_tools if peer.object_id in t.tool_name),
+                    None,
+                )
+                if peer_tool is None:
+                    # Create a basic write mock tool for this peer
+                    tool_name = f"{peer.object_id}_write"
+                    if tool_name not in existing_tool_names:
+                        from src.data.schema import MockToolDef
+                        peer_tool = MockToolDef(
+                            tool_name=tool_name,
+                            description=f"Write or notify {peer.object_id}.",
+                            arguments_schema={"type": "object", "properties": {}, "required": []},
+                            response_template=f"Delivered to {peer.object_id}.",
+                        )
+                        sample.mock_tools.append(peer_tool)
+                        existing_tool_names.add(tool_name)
+                        changed = True
+                # Add a trigger that fires a confirmation back to the waiter
+                already_triggers_waiter = any(
+                    t.target_object_id == waiter_id for t in peer_tool.triggers
+                )
+                if not already_triggers_waiter:
+                    peer_tool.triggers.append(MockToolTrigger(
+                        target_object_id=waiter_id,
+                        message_template=f"Confirmed: action completed by {peer.object_id}.",
+                        source=peer.object_id,
+                    ))
+                    changed = True
+        remaining.pop("find_sequential_confirmation_chains")
+
+    # --- Patch: unreachable_objects (wire missing peer links) ---
+    # Pattern: object A has no peers (dead-end) and object B is unreachable.
+    # If A's behavior text mentions B's object_id, A should forward to B.
+    # This catches the common data-gen mistake where an intermediate processor
+    # forgets to declare its downstream write/notify service as a peer.
+    if "find_unreachable_objects" in remaining:
+        from src.data.schema import PeerDecl
+        from collections import deque
+
+        def _reachable(objs):
+            entries = {o.object_id for o in objs if o.event_sources}
+            peer_map = {o.object_id: {p.object_id for p in o.peers} for o in objs}
+            visited, q = set(entries), deque(entries)
+            while q:
+                n = q.popleft()
+                for nb in peer_map.get(n, set()):
+                    if nb not in visited:
+                        visited.add(nb); q.append(nb)
+            return visited
+
+        fixed_unreachable = []
+        for issue in remaining["find_unreachable_objects"]:
+            m = re.search(r"Object '([^']+)' is not reachable", issue)
+            if not m:
+                fixed_unreachable.append(issue)
+                continue
+            unreachable_id = m.group(1)
+
+            # Find dead-end objects whose behavior text mentions the unreachable id
+            dead_ends = [
+                o for o in sample.objects
+                if not o.peers and not o.event_sources
+                and unreachable_id.replace("-", "[ -]") and
+                re.search(re.escape(unreachable_id), o.behavior, re.IGNORECASE)
+            ]
+            if not dead_ends:
+                fixed_unreachable.append(issue)
+                continue
+
+            # Wire the first matching dead-end → unreachable object
+            donor = dead_ends[0]
+            unreachable_obj = object_map.get(unreachable_id)
+            if not unreachable_obj:
+                fixed_unreachable.append(issue)
+                continue
+
+            donor.peers.append(PeerDecl(
+                object_id=unreachable_id,
+                relationship=f"Forward processed output to {unreachable_id}",
+            ))
+            changed = True
+
+            # Check if this resolved the unreachability
+            if unreachable_id in _reachable(sample.objects):
+                pass  # fixed — don't re-add to fixed_unreachable
+            else:
+                fixed_unreachable.append(issue)
+
+        if fixed_unreachable:
+            remaining["find_unreachable_objects"] = fixed_unreachable
+        else:
+            remaining.pop("find_unreachable_objects")
+
+    # --- Patch: invalid_peer_declarations (remove dangling refs) ---
+    if "find_invalid_peer_declarations" in remaining:
+        existing_ids = {o.object_id for o in sample.objects}
+        for obj in sample.objects:
+            before = len(obj.peers)
+            obj.peers = [p for p in obj.peers if p.object_id in existing_ids]
+            if len(obj.peers) != before:
+                changed = True
+        remaining.pop("find_invalid_peer_declarations")  # re-checked after save
+
+    return changed, remaining
+
+
+def _edit_sample_interactive(sample, samples_path: Path, sample_map: dict) -> dict:
+    """
+    Open the sample JSON in $EDITOR, reload on save, re-validate.
+    Returns the (possibly empty) blocking issues dict after the edit.
+    """
+    from src.data.schema import Sample
+
+    raw = json.loads(sample.model_dump_json())
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix=f"{sample.id}_", delete=False
+    ) as f:
+        json.dump(raw, f, indent=2)
+        tmp = f.name
+
+    editor = os.environ.get("EDITOR", "vim")
+    print(f"  Opening {tmp} in {editor} — save and quit when done.")
+    os.system(f"{editor} {tmp}")
+
+    try:
+        with open(tmp) as f:
+            edited = json.load(f)
+        updated = Sample(**edited)
+    except Exception as e:
+        print(f"  [edit] Could not reload sample: {e} — keeping original.")
+        return _blocking_issues(validate_sample(sample))
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    # Persist the edit and reload
+    sample_map[updated.id] = updated
+    all_samples = [sample_map.get(s.id, s) for s in load_jsonl(samples_path, Sample)]
+    _save_samples(samples_path, all_samples)
+
+    return _blocking_issues(validate_sample(updated))
+
+
+def _validate_and_repair_samples(
+    samples_path: Path,
+    stage1_args: argparse.Namespace,
+    max_fix_attempts: int,
+) -> tuple[Path, set[str]]:
+    """
+    Validate Stage-1 samples using a three-tier repair strategy:
+
+    1. Auto-patch — deterministic fixes (add _data skill, remove dangling peers).
+       No LLM cost.  Applied silently.
+    2. Retry generation — re-run Stage 1 for the sample (uses LLM).  Up to
+       max_fix_attempts times per sample.
+    3. Human decision — per-sample prompt: [r]etry · [k]eep flagged · [s]kip.
+       Flagged samples proceed to Stage 2 but are marked for follow-up.
+       Nothing is dropped without explicit human [s]kip.
+
+    Returns (samples_path, modified_sample_ids).
+    modified_sample_ids: IDs of samples that were changed — their existing test
+    cases must be invalidated so Stage 2 regenerates them from the fixed data.
+    """
+    from src.data.schema import Sample
+
+    print()
+    print("  [validate] Checking Stage 1 samples...")
+
+    modified_ids: set[str] = set()  # samples changed by any repair — their TCs must be regenerated
+
+    try:
+        samples = load_jsonl(samples_path, Sample)
+    except Exception as e:
+        print(f"  [validation skipped] Could not load samples: {e}")
+        return samples_path, modified_ids
+
+    all_issues = {s.id: validate_sample(s) for s in samples}
+    blocking = {sid: _blocking_issues(v) for sid, v in all_issues.items() if _blocking_issues(v)}
+    warnings = {sid: _warning_issues(v) for sid, v in all_issues.items() if _warning_issues(v)}
+
+    if not blocking and not warnings:
+        print(f"  [validate] All {len(samples)} sample(s) passed.")
+        return samples_path, modified_ids
+
+    if warnings:
+        w_total = sum(len(msgs) for vd in warnings.values() for msgs in vd.values())
+        print(f"  [validate] {w_total} warning(s) in {len(warnings)} sample(s) — non-blocking, continuing:")
+        for sid, vd in warnings.items():
+            for vname, msgs in vd.items():
+                print(f"    [{sid}] {vname.replace('find_', '')}: {msgs[0]}")
+
+    # ── Warning auto-patch (sequential_confirmation_chains) ───────────────────
+    # Reclassified as WARNING but still needs a deterministic fix: add mock tool
+    # triggers so the confirmation callback is actually delivered at eval time.
+    PATCHABLE_WARNINGS = {"find_sequential_confirmation_chains"}
+    warning_patchable = {
+        sid: {k: v for k, v in vd.items() if k in PATCHABLE_WARNINGS}
+        for sid, vd in warnings.items()
+        if any(k in PATCHABLE_WARNINGS for k in vd)
+    }
+    if warning_patchable:
+        sample_map = {s.id: s for s in samples}
+        warn_patched = set()
+        for sid, issues in warning_patchable.items():
+            sample = sample_map[sid]
+            changed, _ = _autopatch_sample(sample, issues)
+            if changed:
+                warn_patched.add(sid)
+        if warn_patched:
+            _save_samples(samples_path, samples)
+            modified_ids |= warn_patched
+            print(f"  [auto-patch] Fixed warning (sequential_confirmation_chains) in {len(warn_patched)}: {', '.join(sorted(warn_patched))}")
+
+    if not blocking:
+        return samples_path, modified_ids
+
+    print(f"  [validate] {len(blocking)} sample(s) have blocking issues.")
+
+    # ── Tier 1: Auto-patch ────────────────────────────────────────────────────
+    sample_map = {s.id: s for s in samples}
+    patched_ids = set()
+
+    for sid, issues in blocking.items():
+        sample = sample_map[sid]
+        changed, _ = _autopatch_sample(sample, issues)
+        if changed:
+            patched_ids.add(sid)
+
+    if patched_ids:
+        _save_samples(samples_path, samples)
+        # Re-validate patched samples
+        samples = load_jsonl(samples_path, Sample)
+        sample_map = {s.id: s for s in samples}
+        repaired = {sid: _blocking_issues(validate_sample(sample_map[sid])) for sid in patched_ids}
+        fixed = {sid for sid, b in repaired.items() if not b}
+        still_broken = {sid: b for sid, b in repaired.items() if b}
+        if fixed:
+            print(f"  [auto-patch] Fixed {len(fixed)}: {', '.join(sorted(fixed))}")
+            modified_ids |= fixed
+        modified_ids |= patched_ids  # patched but not fully fixed still need TC regeneration
+        # Update blocking: remove fixed, update still-broken
+        for sid in fixed:
+            blocking.pop(sid)
+        for sid, b in still_broken.items():
+            blocking[sid] = b
+
+    if not blocking:
+        print(f"  [validate] All blocking issues resolved via auto-patch.")
+        return samples_path, modified_ids
+
+    # ── Tier 2+3: Per-sample human decision ──────────────────────────────────
+    print(f"\n  {len(blocking)} sample(s) still have blocking issues after auto-patch.")
+    print("  [e]dit · [r]etry · [k]eep flagged · [s]kip · [n]ext · [p]rev\n")
+
+    items = list(blocking.items())           # ordered list of (sid, issues)
+    decisions: dict[str, tuple] = {}         # sid → (choice, current_issues)
+    i = 0
+
+    while True:
+        # If we've passed the end, wrap up any undecided samples
+        undecided = [j for j, (sid, _) in enumerate(items) if sid not in decisions]
+        if i >= len(items):
+            if not undecided:
+                break
+            print(f"\n  {len(undecided)} sample(s) still undecided — cycling back.")
+            i = undecided[0]
+
+        sid, issues = items[i]
+        current_issues = decisions.get(sid, (None, issues))[1]
+        prev_choice = decisions.get(sid, (None,))[0]
+
+        total = len(items)
+        decided = len(decisions)
+        status = f"{decided}/{total} decided"
+        marker = f"  ┌─ [{i+1}/{total}] [{sid}]"
+        if prev_choice:
+            marker += f"  (was: {prev_choice})"
+        print(f"{marker} {status} {'─' * max(0, 55 - len(marker))}")
+        for vname, msgs in current_issues.items():
+            print(f"  │  {vname.replace('find_', '')}: {msgs[0]}")
+        print(f"  └{'─' * 58}")
+
+        choice = _ask("Action?", ("e", "r", "k", "s", "n", "p"), default="n")
+
+        if choice == "p":
+            i = max(0, i - 1)
+            continue
+        if choice == "n":
+            i += 1
+            continue
+        if choice == "e":
+            current_issues = _edit_sample_interactive(sample_map[sid], samples_path, sample_map)
+            modified_ids.add(sid)  # edited regardless of outcome
+            if not current_issues:
+                print(f"  [edit] Fixed — no more blocking issues.")
+                decisions[sid] = ("fixed", {})
+                i += 1
+                continue
+            print(f"  [edit] Still has blocking issues.")
+            decisions[sid] = ("e", current_issues)
+            continue
+
+        decisions[sid] = (choice, current_issues)
+        i += 1
+
+    retry_queue: set[str] = set()
+    keep_flagged: dict[str, dict] = {}
+    skip_ids: set[str] = set()
+
+    for sid, (choice, current_issues) in decisions.items():
+        if choice == "fixed" or not current_issues:
+            continue
+        if choice == "r":
+            retry_queue.add(sid)
+        elif choice == "s":
+            skip_ids.add(sid)
+        else:
+            keep_flagged[sid] = current_issues
+
+    # Samples with no decision default to keep-flagged
+    for sid, issues in blocking.items():
+        if sid not in decisions:
+            keep_flagged[sid] = issues
+
+    # ── Retry loop ────────────────────────────────────────────────────────────
+    for attempt in range(1, max_fix_attempts + 1):
+        if not retry_queue:
+            break
+        ids = list(retry_queue)
+        print(f"\n  [retry {attempt}/{max_fix_attempts}] Regenerating {len(ids)} sample(s): {', '.join(ids)}")
+        fix_args = argparse.Namespace(**vars(stage1_args))
+        fix_args.ids = ids
+        fix_args.force = True
+        try:
+            generate_samples.run(fix_args)
+        except Exception as e:
+            print(f"  [retry] Generation failed: {e}")
+            break
+
+        modified_ids |= set(ids)  # retried samples always need TC regeneration
+        samples = load_jsonl(samples_path, Sample)
+        sample_map = {s.id: s for s in samples}
+        still = {sid: _blocking_issues(validate_sample(sample_map[sid])) for sid in ids}
+        fixed = {sid for sid, b in still.items() if not b}
+        if fixed:
+            print(f"  [retry] Fixed: {', '.join(sorted(fixed))}")
+            retry_queue -= fixed
+
+        # For samples still broken after this attempt, ask again (no more [r])
+        for sid in list(retry_queue):
+            current_issues = still[sid]
+            while True:
+                print(f"\n  [{sid}] still failing after retry {attempt}:")
+                for vname, msgs in current_issues.items():
+                    print(f"    {vname.replace('find_', '')}: {msgs[0]}")
+                choice = _ask("Action?", ("e", "k", "s"), default="k")
+                if choice == "e":
+                    current_issues = _edit_sample_interactive(sample_map[sid], samples_path, sample_map)
+                    modified_ids.add(sid)
+                    if not current_issues:
+                        print(f"  [edit] Fixed.")
+                        break
+                    continue
+                break
+            retry_queue.discard(sid)
+            if not current_issues:
+                continue
+            if choice == "s":
+                skip_ids.add(sid)
+            else:
+                keep_flagged[sid] = current_issues
+
+    # ── Mark flagged samples ──────────────────────────────────────────────────
+    if keep_flagged:
+        samples = load_jsonl(samples_path, Sample)
+        sample_map = {s.id: s for s in samples}
+        for sid, issues in keep_flagged.items():
+            if sid in sample_map:
+                sample_map[sid].flagged = True
+                sample_map[sid].flag_reasons = [
+                    f"{vname.replace('find_', '')}: {msgs[0]}"
+                    for vname, msgs in issues.items()
+                ]
+        _save_samples(samples_path, list(sample_map.values()))
+        print(f"\n  [validate] {len(keep_flagged)} sample(s) kept as flagged: {', '.join(sorted(keep_flagged))}")
+
+    # ── Drop skipped samples ──────────────────────────────────────────────────
+    if skip_ids:
+        samples = load_jsonl(samples_path, Sample)
+        kept = [s for s in samples if s.id not in skip_ids]
+        _save_samples(samples_path, kept)
+        print(f"  [validate] Dropped {len(skip_ids)} sample(s): {', '.join(sorted(skip_ids))}")
+
+    total = len(load_jsonl(samples_path, Sample))
+    print(f"  [validate] {total} sample(s) proceeding to Stage 2.")
+    return samples_path, modified_ids
+
+
+def _validate_test_cases_final(test_cases_path: Path) -> None:
+    """
+    Validate fully-formed test cases after Stage 3.
+    Blocking issues drop the test case from the file (logged).
+    Warning issues are printed but the test case is kept.
+    """
+    from src.data.schema import TestCase
+
+    print()
+    print("  [validate] Checking Stage 3 test cases...")
+
+    try:
+        test_cases = load_jsonl(test_cases_path, TestCase)
+    except Exception as e:
+        print(f"  [validation skipped] Could not load test cases: {e}")
+        return
+
+    all_issues = {tc.id: validate_test_case(tc) for tc in test_cases}
+    blocking_tcs = {tid: _blocking_issues(v) for tid, v in all_issues.items() if _blocking_issues(v)}
+    warning_tcs  = {tid: _warning_issues(v)  for tid, v in all_issues.items() if _warning_issues(v)}
+
+    if not blocking_tcs and not warning_tcs:
+        print(f"  [validate] All checks passed ({len(test_cases)} test case(s)).")
+        return
+
+    if warning_tcs:
+        w_total = sum(len(v) for vd in warning_tcs.values() for v in vd.values())
+        print(f"  [validate] {w_total} warning(s) across {len(warning_tcs)} test case(s):")
+        for tid, vd in warning_tcs.items():
+            for vname, msgs in vd.items():
+                print(f"    [{tid}] {vname.replace('find_', '')}: {msgs[0]}")
+
+    if blocking_tcs:
+        print(f"  [validate] Dropping {len(blocking_tcs)} test case(s) with blocking issues:")
+        for tid, vd in blocking_tcs.items():
+            for vname, msgs in vd.items():
+                print(f"    [DROPPED] [{tid}] {vname.replace('find_', '')}: {msgs[0]}")
+        kept = [tc for tc in test_cases if tc.id not in blocking_tcs]
+        with open(test_cases_path, "w") as f:
+            for tc in kept:
+                f.write(tc.model_dump_json() + "\n")
+        print(f"  [validate] {len(kept)}/{len(test_cases)} test case(s) kept.")
 
 
 def main():
@@ -155,7 +766,7 @@ Examples:
     shared = parser.add_argument_group("Shared")
     shared.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "google"],
         default=None,
         help="LLM provider (inferred from model if not specified)",
     )
@@ -187,6 +798,23 @@ Examples:
         default=None,
         help="Process only the first N items",
     )
+    shared.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=1,
+        help="Parallel workers per stage (default: 1)",
+    )
+    shared.add_argument(
+        "--max-fix-attempts",
+        type=int,
+        default=2,
+        help="Max auto-regeneration attempts per sample before human review (default: 2)",
+    )
+    shared.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="Skip all validation (useful when iterating on known-bad samples)",
+    )
 
     args = parser.parse_args()
 
@@ -210,7 +838,7 @@ Examples:
     elif args.target_dir is not None:
         # Target dir provided — check for existing samples (continuation)
         samples_path = args.target_dir / SAMPLES_FILENAME
-        if samples_path.exists() and not args.force:
+        if samples_path.exists() and not args.force and not args.ids:
             skip_stage1 = True
             print(f"Found existing samples: {samples_path} (skipping stage 1)")
         else:
@@ -232,28 +860,47 @@ Examples:
         test_cases_output = args.target_dir / TEST_CASES_FILENAME
 
     # --- Stage 1 ---
+    print("=" * 60)
     if skip_stage1:
-        print("=" * 60)
         print("STAGE 1: skipped (using existing samples)")
-        print("=" * 60)
     else:
-        print("=" * 60)
         print("STAGE 1: Generate Samples")
-        print("=" * 60)
+    print("=" * 60)
 
-        stage1_args = argparse.Namespace(
-            input=args.input,
-            output=samples_path,  # None → derived by generate_samples.run()
-            samples_per_template=args.samples_per_template,
-            ids=args.ids,
-            provider=args.provider,
-            model=args.model,
-            seed=args.seed,
-            temperature=args.temperature,
-            force=args.force,
-            limit=args.limit,
-        )
+    stage1_args = argparse.Namespace(
+        input=args.input,
+        output=samples_path,
+        samples_per_template=args.samples_per_template,
+        ids=args.ids,
+        provider=args.provider,
+        model=args.model,
+        seed=args.seed,
+        temperature=args.temperature,
+        force=args.force,
+        limit=args.limit,
+        workers=args.workers,
+    )
+
+    if not skip_stage1:
         samples_path = generate_samples.run(stage1_args)
+
+    if not args.no_validate:
+        samples_path, modified_ids = _validate_and_repair_samples(
+            samples_path=samples_path,
+            stage1_args=stage1_args,
+            max_fix_attempts=args.max_fix_attempts,
+        )
+    else:
+        modified_ids = set()
+
+    # Any sample explicitly regenerated via --id must have its TCs invalidated,
+    # even if the validation step made no repairs (Stage 2 would otherwise hit
+    # the completion cache and skip regeneration entirely).
+    if args.ids and not skip_stage1:
+        modified_ids |= set(args.ids)
+
+    if modified_ids and test_cases_output:
+        _invalidate_test_cases(test_cases_output, modified_ids)
 
     # --- Stage 2 ---
     print()
@@ -272,12 +919,14 @@ Examples:
         mod_type=args.mod_type,
         mods_per_scenario=args.mods_per_scenario,
         ambiguity=args.ambiguity,
+        ids=args.ids,
         provider=args.provider,
         model=args.model,
         seed=args.seed,
         temperature=args.temperature,
         force=args.force,
         limit=args.limit,
+        workers=args.workers,
     )
     test_cases_path = generate_test_cases.run(stage2_args)
 
@@ -297,8 +946,12 @@ Examples:
         temperature=args.temperature,
         force=args.force,
         limit=args.limit,
+        workers=args.workers,
     )
     output_path = generate_seed.run(stage3_args)
+
+    if not args.no_validate:
+        _validate_test_cases_final(output_path)
 
     print()
     print("=" * 60)

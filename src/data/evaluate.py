@@ -15,10 +15,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import statistics
 import sys
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -35,6 +38,7 @@ from src.data.schema import (
     MockConfig,
     MockToolDef,
     ModificationResult,
+    RunConfig,
     TestCase,
     TestCaseResult,
     to_lnl_definition,
@@ -125,8 +129,7 @@ def gather_evidence(
 
     Evidence is structured in two sections:
     - THIS EVENT: everything that happened during this invocation —
-      tool calls made (primary), bus messages exchanged, external actions,
-      and replies. Tool calls are authoritative; external_actions are legacy.
+      tool calls made (primary), bus messages exchanged, and replies.
     - OBJECT STATES: each object's updated_state after the event
       (may be empty; use THIS EVENT as authoritative evidence).
     """
@@ -156,15 +159,6 @@ def gather_evidence(
             sender = f"[{msg.sender}]" if msg.type.value == "event" else msg.sender
             lines.append(f"  {sender} {arrow} {msg.recipient} ({msg.type.value}): {msg.content[:200]}")
         this_event_parts.append("Message bus activity:\n" + "\n".join(lines))
-
-    # External actions declared by objects (email.send, slack.send_message, etc.)
-    ext_lines = []
-    for r in results:
-        for ea in getattr(r, "external_actions", []):
-            params_str = json.dumps(ea.params) if ea.params else "{}"
-            ext_lines.append(f"  [{r.object_id}] {ea.system}.{ea.action}: {ea.content[:300]} params={params_str}")
-    if ext_lines:
-        this_event_parts.append("External actions:\n" + "\n".join(ext_lines))
 
     # Replies from the chain triggered by this event
     replies = [r for r in results if r.reply and str(r.reply).strip()]
@@ -207,7 +201,7 @@ def _print_message(msg) -> None:
     content = msg.content[:120].replace("\n", " ")
     # Mark external event sources clearly to distinguish from LLM-object IDs
     sender = f"[{msg.sender}]" if msg.type.value == "event" else msg.sender
-    print(f"      {sender} {arrow} {msg.recipient} ({msg.type.value}): {content}")
+    tqdm.write(f"      {sender} {arrow} {msg.recipient} ({msg.type.value}): {content}")
 
 
 def _execute_test_case_inner(
@@ -220,6 +214,8 @@ def _execute_test_case_inner(
     max_chain_depth: int = 20,
     global_mock_tools: "list[MockToolDef] | None" = None,
     progress_callback=None,
+    on_event_result=None,
+    on_mod_applied=None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase and return event + modification results."""
     from src.lnl.gateway import EventGateway
@@ -260,7 +256,7 @@ def _execute_test_case_inner(
     # The evaluator dispatches one event at a time and waits; the background
     # run-loop is not needed and would break _run_with_timeout (ThreadPoolExecutor
     # shutdown(wait=True) hangs when the foreground thread is blocked on item.done).
-    rt = Runtime(brain, strict_peers=False, tool_registry=tool_registry, max_chain_depth=max_chain_depth)
+    rt = Runtime(brain, tool_registry=tool_registry, max_chain_depth=max_chain_depth)
     if debug_messages and progress_callback:
         rt.set_message_listener(lambda msg: (_print_message(msg), progress_callback(msg)))
     elif debug_messages:
@@ -279,6 +275,8 @@ def _execute_test_case_inner(
         steps_only=steps_only,
         mock_executors=mock_executors + [passthrough] if final_mock_tools else [],
         trigger_map=trigger_map,
+        on_event_result=on_event_result,
+        on_mod_applied=on_mod_applied,
     )
 
 
@@ -337,6 +335,8 @@ def _run_test_case_timeline(
     steps_only: bool = False,
     mock_executors: "list | None" = None,
     trigger_map: "dict[str, list] | None" = None,
+    on_event_result=None,   # callable(EventResult, is_step: bool)
+    on_mod_applied=None,    # callable(Modification)
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Execute steps and timeline events against a live runtime."""
     event_results: list[EventResult] = []
@@ -365,6 +365,8 @@ def _run_test_case_timeline(
                     expected=step.expect.action,
                     latency_ms=latency_ms,
                 ))
+                if on_event_result:
+                    on_event_result(event_results[-1], True)
             else:
                 in_tok = sum(r.metrics.input_tokens for r in results if r.metrics)
                 out_tok = sum(r.metrics.output_tokens for r in results if r.metrics)
@@ -383,6 +385,8 @@ def _run_test_case_timeline(
                     output_tokens=out_tok,
                     latency_ms=latency_ms,
                 ))
+                if on_event_result:
+                    on_event_result(event_results[-1], True)
         prior_context = _format_prior_state(rt)
 
     if steps_only:
@@ -449,6 +453,8 @@ def _run_test_case_timeline(
 
     for _, kind, item in timeline:
         if kind == "mod":
+            if on_mod_applied:
+                on_mod_applied(item)
             t0 = time.monotonic()
             results, timed_out = _run_with_timeout(
                 lambda it=item: rt.send(it.target, it.intent, sender=it.source),
@@ -472,6 +478,8 @@ def _run_test_case_timeline(
             res, tout, lat, log_snap, exec_s = _dispatch_event(item)
             if item.expect is not None:
                 _record_event_result(item, res, tout, lat, log_snap, exec_s, prior_context)
+                if on_event_result:
+                    on_event_result(event_results[-1], False)
             prior_context = _format_prior_state(rt)
 
             # Dispatch events triggered by this one (in declaration order)
@@ -479,6 +487,8 @@ def _run_test_case_timeline(
                 tr, tt, tl, tls, tes = _dispatch_event(triggered_evt)
                 if triggered_evt.expect is not None:
                     _record_event_result(triggered_evt, tr, tt, tl, tls, tes, prior_context)
+                    if on_event_result:
+                        on_event_result(event_results[-1], False)
                 prior_context = _format_prior_state(rt)
 
     return event_results, mod_results
@@ -494,6 +504,8 @@ def execute_test_case(
     max_chain_depth: int = 20,
     global_mock_tools: "list[MockToolDef] | None" = None,
     progress_callback=None,
+    on_event_result=None,
+    on_mod_applied=None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase with a per-event timeout (seconds).
 
@@ -504,6 +516,8 @@ def execute_test_case(
         global_mock_tools: Shared mock tool definitions loaded from --mock-config files.
             Merged with tc.mock_tools; per-TestCase entries override shared ones.
         progress_callback: Optional callable(msg) invoked on every bus message delivery.
+        on_event_result: Optional callable(EventResult, is_step: bool) for real-time display.
+        on_mod_applied: Optional callable(Modification) called before each modification runs.
     """
     return _execute_test_case_inner(
         tc, brain, harness,
@@ -513,6 +527,8 @@ def execute_test_case(
         max_chain_depth=max_chain_depth,
         global_mock_tools=global_mock_tools,
         progress_callback=progress_callback,
+        on_event_result=on_event_result,
+        on_mod_applied=on_mod_applied,
     )
 
 
@@ -528,13 +544,13 @@ def default_output_path(input_path: Path) -> Path:
 def _print_event_result(ev, show_evidence: bool = False) -> None:
     """Print a single event result. Evidence is optional (verbose mode only)."""
     status = "PASS" if ev.passed else "FAIL"
-    print(f"    [{status}] {ev.event_id}")
-    print(f"      Expected: {ev.expected}")
+    tqdm.write(f"    [{status}] {ev.event_id}")
+    tqdm.write(f"      Expected: {ev.expected}")
     if show_evidence and ev.evidence:
         indented = ev.evidence.replace("\n", "\n        ")
-        print(f"      Evidence: {indented}")
-    print(f"      Judge:    {ev.reasoning}")
-    print()
+        tqdm.write(f"      Evidence: {indented}")
+    tqdm.write(f"      Judge:    {ev.reasoning}")
+    tqdm.write("")
 
 
 def _print_verbose(tc_result: TestCaseResult, show_evidence: bool = False) -> None:
@@ -552,6 +568,8 @@ def run(args: argparse.Namespace) -> Path:
     if args.output is None:
         args.output = default_output_path(args.input)
 
+    print(f"Output: {args.output}")
+
     if args.provider is None:
         args.provider = infer_provider(args.model)
 
@@ -562,7 +580,11 @@ def run(args: argparse.Namespace) -> Path:
     test_cases = load_jsonl(args.input, TestCase)
 
     if getattr(args, "tc", None):
-        # Select test cases by 1-based index or ID; preserve order of appearance in file
+        # Select test cases by 1-based index, ID, or ID[mod_type] (e.g. TC001[temporal]).
+        # Preserve order of appearance in file.
+        def _tc_mod_type(tc: TestCase) -> str:
+            return tc.modifications[0].mod_type.value if tc.modifications else "none"
+
         selected: list[TestCase] = []
         for selector in args.tc:
             if selector.isdigit():
@@ -571,6 +593,13 @@ def run(args: argparse.Namespace) -> Path:
                     print(f"Error: --tc {selector} out of range (file has {len(test_cases)} test cases)", file=sys.stderr)
                     sys.exit(1)
                 selected.append(test_cases[idx])
+            elif "[" in selector and selector.endswith("]"):
+                tc_id, mod_type = selector[:-1].rsplit("[", 1)
+                matched = [tc for tc in test_cases if tc.id == tc_id and _tc_mod_type(tc) == mod_type]
+                if not matched:
+                    print(f"Error: --tc {selector!r} not found. Use ID[mod_type] e.g. TC001[temporal].", file=sys.stderr)
+                    sys.exit(1)
+                selected.extend(matched)
             else:
                 matched = [tc for tc in test_cases if tc.id == selector]
                 if not matched:
@@ -581,17 +610,60 @@ def run(args: argparse.Namespace) -> Path:
     elif args.limit:
         test_cases = test_cases[: args.limit]
 
+    # When running steps-only (no modifications), deduplicate by sample_id so
+    # test cases sharing the same base steps are only executed once.
+    if getattr(args, "steps_only", False):
+        seen_samples: set[str] = set()
+        deduped: list[TestCase] = []
+        for tc in test_cases:
+            key = tc.sample_id or tc.id
+            if key not in seen_samples:
+                seen_samples.add(key)
+                deduped.append(tc)
+        if len(deduped) < len(test_cases):
+            print(
+                f"  Steps-only mode: deduplicating by sample_id "
+                f"({len(test_cases)} → {len(deduped)} test cases)"
+            )
+        test_cases = deduped
+
     timeout_s: Optional[float] = getattr(args, "timeout", None)
 
     print(f"Loaded {len(test_cases)} test cases from {args.input}")
-    # Use a dedicated judge model if specified; otherwise fall back to the object model.
-    # SubstringJudge is insufficient for test cases with NL assertion conditions.
-    judge_model = args.judge_model or args.model
-    judge_provider = infer_provider(judge_model) if args.judge_model else args.provider
+    # Build judge spec list — --llm-judge takes precedence; fall back to --judge-model / --model.
+    # Each spec is "model" or "provider/model".
+    def _parse_judge_spec(spec: str) -> tuple[str, str]:
+        """Return (provider, model) for a judge spec."""
+        if "/" in spec:
+            provider, model = spec.split("/", 1)
+        else:
+            model = spec
+            provider = infer_provider(model)
+        return provider, model
+
+    llm_judge_specs: list[str] = getattr(args, "llm_judge", None) or []
+    if llm_judge_specs:
+        parsed_judges = [_parse_judge_spec(s) for s in llm_judge_specs]
+    elif getattr(args, "judge_model", None):
+        jp = getattr(args, "judge_provider", None) or infer_provider(args.judge_model)
+        parsed_judges = [(jp, args.judge_model)]
+    else:
+        parsed_judges = [(args.provider, args.model)]
+
+    # Use first judge for backward-compat RunConfig fields
+    judge_provider, judge_model = parsed_judges[0]
+
+    if len(parsed_judges) == 1:
+        judge_label = f"{judge_provider}/{judge_model}"
+    else:
+        judge_label = f"panel({len(parsed_judges)}): " + ", ".join(
+            f"{p}/{m}" for p, m in parsed_judges
+        )
+
     extra_info = {
         "Runs per test case": str(args.runs),
         "Timeout per event": f"{timeout_s}s" if timeout_s else "none",
-        "Judge": f"{judge_provider}/{judge_model}",
+        "Judge": judge_label,
     }
     print_run_info(
         args.provider,
@@ -600,11 +672,16 @@ def run(args: argparse.Namespace) -> Path:
         extra_info,
     )
 
-    # Build LNL brain (for objects) and judge (for assertions)
+    # Build LNL brain (for objects) and judge(s) (for assertions)
+    seed: Optional[int] = getattr(args, "seed", None)
+
     def _make_brain(provider, model):
         if provider == "openai":
             from src.lnl.brain import OpenAIBrain
-            return OpenAIBrain(model=model)
+            return OpenAIBrain(model=model, seed=seed)
+        elif provider == "google":
+            from src.lnl.brain import GeminiBrain
+            return GeminiBrain(model=model)
         else:
             from src.lnl.brain import AnthropicBrain
             return AnthropicBrain(model=model)
@@ -613,12 +690,20 @@ def run(args: argparse.Namespace) -> Path:
         if provider == "openai":
             from src.lnl.judge import OpenAIJudge
             return OpenAIJudge(model=model)
+        elif provider == "google":
+            from src.lnl.judge import GeminiJudge
+            return GeminiJudge(model=model)
         else:
             from src.lnl.judge import AnthropicJudge
             return AnthropicJudge(model=model)
 
     brain = _make_brain(args.provider, args.model)
-    judge = _make_judge(judge_provider, judge_model)
+    single_judges = [_make_judge(p, m) for p, m in parsed_judges]
+    if len(single_judges) == 1:
+        judge = single_judges[0]
+    else:
+        from src.lnl.judge import PanelJudge
+        judge = PanelJudge(single_judges)
 
     from src.lnl.benchmark import BenchmarkHarness
     harness = BenchmarkHarness(brain=brain, judge=judge)
@@ -632,56 +717,166 @@ def run(args: argparse.Namespace) -> Path:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
+    # Continuation: if output file already exists, load completed runs and resume.
+    # Key is (tc_index, run_index, seed). tc_index (0-based file position) is the
+    # reliable unique identifier — tc_id is NOT unique (80 IDs × 6 mod-type variants).
+    # Different seed values coexist in the same file; continuation is per-seed.
+    # Legacy results (tc_index=-1) fall back to (tc_id, run_index) keying.
+    completed: set[tuple[int, int, Optional[int]]] = set()  # (tc_index, run_index, seed)
+    completed_legacy: set[tuple[str, int]] = set()
     all_tc_results: list[TestCaseResult] = []
+    if args.output.exists():
+        for line in args.output.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                data = json.loads(line)
+                if "tc_id" in data and "run_index" in data:
+                    tc_index = data.get("tc_index", -1)
+                    run_index = data["run_index"]
+                    result_seed = data.get("seed")  # None for legacy/unseeded
+                    if tc_index >= 0:
+                        completed.add((tc_index, run_index, result_seed))
+                    else:
+                        completed_legacy.add((data["tc_id"], run_index))
+                    all_tc_results.append(TestCaseResult.model_validate(data))
+            except Exception:
+                pass
+        n_done = len(completed) + len(completed_legacy)
+        if n_done:
+            print(f"Resuming: {n_done} runs already complete, continuing from checkpoint.")
+    file_mode = "a" if (completed or completed_legacy) else "w"
+
     total_runs = len(test_cases) * args.runs
+    # Count only runs that will actually be skipped in this invocation
+    n_skipped = sum(
+        1
+        for tc_idx, tc in enumerate(test_cases)
+        for run_idx in range(args.runs)
+        if (tc_idx, run_idx, seed) in completed
+        or (tc.id, run_idx) in completed_legacy
+    )
 
-    with open(args.output, "w") as f:
-        with tqdm(total=total_runs, unit="run", desc="Evaluating") as pbar:
-            for tc in test_cases:
-                for run_idx in range(args.runs):
-                    label = f"{tc.id} run={run_idx}" if args.runs > 1 else tc.id
-                    pbar.set_postfix_str(label, refresh=True)
-                    msg_count = [0]
-                    tc_start = time.monotonic()
+    workers: int = getattr(args, "workers", 1)
+    write_lock = threading.Lock()
 
-                    def _on_message(_msg, _label=label, _count=msg_count, _start=tc_start):
-                        _count[0] += 1
-                        elapsed = time.monotonic() - _start
-                        pbar.set_postfix_str(
-                            f"{_label}  msgs={_count[0]}  {elapsed:.0f}s", refresh=True
-                        )
+    def _run_one(tc_idx: int, tc: TestCase, run_idx: int) -> Optional[TestCaseResult]:
+        mod_type_str = tc.modifications[0].mod_type.value if tc.modifications else "none"
+        label = f"{tc.id}[{mod_type_str}]"
+        if args.runs > 1:
+            label += f" run={run_idx+1}/{args.runs}"
 
+        tqdm.write(f"\n{label}")
+        msg_count = [0]
+        tc_start = time.monotonic()
+
+        def _on_event_result(result: EventResult, is_step: bool, _args=args):
+            status = "PASS" if result.passed else "FAIL"
+            tag = " (baseline)" if is_step else ""
+            tqdm.write(f"  [{status}] {result.event_id}{tag}: {result.expected[:70]}")
+            if not result.passed:
+                tqdm.write(f"         → {result.reasoning[:120]}")
+            if _args.verbose and result.evidence:
+                indented = result.evidence[:400].replace("\n", "\n           ")
+                tqdm.write(f"         evidence: {indented}")
+
+        def _on_mod_applied(mod, _tc=tc):
+            tqdm.write(
+                f"  ── [{mod.mod_type.value}/{mod.ambiguity.value}] {mod.id}: "
+                f"{mod.intent[:70]}"
+            )
+            pbar.set_description(f"Eval [{_tc.id}] {mod.mod_type.value}")
+
+        def _on_message(_msg, _label=label, _count=msg_count, _start=tc_start):
+            _count[0] += 1
+            elapsed = time.monotonic() - _start
+            pbar.set_postfix_str(
+                f"{_label}  msgs={_count[0]}  {elapsed:.0f}s", refresh=True
+            )
+
+        event_results, mod_results = execute_test_case(
+            tc, brain, harness, timeout_s,
+            debug_messages=getattr(args, "debug_messages", False),
+            steps_only=getattr(args, "steps_only", False),
+            max_chain_depth=args.max_chain_depth,
+            global_mock_tools=global_mock_tools or None,
+            progress_callback=_on_message,
+            on_event_result=_on_event_result,
+            on_mod_applied=_on_mod_applied,
+        )
+        pass_rate = (
+            sum(1 for e in event_results if e.passed) / len(event_results)
+            if event_results else None
+        )
+        result = TestCaseResult(
+            tc_id=tc.id,
+            sample_id=tc.sample_id,
+            tc_index=tc_idx,
+            seed=seed,
+            name=tc.name,
+            domain=tc.domain,
+            run_index=run_idx,
+            events=event_results,
+            modifications=mod_results,
+            pass_rate=pass_rate,
+        )
+        passed_n = sum(1 for e in event_results if e.passed)
+        total_n = len(event_results)
+        rate_str = f"{pass_rate:.0%}" if pass_rate is not None else "N/A"
+        tqdm.write(f"  → pass={passed_n}/{total_n} ({rate_str})")
+        return result
+
+    # Build list of pending (tc_idx, tc, run_idx) tuples
+    pending_runs = [
+        (tc_idx, tc, run_idx)
+        for tc_idx, tc in enumerate(test_cases)
+        for run_idx in range(args.runs)
+        if (tc_idx, run_idx, seed) not in completed
+        and (tc.id, run_idx) not in completed_legacy
+    ]
+
+    is_continuation = bool(completed or completed_legacy)
+    run_config = RunConfig(
+        timestamp=datetime.now().isoformat(),
+        input_path=str(args.input),
+        output_path=str(args.output),
+        model=args.model,
+        provider=args.provider,
+        judge_model=judge_model,
+        judge_provider=judge_provider,
+        judge_specs=[f"{p}/{m}" for p, m in parsed_judges] if len(parsed_judges) > 1 else [],
+        runs=args.runs,
+        workers=workers,
+        timeout_s=timeout_s,
+        seed=seed,
+        steps_only=getattr(args, "steps_only", False),
+        max_chain_depth=args.max_chain_depth,
+        mock_config_paths=[str(p) for p in (getattr(args, "mock_config", None) or [])],
+        tc_filter=getattr(args, "tc", None),
+        limit=getattr(args, "limit", None),
+        is_continuation=is_continuation,
+    )
+
+    with open(args.output, file_mode) as f:
+        f.write(run_config.model_dump_json() + "\n")
+        f.flush()
+        with tqdm(total=total_runs, initial=n_skipped, unit="run", desc="Evaluating") as pbar:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(_run_one, tc_idx, tc, run_idx): (tc_idx, tc, run_idx)
+                    for tc_idx, tc, run_idx in pending_runs
+                }
+                for future in as_completed(futures):
+                    tc_idx, tc, run_idx = futures[future]
+                    label = f"{tc.id}"
                     try:
-                        event_results, mod_results = execute_test_case(
-                            tc, brain, harness, timeout_s,
-                            debug_messages=getattr(args, "debug_messages", False),
-                            steps_only=getattr(args, "steps_only", False),
-                            max_chain_depth=args.max_chain_depth,
-                            global_mock_tools=global_mock_tools or None,
-                            progress_callback=_on_message,
-                        )
-                        pass_rate = (
-                            sum(1 for e in event_results if e.passed) / len(event_results)
-                            if event_results else 1.0
-                        )
-                        tc_result = TestCaseResult(
-                            tc_id=tc.id,
-                            name=tc.name,
-                            domain=tc.domain,
-                            run_index=run_idx,
-                            events=event_results,
-                            modifications=mod_results,
-                            pass_rate=pass_rate,
-                        )
-                        f.write(tc_result.model_dump_json() + "\n")
-                        f.flush()
-                        all_tc_results.append(tc_result)
-                        pbar.set_postfix_str(f"{label} pass={pass_rate:.2f}", refresh=True)
-                        if args.verbose:
-                            tqdm.write("")
-                            _print_verbose(tc_result, show_evidence=True)
+                        tc_result = future.result()
+                        with write_lock:
+                            f.write(tc_result.model_dump_json() + "\n")
+                            f.flush()
+                            all_tc_results.append(tc_result)
                     except Exception as e:
-                        tqdm.write(f"FAILED {label}: {e}", file=sys.stderr)
+                        tqdm.write(f"FAILED {label} run={run_idx}: {e}", file=sys.stderr)
                     pbar.update(1)
 
     # Write summary
@@ -695,9 +890,17 @@ def run(args: argparse.Namespace) -> Path:
     return args.output
 
 
+_STEP_EVENT_ID = re.compile(r"^S\d+$")
+
+
 def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
-    """Compute aggregate metrics across all test case results."""
-    all_events = [e for r in results for e in r.events]
+    """Compute aggregate metrics across all test case results.
+
+    Step events (id matching S\\d+) are deduplicated by sample_id: only the first
+    TC variant per sample contributes step results to the summary. All TC variants
+    contribute their modification and timeline event results. This avoids
+    over-weighting baseline behavior when multiple variants share the same sample.
+    """
     all_mods = [m for r in results for m in r.modifications]
     total_runs = len(results)
     total_test_cases = len({r.tc_id for r in results})
@@ -705,16 +908,38 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     def mean(vals):
         return sum(vals) / len(vals) if vals else 0.0
 
-    # Mean pass rate: average across all (tc, run) results
-    pass_rates = [r.pass_rate for r in results]
-    mean_pass_rate = mean(pass_rates)
+    # Identify the first TC seen per sample_id — that TC's step results are canonical.
+    # TCs without a sample_id fall back to their own tc_id (treated as unique samples).
+    first_tc_per_sample: dict[str, str] = {}
+    for r in results:
+        sid = r.sample_id or r.tc_id
+        if sid not in first_tc_per_sample:
+            first_tc_per_sample[sid] = r.tc_id
+    base_tc_ids = set(first_tc_per_sample.values())
+
+    # Compute per-result effective events (step events only for the base TC per sample).
+    all_events: list[EventResult] = []
+    pass_rates: list[float] = []
+    for r in results:
+        is_base = r.tc_id in base_tc_ids
+        effective = [
+            e for e in r.events
+            if is_base or not _STEP_EVENT_ID.match(e.event_id)
+        ]
+        all_events.extend(effective)
+        if effective:
+            pass_rates.append(sum(1 for e in effective if e.passed) / len(effective))
+        # TCs with no evaluable events are excluded from pass rate — not counted as passing.
+
+    mean_pass_rate = mean(pass_rates) if pass_rates else 0.0
 
     # Behavioral consistency: mean of per-TC std devs across runs.
     # Groups results by tc_id, computes std dev within each group, then averages.
     # Requires --runs > 1; returns 0.0 when each TC has only one run.
     by_tc: dict[str, list[float]] = defaultdict(list)
     for r in results:
-        by_tc[r.tc_id].append(r.pass_rate)
+        if r.pass_rate is not None:
+            by_tc[r.tc_id].append(r.pass_rate)
     per_tc_stds = [
         statistics.stdev(rates) for rates in by_tc.values() if len(rates) > 1
     ]
@@ -767,6 +992,12 @@ Examples:
         help="Number of runs per test case for behavioral consistency (default: 1)",
     )
     parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=1,
+        help="Number of parallel test case workers (default: 1). Each worker runs one TC at a time; LNL runtime uses its own thread pool per TC.",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=180.0,
@@ -790,7 +1021,7 @@ Examples:
         nargs="+",
         default=None,
         metavar="N_OR_ID",
-        help="Run specific test cases by 1-based index or ID (e.g. --tc 2 5 TC007). Overrides --limit.",
+        help="Run specific test cases by 1-based index, ID, or ID[mod_type] (e.g. --tc 2 TC007 TC001[temporal]). Overrides --limit.",
     )
     parser.add_argument(
         "--steps-only",
@@ -799,15 +1030,27 @@ Examples:
         help="Run only the steps (baseline behavior); skip modifications and events",
     )
     parser.add_argument(
+        "--llm-judge",
+        action="append",
+        default=None,
+        metavar="[PROVIDER/]MODEL",
+        help=(
+            "Judge model spec (can be repeated for a multi-judge panel). "
+            "Format: 'model' (provider inferred) or 'provider/model'. "
+            "With 2 judges both must agree; with 3+ a majority vote is used. "
+            "Example: --llm-judge gpt-4o --llm-judge claude-sonnet-4-6"
+        ),
+    )
+    parser.add_argument(
         "--judge-model",
         default=None,
-        help="Model for LLM-as-judge (default: same as --model). Provider is inferred from model name.",
+        help="Model for LLM-as-judge (default: same as --model). Ignored when --llm-judge is set.",
     )
     parser.add_argument(
         "--judge-provider",
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "google"],
         default=None,
-        help="Provider for judge model (inferred from judge-model if not specified)",
+        help="Provider for judge model (inferred from judge-model if not specified). Ignored when --llm-judge is set.",
     )
     parser.add_argument(
         "--max-chain-depth",

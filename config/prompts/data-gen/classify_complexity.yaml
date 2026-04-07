@@ -1,0 +1,43 @@
+prompt: |
+  # Task: Classify Automation Template Complexity
+
+  You are evaluating a Zapier automation template to determine whether it is
+  complex enough for use in a distributed LLM-object research pipeline.
+
+  A template is **complex** if it satisfies ALL of the following:
+  1. It involves **at least 2 distinct actors** (e.g., separate services, systems, or roles that each perform actions)
+  2. It requires **multiple interactions between actors** — not just one system triggering another once, but back-and-forth or chained interactions
+  3. There is a **clear, meaningful description** of what the automation does
+
+  A template is **NOT complex** if:
+  - It is a simple "trigger → single action" pipe (e.g., "when X happens in Gmail, create a row in Sheets")
+  - It involves only one actor doing all the work
+  - The description is vague or the steps are trivial/repetitive
+
+  ---
+
+  ## Template
+
+  **Title:** {TITLE}
+
+  **Description:** {DESCRIPTION}
+
+  **Steps (from the Zapier page):**
+  {STEPS}
+
+  ---
+
+  ## Instructions
+
+  1. Decide if this template is complex (meets all 3 criteria above).
+  2. If complex, produce cleaned `raw_steps`: a list of clear, imperative-sentence steps
+     describing the automation flow. Remove any HTML artifacts, marketing fluff, or
+     repetition. Each step should be a complete sentence describing one action or decision.
+     Keep the steps faithful to the original — do not invent new steps.
+  3. If not complex, set `complex` to false and `cleaned_steps` to an empty list.
+
+  **Output format:**
+  - `complex`: true or false
+  - `reason`: one sentence explaining your decision
+  - `cleaned_steps`: list of cleaned step strings (empty if not complex)
+  - `name`: a concise, descriptive name for this automation (3–6 words, title case)

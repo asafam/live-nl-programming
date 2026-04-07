@@ -31,8 +31,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--provider", default="openai", choices=["openai", "anthropic", "mock"])
     parser.add_argument("--model", default=None)
-    parser.add_argument("--strict-peers", action="store_true", default=False)
-    parser.add_argument("--max-chain-depth", type=int, default=10)
+parser.add_argument("--max-chain-depth", type=int, default=10)
 
     sub = parser.add_subparsers(dest="command")
 
@@ -100,7 +99,6 @@ def main(argv: list[str] | None = None) -> None:
         brain,
         # CLI flag overrides config file if explicitly provided (argparse default is 10)
         max_chain_depth=args.max_chain_depth,
-        strict_peers=args.strict_peers,
         system_config=cfg,
     )
 

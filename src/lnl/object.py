@@ -35,10 +35,12 @@ class LLMObject:
         max_tool_rounds: int = 5,
         max_history: int = 6,
         react_cross_objects: bool = True,
+        pending_timeout_seconds: float = 90.0,
+        heartbeat_interval_seconds: float = 30.0,
     ) -> None:
         self._definition = definition
         self._brain = brain
-        self._state: dict = {}  # mutable runtime state
+        self._state = ""  # mutable runtime state (str from LLM; dict from mock scripts)
         self._history: list[Message] = []
         self._mailbox: deque[Message] = deque()
         self._tool_registry = tool_registry
@@ -48,6 +50,8 @@ class LLMObject:
         self._max_tool_rounds = max_tool_rounds
         self._max_history = max_history
         self._react_cross_objects = react_cross_objects
+        self._pending_timeout_seconds = pending_timeout_seconds
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
 
     # --- Properties ---
 
@@ -56,8 +60,9 @@ class LLMObject:
         return self._definition.object_id
 
     @property
-    def state(self) -> dict:
-        return self._state
+    def state(self):
+        """Return state: a dict if parseable, otherwise the raw string (or {} if empty)."""
+        return _coerce_state(self._state)
 
     @property
     def definition(self) -> ObjectDefinition:
@@ -126,13 +131,15 @@ class LLMObject:
 
     def process_message(self, message: Message) -> ProcessingResult:
         """Process an incoming message via a ReAct loop: think → act → observe → repeat."""
-        state_before = dict(self._state)  # snapshot — state only committed after successful loop
+        state_before = self._state  # snapshot — state only committed after successful loop
 
         tools_desc = self._tool_registry.describe() if self._tool_registry else ""
         sys_prompt = build_system_prompt(
             self._definition, self._state,
             tools=tools_desc,
             react_cross_objects=self._react_cross_objects,
+            pending_timeout_seconds=self._pending_timeout_seconds,
+            heartbeat_interval_seconds=self._heartbeat_interval_seconds,
         )
         messages = _build_chat_messages(sys_prompt, self._history, message)
 
@@ -190,12 +197,11 @@ class LLMObject:
             object_id=self.object_id,
             reply=finish.reply,
             outgoing_messages=finish.outgoing_messages,
-            state_before=state_before,
-            state_after=self._state,
+            state_before=_coerce_state(state_before),
+            state_after=_coerce_state(self._state),
             metrics=total_metrics,
             in_reply_to=message.sender,
             source_message_type=message.type,
-            external_actions=finish.external_actions,
             depth_remaining=message.depth_remaining,
         )
 
@@ -224,18 +230,37 @@ class LLMObject:
 
     # --- Testing / Debugging ---
 
-    def set_state(self, state: dict) -> None:
-        """Set state directly (for testing)."""
-        self._state = state
+    def set_state(self, state: str | dict) -> None:
+        """Set state directly (for testing). Accepts str or dict (dict is JSON-encoded)."""
+        if isinstance(state, dict):
+            import json as _json
+            self._state = _json.dumps(state)
+        else:
+            self._state = state
 
     def snapshot(self) -> dict:
         """Return a debug snapshot of the object."""
         return {
             "object_id": self.object_id,
-            "state": self._state,
+            "state": _coerce_state(self._state),
             "definition": asdict(self._definition),
             "history_length": len(self._history),
         }
+
+
+def _coerce_state(s):
+    """Return state as dict if possible, otherwise the raw string (or {} if empty)."""
+    if isinstance(s, dict):
+        return s
+    if not s:
+        return {}
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return s
 
 
 def _accumulate_metrics(base: InferenceMetrics, add: InferenceMetrics) -> InferenceMetrics:

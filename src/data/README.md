@@ -120,6 +120,89 @@ python -m src.data.generate_test_cases \
 
 ---
 
+## Mock Tool Coverage
+
+Test cases require mock tools for any external data lookup (org directories, employee records,
+product catalogs, etc.) that an LLM-object performs at evaluation time. The pipeline generates
+these during Stage 1, but may miss lookups that are embedded in business logic objects rather
+than in explicit read-service objects.
+
+Two complementary scripts close this gap on an existing `test_cases.jsonl`:
+
+### retrofit_mock_tools — static analysis
+
+Analyzes each sample's object descriptions and step text using an LLM to infer what
+read-service data tools are needed, then generates mock data for any that are missing.
+Runs once per sample (80 LLM calls for 80 samples), no LNL runtime required.
+
+```bash
+# Preview what tools would be added (no writes)
+python -m src.data.retrofit_mock_tools \
+    -i outputs/my-run/test_cases.jsonl \
+    --dry-run --model gpt-4o
+
+# Patch test_cases.jsonl and samples.jsonl in-place
+python -m src.data.retrofit_mock_tools \
+    -i outputs/my-run/test_cases.jsonl \
+    --samples outputs/my-run/samples.jsonl \
+    --model gpt-4o
+```
+
+### discover_mock_tools — dynamic discovery
+
+Runs each sample's steps through the LNL runtime (with a no-op judge) and records
+every `_data` tool call that falls through to `PassthroughExecutor` — i.e., was called
+but not yet mocked. Generates mock data for any newly discovered tools and patches the file.
+
+Run **after** `retrofit_mock_tools` to catch tools that static analysis missed.
+
+```bash
+# Preview discovered tools (no writes)
+python -m src.data.discover_mock_tools \
+    -i outputs/my-run/test_cases.jsonl \
+    --dry-run --model gpt-4o
+
+# Patch test_cases.jsonl and samples.jsonl in-place
+python -m src.data.discover_mock_tools \
+    -i outputs/my-run/test_cases.jsonl \
+    --samples outputs/my-run/samples.jsonl \
+    --model gpt-4o
+```
+
+### Recommended workflow for a new run
+
+```bash
+# 1. Generate pipeline as normal
+python -m src.data.pipeline -i data/zapier/raw/templates.yaml --target-dir outputs/my-run
+
+# 2. Fill mock tool gaps (static pass)
+python -m src.data.retrofit_mock_tools \
+    -i outputs/my-run/test_cases.jsonl \
+    --samples outputs/my-run/samples.jsonl \
+    --model gpt-4o
+
+# 3. Fill remaining gaps (dynamic pass)
+python -m src.data.discover_mock_tools \
+    -i outputs/my-run/test_cases.jsonl \
+    --samples outputs/my-run/samples.jsonl \
+    --model gpt-4o
+
+# 4. Evaluate
+python -m src.data.evaluate \
+    -i outputs/my-run/test_cases.jsonl \
+    --model gpt-4o --judge-model gpt-4o
+```
+
+### How uncovered tool calls are handled at eval time
+
+Any `_data` tool call that still has no mock at evaluation time is caught by
+`PassthroughExecutor`, which returns `{}` — a valid empty JSON response. The LLM-object
+receives this and can handle the missing data gracefully rather than failing hard.
+Non-data tool calls (action tools like `email.send`, `slack.post`) return
+`"[mock] <tool> executed successfully."` and are captured as evidence for the judge.
+
+---
+
 ## Examples
 
 ```bash

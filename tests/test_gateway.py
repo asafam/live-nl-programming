@@ -11,7 +11,7 @@ class TestEventGateway:
         brain.script("slack", LLMResponse(
             updated_state={"status": "got message"}, reply="Received",
         ))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="slack",
             role="Slack monitor",
@@ -31,7 +31,7 @@ class TestEventGateway:
         brain.script("worker", LLMResponse(
             updated_state={"status": "processed"}, reply="ok",
         ))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="worker", role="Worker"))
 
         gw = EventGateway(rt)
@@ -45,7 +45,7 @@ class TestEventGateway:
         """Explicit descriptor targets the specific event source."""
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={}, reply="ok"))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="monitor",
             role="Multi-source monitor",
@@ -68,7 +68,7 @@ class TestEventGateway:
         brain.script("triage", LLMResponse(
             updated_state={"status": "triaged"}, reply="handled",
         ))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="slack",
             role="Slack monitor",
@@ -87,7 +87,7 @@ class TestEventGateway:
         """Source parameter is passed through to the event."""
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={}, reply="ok"))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="slack",
             role="Slack monitor",

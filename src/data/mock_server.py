@@ -32,9 +32,11 @@ from fastapi import FastAPI, Request
 
 from src.data.schema import (
     MockCallback,
+    MockImmediateResponse,
     MockMethodDef,
     MockScript,
     MockSystemDef,
+    MockToolDef,
     OrchestratorReaction,
     OrchestratorScript,
     OrchestratorTrigger,
@@ -84,6 +86,56 @@ def resolve_mock_configs(tc: TestCase) -> Optional[MockScript]:
         return None
 
     return MockScript(systems=list(found.values()))
+
+
+def merge_tc_mock_tools(
+    script: Optional[MockScript],
+    tc_mock_tools: list[MockToolDef],
+) -> Optional[MockScript]:
+    """Merge per-TC MockToolDef entries into a MockScript for the baseline mock server.
+
+    MockToolDef (LNL in-process mock) and MockMethodDef (baseline HTTP mock) share
+    the same response data; only the wrapper schema differs. This converts each
+    MockToolDef to a MockMethodDef (response_template → immediate.template) and
+    injects them into a synthetic system group in the script.
+
+    Per-TC tool definitions WIN over same-named entries from the static YAML configs,
+    ensuring the seeded reference data (org directories, approval policies, etc.) is
+    used consistently by both the LNL and baseline evaluations.
+    """
+    if not tc_mock_tools:
+        return script
+
+    # Convert MockToolDef → MockMethodDef
+    tc_methods: dict[str, MockMethodDef] = {
+        t.tool_name: MockMethodDef(
+            method=t.tool_name,
+            immediate=MockImmediateResponse(template=t.response_template),
+        )
+        for t in tc_mock_tools
+    }
+
+    if script is None:
+        return MockScript(systems=[MockSystemDef(system="tc_mock_tools", tools=list(tc_methods.values()))])
+
+    # Merge: override any same-named method in existing systems, append the rest
+    overridden: set[str] = set()
+    new_systems = []
+    for sys_def in script.systems:
+        new_tools = []
+        for m in sys_def.tools:
+            if m.method in tc_methods:
+                new_tools.append(tc_methods[m.method])  # per-TC wins
+                overridden.add(m.method)
+            else:
+                new_tools.append(m)
+        new_systems.append(MockSystemDef(system=sys_def.system, tools=new_tools))
+
+    remaining = [m for name, m in tc_methods.items() if name not in overridden]
+    if remaining:
+        new_systems.append(MockSystemDef(system="tc_mock_tools", tools=remaining))
+
+    return MockScript(systems=new_systems)
 
 
 # ── Template interpolation ────────────────────────────────────────────────────

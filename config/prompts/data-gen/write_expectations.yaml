@@ -48,12 +48,34 @@ prompt: |
   The Reference Data is NOT a source of routing rules — it is only a lookup table for names and
   data values. If the Reference Data contains routing tables or thresholds, ignore them.
 
+  **Threshold evaluation:** If the object's behavior specifies a conditional output gated on a
+  numeric or categorical threshold (e.g., "if score < 15, escalate to manager"), you MUST evaluate
+  whether the event's actual input data satisfies that condition. Only include the conditional output
+  in `action` if the threshold IS met by the event data. If it is NOT met, write only the
+  non-conditional base-case outputs. Do not assume the threshold is met just because the event
+  involves the relevant field.
+
   **Step 4 — Apply modifications by timestamp.**
   A modification is active ONLY if the event occurs at or after the modification's `when` timestamp.
   The `[active modifications: ...]` annotation on each event tells you exactly which apply.
 
   **Step 5 — Look up exact names from the Reference Data.**
   Use the Reference Data to find the actual entity that fills each role. Use exact names and identifiers.
+
+  **Step 6 — Only describe actions that objects in the Object System actually perform.**
+  Every output you include in `action` must be directly traceable to an object listed in the
+  Object System above. If no object in the Object System sends Slack messages, do NOT include
+  a Slack notification in the action. If no object sends email, do NOT include an email. Do not
+  invent outputs for capabilities the system does not have.
+
+  **Step 7 — Only use identifiers that are present in the provided data.**
+  Any specific identifier you include in `action` — especially Slack channel names (`#channel`),
+  ticket/record IDs (e.g., `PROJ-1042`), and email addresses — MUST appear verbatim in one of:
+  the event's `input` text, another event's `input` text, the Object System behaviors above,
+  or the Reference Data above.
+  Do NOT invent channel names or identifiers. If the routing target is described by role
+  (e.g., "sales team channel") but no channel name is given anywhere in the provided data,
+  describe it by role ("sales team channel") rather than inventing a `#channel-name`.
 
   ---
 
@@ -68,6 +90,13 @@ prompt: |
   **Do NOT name the internal object that performs the action.** Write what happens externally:
   "Message sent to Alex Rivera" — NOT "Message sent to Alex Rivera via notification-service".
   "Record updated in system X" — NOT "Message sent to record-writer".
+
+  **Use names as primary identifiers.** When referencing a person, use their name as the
+  primary identifier (e.g., "DM sent to Priya Nair"). Only include a system ID (Slack user ID,
+  ticket ID, record key) if it is the sole way to identify the target in the evidence, or if
+  the ID itself is the meaningful output (e.g., "ticket PROJ-1042 created"). Do not require
+  both a system ID and a name when the name alone is sufficient — over-specifying identifiers
+  causes false failures when the system uses one form and the evidence shows the other.
 
   `reason` = the rule or behavior clause that drives this outcome (one sentence).
 

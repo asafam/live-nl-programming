@@ -115,6 +115,78 @@ class AnthropicJudge(LLMJudge):
         return bool(raw.get("passed", False)), str(raw.get("reasoning", ""))
 
 
+class GeminiJudge(LLMJudge):
+    """Judge backed by the Google Gemini API."""
+
+    def __init__(self, model: str = "gemini-2.5-pro", api_key: Optional[str] = None) -> None:
+        import os
+
+        try:
+            from google import genai
+            from google.genai import types as genai_types
+        except ImportError:
+            raise ImportError("google-genai package required. Install with: pip install google-genai")
+
+        self.model = model
+        self._client = genai.Client(api_key=api_key or os.environ["GOOGLE_API_KEY"])
+        self._types = genai_types
+
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
+        config = self._types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=512,
+            response_mime_type="application/json",
+            response_schema=_JUDGE_SCHEMA,
+            system_instruction=_judge_system_prompt(),
+        )
+        user_content = self._types.Content(
+            role="user",
+            parts=[self._types.Part(text=_user_msg(condition, evidence, context))],
+        )
+        resp = self._client.models.generate_content(
+            model=self.model,
+            contents=[user_content],
+            config=config,
+        )
+        raw = _safe_json_loads(resp.text or "{}")
+        return bool(raw.get("passed", False)), str(raw.get("reasoning", ""))
+
+
+class PanelJudge(LLMJudge):
+    """Multi-judge panel with majority-vote agreement.
+
+    With 2 judges: both must agree; disagreement → fail.
+    With 3+ judges: simple majority vote; ties → fail.
+    """
+
+    def __init__(self, judges: list[LLMJudge]) -> None:
+        if not judges:
+            raise ValueError("PanelJudge requires at least one judge")
+        self._judges = judges
+
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
+        results = [j.evaluate(condition, evidence, context) for j in self._judges]
+        votes = [r[0] for r in results]
+        reasonings = [r[1] for r in results]
+
+        pass_count = sum(votes)
+        total = len(votes)
+
+        # Build per-judge summary
+        summaries = "; ".join(
+            f"judge{i + 1}={'PASS' if v else 'FAIL'}: {r[:80]}"
+            for i, (v, r) in enumerate(zip(votes, reasonings))
+        )
+
+        if pass_count == total - pass_count:
+            # Tied — treat as fail
+            return False, f"Judges tied ({pass_count}/{total} pass) — {summaries}"
+
+        majority_passed = pass_count > total - pass_count
+        verdict = "PASS" if majority_passed else "FAIL"
+        return majority_passed, f"{verdict} ({pass_count}/{total} judges agree) — {summaries}"
+
+
 def _safe_json_loads(text: str) -> dict:
     text = text.strip()
     if not text:

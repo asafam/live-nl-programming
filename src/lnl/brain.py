@@ -1,6 +1,7 @@
 """LLM provider abstraction — Brain interface and implementations."""
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import time
@@ -12,7 +13,6 @@ from typing import Any, Optional, Sequence
 import yaml
 
 from .types import (
-    ExternalAction,
     InferenceMetrics,
     LLMResponse,
     Message,
@@ -30,9 +30,8 @@ LLM_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "updated_state": {
-            "type": "object",
-            "additionalProperties": True,
-            "description": "The complete updated state after processing the message, as a JSON object.",
+            "type": "string",
+            "description": "Your complete updated state serialized as a JSON string, e.g. '{\"key\": \"value\"}'. Use '{}' if no state to store.",
         },
         "reply": {
             "type": "string",
@@ -60,34 +59,6 @@ LLM_RESPONSE_SCHEMA: dict[str, Any] = {
         "reasoning": {
             "type": "string",
             "description": "Brief internal reasoning about what you did and why.",
-        },
-        "external_actions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "system": {
-                        "type": "string",
-                        "description": "External system name, e.g. 'slack', 'email', 'jira'.",
-                    },
-                    "action": {
-                        "type": "string",
-                        "description": "Action to perform, e.g. 'send_message', 'send', 'create_issue'.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "NL content: the message body, email text, ticket description, etc.",
-                    },
-                    "params": {
-                        "type": "object",
-                        "additionalProperties": True,
-                        "description": "Structured parameters: channel, to, subject, project, etc.",
-                    },
-                },
-                "required": ["system", "action", "content"],
-                "additionalProperties": False,
-            },
-            "description": "Actions directed at external systems (Slack, Email, Jira, etc.). Use instead of outgoing_messages for external integrations.",
         },
     },
     "required": ["updated_state", "reply", "outgoing_messages", "reasoning"],
@@ -155,9 +126,8 @@ LLM_REACT_SCHEMA: dict[str, Any] = {
             "properties": {
                 "reply": {"type": "string", "description": "Reply to the message sender."},
                 "updated_state": {
-                    "type": "object",
-                    "additionalProperties": True,
-                    "description": "Your complete updated state.",
+                    "type": "string",
+                    "description": "Your complete updated state serialized as a JSON string, e.g. '{\"key\": \"value\"}'. Use '{}' if no state to store.",
                 },
                 "outgoing_messages": {
                     "type": "array",
@@ -168,20 +138,6 @@ LLM_REACT_SCHEMA: dict[str, Any] = {
                             "content": {"type": "string"},
                         },
                         "required": ["recipient", "content"],
-                        "additionalProperties": False,
-                    },
-                },
-                "external_actions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "system": {"type": "string"},
-                            "action": {"type": "string"},
-                            "content": {"type": "string"},
-                            "params": {"type": "object", "additionalProperties": True},
-                        },
-                        "required": ["system", "action", "content"],
                         "additionalProperties": False,
                     },
                 },
@@ -245,23 +201,65 @@ def _message_label(msg: Message) -> str:
     return f"Message from peer: {msg.sender}"
 
 
-_PEER_INTERACTION_LOOP = """
-  ## Peer Interaction Loop
-  When you need information from a peer before completing your work:
-  1. Finish your current step by sending the peer your question via outgoing_messages.
-  2. Record your intent in updated_state so you can resume on their reply:
-     {{"_pending_reply_from": "<peer_id>", "_pending_intent": "<goal>"}}
-  3. When their REPLY message arrives, check _pending_reply_from, resume your
-     reasoning using _pending_intent as context, then clear those fields from state
-     once the goal is complete.
-  This makes multi-step peer interactions explicit and traceable."""
+def _peer_interaction_loop(pending_timeout_seconds: float, heartbeat_interval_seconds: float) -> str:
+    return f"""
+  ## Peer Sends: Two Modes
+
+  **Fire-and-forget (NOTIFY / WRITE / FORWARD):** You are informing, storing, or
+  passing an event along — no reply expected. Send the outgoing_message and
+  immediately proceed to your next action or finish. Do NOT set a PENDING flag.
+  This is the DEFAULT. Examples:
+  - Forwarding an event to the next object in the chain
+  - Writing a record to a store
+  - Posting a Slack notification
+  - Triggering a downstream action
+
+  **Request-reply (QUERY):** You need information back from the peer before you can
+  continue. Send your question via outgoing_messages, set a `_pending` block in
+  state, and STOP. When their REPLY arrives, read your state to recall your intent,
+  complete the goal, then clear `_pending`.
+  Use this ONLY when you cannot proceed without the peer's answer. Examples:
+  - Looking up a manager's name/email before addressing a notification
+  - Checking policy rules before routing a ticket
+  - Querying an org directory before assigning work
+
+  **Saving a continuation when going PENDING:** Your `_pending` block must contain
+  everything needed to resume without re-reading the original trigger.
+  Every message you receive is prefixed with "[system time: <timestamp>]" — use
+  that timestamp as `started_at` so you know exactly when you went pending:
+    _pending: {{
+      waiting_for: "<peer-id>",
+      question: "<exact question sent>",
+      intent: "<what you will do once you have the answer>",
+      started_at: "<timestamp from the [system time: ...] prefix of the current message>",
+      context: {{ <all data from the original message needed to complete the action> }}
+    }}
+
+  **Rule:** If you already have all the data you need to complete your action, send
+  fire-and-forget messages to all relevant peers and finish in one step. Never set
+  PENDING after a fire-and-forget send.
+
+  **Heartbeat recovery:** A Heartbeat arrives every {heartbeat_interval_seconds:.0f}s.
+  Like all messages, it is prefixed with "[system time: <timestamp>]" — this is the
+  authoritative current time. On each Heartbeat, check your state for a `_pending`
+  block. If present:
+  - Read the current time from the "[system time: ...]" prefix of the Heartbeat.
+  - Compute elapsed seconds = current_time - `_pending.started_at`.
+  - If elapsed < {pending_timeout_seconds:.0f}s: re-send the original question to
+    `_pending.waiting_for` and remain PENDING (do not update `started_at`).
+  - If elapsed >= {pending_timeout_seconds:.0f}s: the peer is unresponsive. Use
+    `_pending.intent` and `_pending.context` to take the best available fallback
+    action (proceed with a default, escalate, or log a failure), then clear
+    `_pending` from state."""
 
 
 def build_system_prompt(
     definition: ObjectDefinition,
-    current_state: dict,
+    current_state,  # str (from LLM) or dict (from mock scripts)
     tools: str = "",
     react_cross_objects: bool = True,
+    pending_timeout_seconds: float = 90.0,
+    heartbeat_interval_seconds: float = 30.0,
 ) -> str:
     """Build the system prompt from the YAML template and an ObjectDefinition."""
     config = _load_prompt_config()
@@ -286,9 +284,9 @@ def build_system_prompt(
         "skills": skills_str or "(none)",
         "peers": peers or "(none)",
         "event_sources": event_sources or "(none)",
-        "current_state": json.dumps(current_state, indent=2) if current_state else "(empty)",
+        "current_state": (json.dumps(current_state, indent=2) if isinstance(current_state, dict) else current_state.strip()) if current_state else "(empty)",
         "tools": tools or "(none)",
-        "peer_interaction_loop": _PEER_INTERACTION_LOOP if react_cross_objects else "",
+        "peer_interaction_loop": _peer_interaction_loop(pending_timeout_seconds, heartbeat_interval_seconds) if react_cross_objects else "",
     }
     result = template
     for key, value in substitutions.items():
@@ -311,7 +309,8 @@ def _build_chat_messages(
         history_lines = [f"  [{_message_label(msg)}]: {msg.content}" for msg in history]
         msgs.append({"role": "user", "content": "[Past messages — already reflected in your state]\n" + "\n".join(history_lines)})
         msgs.append({"role": "assistant", "content": "Understood. What is the new message?"})
-    msgs.append({"role": "user", "content": f"[{_message_label(message)}]: {message.content}"})
+    ts = message.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+    msgs.append({"role": "user", "content": f"[system time: {ts}] [{_message_label(message)}]: {message.content}"})
     return msgs
 
 
@@ -553,6 +552,90 @@ class AnthropicBrain(LLMBrain):
         return _parse_react_step(raw), metrics
 
 
+class GeminiBrain(LLMBrain):
+    """Brain backed by the Google Gemini API."""
+
+    def __init__(
+        self,
+        model: str = "gemini-2.5-pro",
+        api_key: Optional[str] = None,
+        temperature: float = 0.0,
+    ) -> None:
+        try:
+            from google import genai
+            from google.genai import types as genai_types
+        except ImportError:
+            raise ImportError("google-genai package required. Install with: pip install google-genai")
+
+        self.model = model
+        self._temperature = temperature
+        self._client = genai.Client(api_key=api_key or os.environ["GOOGLE_API_KEY"])
+        self._types = genai_types
+
+    def _to_gemini_contents(self, messages: list[dict]) -> tuple[str, list]:
+        """Split system prompt and convert messages to Gemini contents format."""
+        system_parts = []
+        contents = []
+        for m in messages:
+            if m["role"] == "system":
+                system_parts.append(m["content"])
+            else:
+                role = "model" if m["role"] == "assistant" else m["role"]
+                contents.append(
+                    self._types.Content(
+                        role=role,
+                        parts=[self._types.Part(text=m["content"])],
+                    )
+                )
+        return "\n".join(system_parts), contents
+
+    def _generate_json(self, messages: list[dict], schema: dict) -> tuple[str, Any]:
+        system_instruction, contents = self._to_gemini_contents(messages)
+        t0 = time.time()
+        config = self._types.GenerateContentConfig(
+            temperature=self._temperature,
+            max_output_tokens=8192,
+            response_mime_type="application/json",
+            response_schema=schema,
+        )
+        if system_instruction:
+            config.system_instruction = system_instruction
+        resp = self._client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=config,
+        )
+        latency_ms = (time.time() - t0) * 1000
+        metrics = InferenceMetrics(
+            input_tokens=getattr(getattr(resp, "usage_metadata", None), "prompt_token_count", 0) or 0,
+            output_tokens=getattr(getattr(resp, "usage_metadata", None), "candidates_token_count", 0) or 0,
+            latency_ms=latency_ms,
+            model=self.model,
+        )
+        return resp.text or "{}", metrics
+
+    def call(
+        self,
+        messages: list[dict],
+        schema: dict,
+        *,
+        object_id: str | None = None,
+    ) -> tuple[LLMResponse, InferenceMetrics]:
+        text, metrics = self._generate_json(messages, schema)
+        raw = _safe_json_loads(text)
+        return _parse_llm_result(raw), metrics
+
+    def react_call(
+        self,
+        messages: list[dict],
+        *,
+        object_id: str | None = None,
+    ) -> tuple[ReactStep, InferenceMetrics]:
+        text, metrics = self._generate_json(messages, LLM_REACT_SCHEMA)
+        raw = _safe_json_loads(text)
+        return _parse_react_step(raw), metrics
+
+
 @dataclass
 class _ScriptEntry:
     response: LLMResponse
@@ -618,7 +701,7 @@ class MockBrain(LLMBrain):
         )
         return (
             LLMResponse(
-                updated_state={},
+                updated_state="",
                 reply=f"Echo: {last_user}",
                 outgoing_messages=[],
                 reasoning="No script configured",
@@ -653,7 +736,6 @@ class MockBrain(LLMBrain):
                 reply=response.reply,
                 updated_state=response.updated_state,
                 outgoing_messages=response.outgoing_messages,
-                external_actions=response.external_actions,
             )
             step = ReactStep(
                 thought=response.reasoning or "Done.",
@@ -689,6 +771,16 @@ def _ensure_str(value: Any) -> str:
     return json.dumps(value)
 
 
+def _parse_state(raw_state: Any) -> str:
+    """Normalize updated_state to a plain string."""
+    if isinstance(raw_state, str):
+        return raw_state.strip()
+    if isinstance(raw_state, dict):
+        # Fallback: model returned an object despite string schema — serialize it.
+        return json.dumps(raw_state)
+    return ""
+
+
 def _parse_react_step(raw: dict) -> ReactStep:
     """Parse a raw LLM dict into a ReactStep."""
     thought = raw.get("thought", "")
@@ -705,29 +797,13 @@ def _parse_react_step(raw: dict) -> ReactStep:
 
     # action == "finish"
     f_data = raw.get("finish") or {}
-    updated_state = dict(f_data.get("updated_state") or {})
+    updated_state = _parse_state(f_data.get("updated_state"))
 
-    # Safety net: LLMs sometimes put outgoing_messages / external_actions inside
-    # updated_state instead of at the finish level. Rescue them before they get lost.
-    state_msgs = updated_state.pop("outgoing_messages", None) or []
-    state_ext = updated_state.pop("external_actions", None) or []
-
-    raw_msgs = f_data.get("outgoing_messages", []) or state_msgs
+    raw_msgs = f_data.get("outgoing_messages", []) or []
     outgoing = [
         OutgoingMessage(recipient=m["recipient"], content=m["content"])
         for m in raw_msgs
         if isinstance(m, dict)
-    ]
-    raw_ext = f_data.get("external_actions", []) or state_ext
-    external = [
-        ExternalAction(
-            system=ea["system"],
-            action=ea["action"],
-            content=ea["content"],
-            params=ea.get("params", {}),
-        )
-        for ea in raw_ext
-        if isinstance(ea, dict)
     ]
     updated_def = f_data.get("updated_definition") or None
     if updated_def == {}:
@@ -736,7 +812,6 @@ def _parse_react_step(raw: dict) -> ReactStep:
         reply=f_data.get("reply", ""),
         updated_state=updated_state,
         outgoing_messages=outgoing,
-        external_actions=external,
         updated_definition=updated_def,
     )
     return ReactStep(thought=thought, action="finish", finish=finish)
@@ -768,23 +843,10 @@ def _parse_llm_result(result: Any) -> LLMResponse:
         elif isinstance(tc, ToolCall):
             tool_calls.append(tc)
 
-    external_actions = []
-    for ea in data.get("external_actions", []):
-        if isinstance(ea, dict):
-            external_actions.append(ExternalAction(
-                system=ea["system"],
-                action=ea["action"],
-                content=ea["content"],
-                params=ea.get("params", {}),
-            ))
-        elif isinstance(ea, ExternalAction):
-            external_actions.append(ea)
-
     return LLMResponse(
-        updated_state=data.get("updated_state") or {},
+        updated_state=_parse_state(data.get("updated_state")),
         reply=_ensure_str(data.get("reply", "")),
         outgoing_messages=outgoing,
         reasoning=data.get("reasoning", ""),
         tool_calls=tool_calls,
-        external_actions=external_actions,
     )

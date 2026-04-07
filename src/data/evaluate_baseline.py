@@ -45,7 +45,7 @@ from src.data.schema import (
     TestCase,
     TestCaseResult,
 )
-from src.data.mock_server import MockServer, resolve_mock_configs
+from src.data.mock_server import MockServer, merge_tc_mock_tools, resolve_mock_configs
 from src.data.utils import (
     add_common_args,
     infer_provider,
@@ -490,12 +490,13 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     def mean(vals):
         return sum(vals) / len(vals) if vals else 0.0
 
-    pass_rates = [r.pass_rate for r in results]
+    pass_rates = [r.pass_rate for r in results if r.pass_rate is not None]
     mean_pass_rate = mean(pass_rates)
 
     by_tc: dict[str, list[float]] = defaultdict(list)
     for r in results:
-        by_tc[r.tc_id].append(r.pass_rate)
+        if r.pass_rate is not None:
+            by_tc[r.tc_id].append(r.pass_rate)
     per_tc_stds = [
         statistics.stdev(rates) for rates in by_tc.values() if len(rates) > 1
     ]
@@ -609,6 +610,9 @@ def run(args: argparse.Namespace) -> Path:
     if judge_provider == "openai":
         from src.lnl.judge import OpenAIJudge
         judge = OpenAIJudge(model=judge_model)
+    elif judge_provider == "google":
+        from src.lnl.judge import GeminiJudge
+        judge = GeminiJudge(model=judge_model)
     else:
         from src.lnl.judge import AnthropicJudge
         judge = AnthropicJudge(model=judge_model)
@@ -625,6 +629,7 @@ def run(args: argparse.Namespace) -> Path:
             # Load mock config for this test case (if mock server is active)
             if mock_server is not None:
                 tc_mock_script = resolve_mock_configs(tc)
+                tc_mock_script = merge_tc_mock_tools(tc_mock_script, tc.mock_tools)
                 mock_server._state.mock_script = tc_mock_script
                 mock_server._state.orchestration_script = None
 
@@ -638,7 +643,7 @@ def run(args: argparse.Namespace) -> Path:
                     )
                     pass_rate = (
                         sum(1 for e in event_results if e.passed) / len(event_results)
-                        if event_results else 1.0
+                        if event_results else None
                     )
                     tc_result = TestCaseResult(
                         tc_id=tc.id,
@@ -652,7 +657,8 @@ def run(args: argparse.Namespace) -> Path:
                     f.write(tc_result.model_dump_json() + "\n")
                     f.flush()
                     all_tc_results.append(tc_result)
-                    print(f"pass_rate={pass_rate:.2f}")
+                    rate_str = f"{pass_rate:.2f}" if pass_rate is not None else "N/A"
+                    print(f"pass_rate={rate_str}")
                 except Exception as e:
                     print(f"FAILED: {e}", file=sys.stderr)
 
@@ -716,7 +722,7 @@ Examples:
     )
     parser.add_argument(
         "--provider", "-p",
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "google"],
         default=None,
         help="LLM provider for the OpenClaw agent (overrides inference from --model).",
     )
@@ -743,7 +749,7 @@ Examples:
     )
     parser.add_argument(
         "--judge-provider",
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "google"],
         default=None,
         help="Provider for judge model (inferred from --judge-model if not specified)",
     )

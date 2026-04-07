@@ -2,20 +2,24 @@
 Stage 3: Generate seed data (mock tools) and expectations jointly.
 
 Reads test cases (from Stage 2) and their matching samples (from Stage 1),
-then for each test case:
-  1. Generates mock tool data using all event inputs + step texts as context —
-     covering every entity that will appear at eval time in one consistent pass.
-  2. Writes event expectations using that exact mock data.
+then for each sample group (all mod-type variants):
+  1. Collects all event inputs from ALL variants + step texts — one rich context.
+  2. Generates mock tool data ONCE per sample, shared across all variants.
+  3. Writes event expectations per TC using that exact mock data.
 
-Because mock data and expectations are generated with full knowledge of all events
-(not just the original sample steps), no refresh or augmentation is needed later.
+Processing at sample granularity (not per TC) avoids redundant LLM calls:
+80 samples × N tools instead of 480 TCs × N tools.
+
+Continuation: the output file is written incrementally per sample. Interrupted
+runs resume from the last completed sample (TCs with mock_tools + expectations
+are skipped).
 
 Usage:
     python -m src.data.generate_seed \\
         --input outputs/my-run/test_cases.jsonl \\
         --samples outputs/my-run/samples.jsonl
 
-    # Force regeneration of all test cases
+    # Force regeneration of all samples
     python -m src.data.generate_seed \\
         --input outputs/my-run/test_cases.jsonl \\
         --samples outputs/my-run/samples.jsonl --force
@@ -30,6 +34,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -49,29 +55,49 @@ from src.data.utils import (
 
 
 def generate_seed(llm, test_case: TestCase, sample: Sample) -> None:
-    """Generate mock_tools and expectations for a test case in one consistent pass.
+    """Generate mock_tools and expectations for one TC in one consistent pass.
 
-    Collects all entities from event inputs AND step texts before generating mock data
-    so no refresh is needed later. Expectations are written using that exact mock data.
+    Context = step texts + THIS TC's own event inputs only. Each TC is an
+    independent unit at eval time, so its mock data reflects exactly what
+    its own events need — no cross-variant contamination.
+
+    Tool discovery (union, not replacement):
+      - Pre-existing tools in tc.mock_tools (from retrofit/discover passes)
+      - Regex-detected tools from object behavior descriptions
     Mutates test_case in place.
     """
     step_texts = [s.text for s in sample.steps if s.text]
     event_texts = [e.input for e in test_case.events if getattr(e, "input", None)]
     all_texts = step_texts + event_texts
 
-    mock_tools = []
+    # Build tool map: existing tools first, then regex-detected additions
+    tool_map: dict[str, str] = {}  # tool_name → description
+    for tool in test_case.mock_tools:
+        tool_map[tool.tool_name] = tool.description
     for obj in sample.objects:
         match = _DATA_TOOL_RE.search(obj.behavior or "")
-        if not match:
-            continue
-        tool_name = match.group(1)
-        description = (obj.state_description or "").strip() or obj.role
+        if match:
+            tool_map.setdefault(
+                match.group(1),
+                (obj.state_description or "").strip() or obj.role,
+            )
+
+    mock_tools = []
+    for tool_name, description in tool_map.items():
         tool = _generate_mock_tool_data(llm, tool_name, description, all_texts)
         if tool:
             mock_tools.append(tool)
     test_case.mock_tools = mock_tools
 
     _rewrite_event_expectations(llm, test_case, sample)
+
+
+def _needs_seed(tc: TestCase, force: bool) -> bool:
+    if force:
+        return True
+    # Expectations are the reliable completion signal — a TC with no data-lookup
+    # objects legitimately has empty mock_tools, so we don't require them here.
+    return not all(e.expect is not None for e in tc.events)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -109,6 +135,12 @@ Examples:
         default=None,
         help="Output JSONL path (default: overwrites input file in place)",
     )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=1,
+        help="Number of parallel sample workers (default: 1). One worker per sample group.",
+    )
     add_common_args(parser)
     return parser
 
@@ -136,7 +168,7 @@ def run(args: argparse.Namespace) -> Path:
             s = Sample.model_validate_json(line)
             samples_by_id[s.id] = s
 
-    # Load test cases
+    # Load test cases, preserving original order
     test_cases: list[TestCase] = []
     with open(args.input) as f:
         for line in f:
@@ -148,15 +180,7 @@ def run(args: argparse.Namespace) -> Path:
     if args.limit:
         test_cases = test_cases[: args.limit]
 
-    # Determine which test cases need seeding
-    def _needs_seed(tc: TestCase) -> bool:
-        if args.force:
-            return True
-        has_mock = bool(tc.mock_tools)
-        has_expect = all(e.expect is not None for e in tc.events if hasattr(e, "expect"))
-        return not (has_mock and has_expect)
-
-    pending = [tc for tc in test_cases if _needs_seed(tc)]
+    pending = [tc for tc in test_cases if _needs_seed(tc, args.force)]
     already_done = len(test_cases) - len(pending)
 
     if not pending:
@@ -164,11 +188,13 @@ def run(args: argparse.Namespace) -> Path:
         return output_path
 
     if already_done:
-        print(f"Resuming: {already_done} already seeded, {len(pending)} remaining")
+        print(f"Resuming: {already_done}/{len(test_cases)} already done, {len(pending)} remaining")
     else:
         print(f"Seeding {len(pending)} test cases")
 
-    print_run_info(args.provider, args.model, args.seed, {})
+    print_run_info(args.provider, args.model, args.seed, {
+        "Workers": str(getattr(args, "workers", 1)),
+    })
 
     llm = create_llm(
         provider=args.provider,
@@ -177,35 +203,51 @@ def run(args: argparse.Namespace) -> Path:
         seed=args.seed,
     )
 
-    # Index pending by id for fast lookup
-    pending_ids = {tc.id for tc in pending}
-
-    # Process — mutate pending test cases in place, keep others unchanged
-    tc_by_id = {tc.id: tc for tc in test_cases}
+    workers: int = getattr(args, "workers", 1)
     success_count = 0
     fail_count = 0
+    write_lock = threading.Lock()
 
-    for tc in tqdm(pending, desc="Seeding test cases"):
-        # Find matching sample — test case ID is "{sample_id}-TC{NNN}"
-        sample_id = tc.id.rsplit("-TC", 1)[0]
-        sample = samples_by_id.get(sample_id)
-        if sample is None:
-            print(f"  Warning: no sample found for {tc.id} (expected sample id: {sample_id})", file=sys.stderr)
-            fail_count += 1
-            continue
-
-        generate_seed(llm, tc, sample)
-
-        if tc.mock_tools:
-            success_count += 1
-        else:
-            fail_count += 1
-
-    # Write all test cases (seeded + unchanged) to output
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Write initial snapshot so the file exists for incremental flushes
     with open(output_path, "w") as f:
         for tc in test_cases:
             f.write(tc.model_dump_json() + "\n")
+
+    def _seed_one(tc: TestCase) -> bool:
+        sample_id = tc.id.rsplit("-TC", 1)[0]
+        sample = samples_by_id.get(sample_id)
+        if sample is None:
+            tqdm.write(f"  Warning: no sample found for {tc.id}", file=sys.stderr)
+            return False
+        generate_seed(llm, tc, sample)
+        # Success = expectations written for all events (mock_tools may be empty
+        # for TCs with no data-lookup objects, which is valid)
+        return all(e.expect is not None for e in tc.events)
+
+    def _flush() -> None:
+        """Overwrite output with current in-memory state (called after each TC completes)."""
+        with write_lock:
+            with open(output_path, "w") as f:
+                for tc in test_cases:
+                    f.write(tc.model_dump_json() + "\n")
+
+    with tqdm(total=len(pending), unit="tc", desc="Seeding") as pbar:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_seed_one, tc): tc for tc in pending}
+            for future in as_completed(futures):
+                tc = futures[future]
+                try:
+                    ok = future.result()
+                    _flush()
+                except Exception as e:
+                    tqdm.write(f"  FAILED {tc.id}: {e}", file=sys.stderr)
+                    ok = False
+                if ok:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                pbar.update(1)
 
     print()
     print(f"Complete. Output: {output_path}")

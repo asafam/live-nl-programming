@@ -22,10 +22,12 @@ def infer_provider(model: str) -> str:
         return "anthropic"
     elif model.startswith("gpt") or model.startswith("o1") or model.startswith("o3"):
         return "openai"
+    elif model.startswith("gemini"):
+        return "google"
     else:
         raise ValueError(
             f"Cannot infer provider from model '{model}'. "
-            f"Use --provider to specify 'openai' or 'anthropic'."
+            f"Use --provider to specify 'openai', 'anthropic', or 'google'."
         )
 
 
@@ -108,10 +110,22 @@ def generate_with_retries(
     """
     from src.data.llm import user_message
 
+    last_error: str = ""
     for attempt in range(max_retries):
+        # On retries, append the previous failure reason so the LLM can self-correct
+        if attempt > 0 and last_error:
+            retry_prompt = (
+                prompt
+                + f"\n\n---\n\nIMPORTANT: Your previous attempt was rejected.\n"
+                f"Reason: {last_error}\n"
+                f"Please fix this specific issue and try again."
+            )
+        else:
+            retry_prompt = prompt
+
         try:
             result = llm.generate_structured(
-                messages=[user_message(prompt)],
+                messages=[user_message(retry_prompt)],
                 response_model=response_model,
             )
 
@@ -121,6 +135,7 @@ def generate_with_retries(
             return result
 
         except Exception as e:
+            last_error = str(e)
             if attempt < max_retries - 1:
                 wait = 2**attempt  # Exponential backoff: 1s, 2s, 4s
                 print(
@@ -142,7 +157,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
         "-p",
-        choices=["openai", "anthropic"],
+        choices=["openai", "anthropic", "google"],
         default=None,
         help="LLM provider (inferred from model if not specified)",
     )
@@ -150,7 +165,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--model",
         "-m",
         default="claude-sonnet-4-6",
-        help="Model name (default: claude-sonnet-4-6). Provider is inferred: claude-* → anthropic, gpt-*/o1-*/o3-* → openai",
+        help="Model name (default: claude-sonnet-4-6). Provider is inferred: claude-* → anthropic, gpt-*/o1-*/o3-* → openai, gemini-* → google",
     )
     parser.add_argument(
         "--seed",
@@ -193,15 +208,6 @@ def validate_paths(input_path: Path, prompt_template_path: Path) -> None:
         sys.exit(1)
 
 
-def confirm_overwrite(output_path: Path) -> None:
-    """Prompt user for confirmation if output file already exists. Exits if declined."""
-    if output_path.exists():
-        response = input(f"Output file already exists: {output_path}\nOverwrite? [y/N] ")
-        if response.strip().lower() != "y":
-            print("Aborted.")
-            sys.exit(0)
-
-
 def setup_output(
     output_path: Path,
     force: bool,
@@ -212,8 +218,12 @@ def setup_output(
     Returns:
         Tuple of (completed_set, file_mode).
     """
-    confirm_overwrite(output_path)
     if force:
+        if output_path.exists():
+            response = input(f"Output file already exists: {output_path}\nOverwrite all? [y/N] ")
+            if response.strip().lower() != "y":
+                print("Aborted.")
+                sys.exit(0)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         return set(), "w"
     else:

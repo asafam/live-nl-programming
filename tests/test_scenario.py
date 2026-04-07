@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
 
 def _make_runtime() -> Runtime:
     brain = OpenAIBrain(model="gpt-4o-mini", temperature=0.0, seed=42)
-    return Runtime(brain, strict_peers=False)
+    return Runtime(brain)
 
 
 def _llm_assert(state: str, condition: str, error_msg: str = "Assertion failed") -> None:

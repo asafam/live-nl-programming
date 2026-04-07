@@ -48,8 +48,10 @@ prompt: |
   - An object updating a record in response to another object
   - Any action that is a consequence of a prior step
 
-  **Most automations have only 1–2 steps.** If you find yourself writing more, check: is each step truly an independent external trigger, or a consequence of a prior one?
+  **Write one step per DISTINCT external trigger type.** A simple automation with one trigger type has one step. An automation that reacts to both a form submission AND a later webhook confirmation (different event types, different behavior chains) has two steps. Do not collapse independent triggers into one step; do not write multiple steps for different data instances of the same event type.
 
   **Consistency:** Names used in step `text` must be realistic and consistent — the pipeline will generate matching mock API data using these names.
+
+  **Carry all data the downstream chain needs.** The step `text` must include every piece of content that downstream objects will need to complete their work. If any object writes, stores, or forwards outcome data, that content must be present in the trigger — not invented mid-chain. Include conversation or thread identifiers for messaging platforms. Satisfy all conditions required by the expected output (e.g., if the expectation requires all approvers to have approved, the step must include all approvals; if a threshold must be met, the data must satisfy it).
 
   **Shared state:** Steps run sequentially on a shared runtime. Each step's side effects carry forward. Before writing `expect` for any step N, ask: "Have prior steps already resolved the state this step depends on?" If yes, omit `expect` — the outcome is no longer deterministic. Omit `expect` entirely for scheduled/heartbeat triggers.

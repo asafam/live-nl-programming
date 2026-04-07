@@ -72,8 +72,36 @@ user_prompt: |
   - **Unrelated events**: A different external trigger that exercises logic unaffected by the modification.
   - If multiple modifications: events between modifications to test intermediate states.
 
-  Focus on writing high-quality `input` values — realistic external triggers that exercise the right
-  logic at the right time. Expectations are written in a separate pass and are not part of your output.
+  Focus on writing high-quality `input` values — realistic external triggers that carry enough
+  information for the full automation chain to run to completion. Expectations are written in a
+  separate pass and are not part of your output.
+
+  **Rule 1 — Carry all data the downstream chain needs.**
+  An event input must include not just the trigger action but every piece of content that downstream
+  objects will need to do their work. If any object in the chain writes, stores, or forwards outcome
+  data (e.g., logs a resolution, writes a knowledge base entry, generates a report, sends a
+  notification with specific details), that content must be present in the triggering input — it
+  cannot be invented by the system mid-chain. Ask: "What would every downstream object need from
+  this event to complete its job?"
+
+  Examples of what to include:
+  - A completion/close action → include the outcome, decision rationale, or resolution details
+  - An approval action → include what was approved, by whom, and any conditions met
+  - A handoff action → include the context the receiving party needs to act
+  - A status change → include what changed, why, and any relevant identifiers
+
+  **Rule 2 — Include conversation and session identifiers.**
+  When the automation involves a messaging platform (chat, email, ticketing), the event input must
+  include the thread, conversation, or session identifier (e.g., thread timestamp, ticket ID, session
+  token). Objects that need to post replies or link follow-up messages back to the original context
+  cannot do so without this identifier — the reply chain will silently stall.
+
+  **Rule 3 — Satisfy all conditions required by the expected outcome.**
+  Before writing an event, trace through the automation logic: if reaching the expected outcome
+  requires multiple conditions to be true (e.g., all required approvers have approved, a threshold
+  has been met, a record exists with a specific status), the event input must provide or imply all
+  of those conditions. A partial trigger that satisfies only some conditions will cause the system
+  to correctly wait or block — making the test case unresolvable.
 
   ```yaml
   events:
@@ -83,7 +111,21 @@ user_prompt: |
       recipient: "<entry-point object from sample>"
       when: "W02-1T09:00"
       input: "<external trigger content matching the sample's step pattern>"
+    - id: "E002"
+      call_type: "send_event"
+      source: "__external__"
+      recipient: "<entry-point object from sample>"
+      when: "W02-2T10:00"
+      input: "<another external trigger>"
+      triggered_by: "E001"   # optional: E001 causes E002 to fire
   ```
+
+  **`triggered_by` constraint:** If an event is triggered as a downstream consequence of another
+  event firing (e.g., a reply arrives after the first event starts processing), set `triggered_by`
+  to the **event ID** of the parent event (e.g., `"E001"`).
+  NEVER set `triggered_by` to a modification ID (e.g., `"M001"`) — modifications are rule changes,
+  not events, and cannot trigger events. If an event is not causally linked to another event,
+  omit `triggered_by` entirely.
 
   ---
 

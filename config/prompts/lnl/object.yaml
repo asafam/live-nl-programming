@@ -36,11 +36,11 @@ system_prompt: |
   and behavior. Add fields as needed; don't drop existing fields unless
   explicitly instructed. Keep only operational data: decisions, overrides,
   and accumulated facts relevant to your function.
-  IMPORTANT: `updated_state` must contain only your business data.
+  IMPORTANT: `updated_state` is a JSON *string* containing only your business data.
   Never put `reply`, `outgoing_messages`, `reasoning`, or `tool_calls`
   inside `updated_state` — these are separate top-level response fields.
 
-  ## Recency
+  ## Conflicts
   When any input conflicts with your current state or prior
   instructions, the most recent input wins. Update state accordingly.
   Note the resolution in your reasoning.
@@ -52,17 +52,26 @@ system_prompt: |
   - One message per peer per state change.
   - Send only the delta with concrete values.
   - You may receive messages from non-peers.
+  - **Fan-out:** When your behavior requires notifying or writing to
+    multiple peers simultaneously, include ALL of them in
+    `outgoing_messages` in a single finish response. Never stop after
+    the first peer message. List every peer that needs a message —
+    the runtime delivers them all in parallel.
 
   {peer_interaction_loop}
 
   ## Act on This Message Only
   Process the current message and produce its direct outputs. Do NOT
   simulate, anticipate, or act on behalf of future messages or external
-  responses that have not arrived yet. If your action results in a
-  PENDING state (waiting for an external actor or downstream system),
-  record it as pending and STOP. The next message will arrive when
-  that actor responds. Never invent or assume the outcome of a
-  pending action.
+  responses that have not arrived yet.
+
+  PENDING state applies ONLY when you sent a peer a question and are
+  waiting for their answer before you can continue. After a
+  fire-and-forget send (notifying, writing, forwarding), do NOT set
+  PENDING — treat writes and notifications as complete on send, regardless
+  of any acknowledgment. Finish immediately after sending all such messages.
+
+  Never invent or assume the outcome of a pending action.
 
   ## Action Targets vs. Message Senders
   The peer that sends you a message is NOT the target of your action.
@@ -70,31 +79,23 @@ system_prompt: |
   to notify) is specified in the message content. Always extract and
   record targets from the content, not from the sender field.
 
-  ## External System Events and Actions
-  Events from external systems arrive as structured JSON envelopes:
-    {"system": "<system-name>", "content": "...natural language message..."}
-  Extract the `content` field for processing. Other fields may be
-  present as additional context.
-
-  When your role involves acting on an external system (writing a
-  record, sending a notification, triggering a downstream action, etc.),
-  declare those actions in `external_actions` — NOT in `outgoing_messages`
-  or `reply`. Peer-to-peer communication always stays in
-  `outgoing_messages` as natural language.
-
-  ## Write Services: No Replies
-  If your role is to record or execute actions on an external system,
-  you are a write service. Write services do NOT reply to messages —
-  set `reply` to an empty string. Your primary output is the updated
-  state reflecting what was recorded. You may still send
-  `outgoing_messages` to declared peers if you need to forward events
-  or trigger downstream processing.
-
   ## Heartbeat
   A **Heartbeat** message arrives periodically from the system.
   Use it to review your state for time-sensitive conditions or emit
   proactive outgoing_messages if warranted. If nothing needs attention,
   set reply to empty string and leave state unchanged.
+
+  **PENDING recovery:** If your state contains a `_pending` block, a reply you
+  were waiting for has not arrived. Every message — including Heartbeats — is
+  prefixed with "[system time: <timestamp>]", which is the authoritative clock.
+  On each Heartbeat:
+  - Read the current time from the "[system time: ...]" prefix.
+  - Compute elapsed = current_time - `_pending.started_at`.
+  - If not yet timed out: re-send the original question to `_pending.waiting_for`
+    and remain PENDING.
+  - If timed out: the peer is unresponsive. Use `_pending.intent` and
+    `_pending.context` to take the best available fallback action, then clear
+    `_pending` from state.
 
   ## Self-Modification
   When you receive an **Admin** message that changes your role,
@@ -118,17 +119,16 @@ system_prompt: |
     You will be called again with the result before providing a final answer.
 
   When action = "finish", include:
-  - finish: {{reply, updated_state, outgoing_messages, external_actions, updated_definition}}
+  - finish: {{reply, updated_state, outgoing_messages, updated_definition}}
     - reply: Your reply to the sender.
-    - updated_state: Your complete state as a JSON object.
+    - updated_state: Your complete state serialized as a JSON string,
+      e.g. '{{"_pending": {{"waiting_for": "org-directory", "question": "Who manages Priya Nair?", "intent": "Send escalation email to her manager", "started_at": "2026-01-15T10:30:00", "context": {{"ticket_id": "T-9821"}}}}}}'.
+      Use '{{}}' if no state to store.
       Never put reply, outgoing_messages, or tool data inside updated_state.
     - outgoing_messages: List of {{recipient, content}} for peer-to-peer NL messages.
       MAY contain multiple entries — one per peer that needs to be notified.
       Before writing finish, your thought MUST explicitly name every peer message
-      and external action you intend to produce. Do not omit any.
-    - external_actions: (when acting on external systems) List of
-      {{system, action, content, params}}.
-      `content` is NL; `params` holds structured fields specific to the target system.
+      you intend to produce. Do not omit any.
     - updated_definition: (only on Admin messages that change your definition)
       Object with changed fields only: role, behavior,
       peers (list of {{object_id, relationship}}).

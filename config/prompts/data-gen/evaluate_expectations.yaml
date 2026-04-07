@@ -1,0 +1,68 @@
+prompt: |
+  # Task: Evaluate Event Expectation Correctness
+
+  You are a quality auditor for an automated test suite. Given a distributed object
+  system, its reference data, a set of modifications, and a specific event with a
+  stored expected outcome — determine whether the expectation is correct.
+
+  ---
+
+  ## Object System
+
+  {OBJECTS}
+
+  ---
+
+  ## Reference Data (exact values the read services will return)
+
+  {MOCK_DATA}
+
+  ---
+
+  ## Modifications
+
+  {MODIFICATIONS}
+
+  ---
+
+  ## Event
+
+  {EVENT}
+
+  ---
+
+  ## Stored Expectation
+
+  action: {ACTION}
+  reason: {REASON}
+
+  ---
+
+  ## How to evaluate
+
+  **Step 1 — Trace the correct terminal output independently.**
+  Follow the same reasoning as if you were writing the expectation from scratch:
+  identify the triggered behavior, trace it to its terminal external output(s),
+  apply active modifications, look up exact names from the Reference Data.
+
+  **Step 2 — Compare your independently derived output to the stored expectation.**
+  Focus on substance, not wording. Minor rephrasing is acceptable. Flag:
+  - Wrong recipient (different person, channel, or system)
+  - Wrong action type (e.g., stored says "DM sent" but correct is "channel post")
+  - Missing output (stored omits a required terminal action)
+  - Extra output (stored includes an action the system does not produce)
+  - Wrong data values (wrong name, wrong status, wrong identifier from the reference data)
+  - Threshold applied incorrectly (conditional output included when threshold not met, or omitted when met)
+
+  **Step 3 — Classify.**
+  - `correct` — expectation accurately describes the terminal output (minor wording differences are fine)
+  - `wrong` — expectation is substantively incorrect; provide the corrected action
+  - `uncertain` — cannot determine correctness from the provided context (e.g., ambiguous routing, underspecified behavior)
+
+  Respond with JSON only:
+  {
+    "event_id": "...",
+    "verdict": "correct" | "wrong" | "uncertain",
+    "issue": "one sentence describing the problem (omit if correct)",
+    "corrected_action": "the correct terminal output (only if verdict is wrong)"
+  }

@@ -25,13 +25,9 @@ class BusMetrics:
 class MessageBus:
     """Routes messages to LLM-object mailboxes. Does not process — that's the Runtime's job."""
 
-    def __init__(
-        self,
-        strict_peers: bool = True,
-    ) -> None:
+    def __init__(self) -> None:
         self._objects: dict[str, LLMObject] = {}
         self._subscriptions: dict[str, set[str]] = {}  # topic -> set of object_ids
-        self._strict_peers = strict_peers
         self._log: list[MessageLog] = []
         self._metrics = BusMetrics()
         self.on_message: Optional[Callable[[Message], None]] = None
@@ -65,23 +61,6 @@ class MessageBus:
 
     def deliver(self, message: Message) -> list[LLMObject]:
         """Route a message to recipient mailbox(es). Returns recipients."""
-        # Validate peers for domain messages
-        if (
-            self._strict_peers
-            and message.type == MessageType.DOMAIN
-            and message.sender not in ("__user__", "__system__", "__external__")
-            and message.recipient != "__broadcast__"
-            and message.topic is None
-        ):
-            sender_obj = self._objects.get(message.sender)
-            if sender_obj and message.recipient not in sender_obj.peer_ids:
-                self._log.append(MessageLog(
-                    message=message,
-                    delivered=False,
-                    error=f"Peer validation failed: '{message.recipient}' is not a peer of '{message.sender}'",
-                ))
-                return []
-
         recipients = self._resolve_recipients(message)
 
         for obj in recipients:

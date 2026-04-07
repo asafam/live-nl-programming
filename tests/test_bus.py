@@ -37,7 +37,7 @@ class TestDelivery:
     def test_deliver_to_mailbox(self):
         """deliver() puts message in target's mailbox without processing."""
         brain = MockBrain()
-        bus = MessageBus(strict_peers=False)
+        bus = MessageBus()
         obj = LLMObject(_defn("a"), brain)
         bus.register(obj)
 
@@ -50,7 +50,7 @@ class TestDelivery:
 
     def test_deliver_to_nonexistent_object(self):
         """deliver() to unknown object returns empty list."""
-        bus = MessageBus(strict_peers=False)
+        bus = MessageBus()
         recipients = bus.deliver(_msg("__user__", "unknown", "hello"))
         assert len(recipients) == 0
 
@@ -59,7 +59,7 @@ class TestDelivery:
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={"status": "changed"}, reply="ok"))
 
-        bus = MessageBus(strict_peers=False)
+        bus = MessageBus()
         obj = LLMObject(_defn("a"), brain)
         bus.register(obj)
 
@@ -70,66 +70,11 @@ class TestDelivery:
         assert obj.has_pending
 
 
-class TestPeerValidation:
-    def test_valid_peer_delivered(self):
-        brain = MockBrain()
-        bus = MessageBus(strict_peers=True)
-        bus.register(LLMObject(
-            _defn("a", peers=[PeerDeclaration("b", "helper")]),
-            brain,
-        ))
-        obj_b = LLMObject(_defn("b"), brain)
-        bus.register(obj_b)
-
-        recipients = bus.deliver(_msg("a", "b", "hello"))
-        assert len(recipients) == 1
-        assert obj_b.has_pending
-
-    def test_non_peer_blocked(self):
-        brain = MockBrain()
-        bus = MessageBus(strict_peers=True)
-        bus.register(LLMObject(_defn("a", peers=[]), brain))
-        obj_b = LLMObject(_defn("b"), brain)
-        bus.register(obj_b)
-
-        recipients = bus.deliver(_msg("a", "b", "hello"))
-        assert len(recipients) == 0
-        assert not obj_b.has_pending
-        assert bus.log[-1].delivered is False
-        assert "Peer validation" in bus.log[-1].error
-
-    def test_user_bypasses_peer_check(self):
-        brain = MockBrain()
-        bus = MessageBus(strict_peers=True)
-        obj = LLMObject(_defn("a"), brain)
-        bus.register(obj)
-
-        recipients = bus.deliver(_msg("__user__", "a", "hello"))
-        assert len(recipients) == 1
-
-    def test_system_bypasses_peer_check(self):
-        brain = MockBrain()
-        bus = MessageBus(strict_peers=True)
-        obj = LLMObject(_defn("a"), brain)
-        bus.register(obj)
-
-        recipients = bus.deliver(_msg("__system__", "a", "hello"))
-        assert len(recipients) == 1
-
-    def test_external_bypasses_peer_check(self):
-        brain = MockBrain()
-        bus = MessageBus(strict_peers=True)
-        obj = LLMObject(_defn("a"), brain)
-        bus.register(obj)
-
-        recipients = bus.deliver(_msg("__external__", "a", "hello"))
-        assert len(recipients) == 1
-
 
 class TestTopicSubscription:
     def test_topic_delivery(self):
         brain = MockBrain()
-        bus = MessageBus(strict_peers=False)
+        bus = MessageBus()
         bus.register(LLMObject(_defn("pub"), brain))
         sub1 = LLMObject(_defn("sub1", subscriptions=["news"]), brain)
         sub2 = LLMObject(_defn("sub2", subscriptions=["news"]), brain)
@@ -153,7 +98,7 @@ class TestTopicSubscription:
 class TestBroadcast:
     def test_broadcast_delivery(self):
         brain = MockBrain()
-        bus = MessageBus(strict_peers=False)
+        bus = MessageBus()
         bus.register(LLMObject(_defn("sender"), brain))
         r1 = LLMObject(_defn("r1"), brain)
         r2 = LLMObject(_defn("r2"), brain)
@@ -169,7 +114,7 @@ class TestBroadcast:
 class TestLogging:
     def test_log_entries(self):
         brain = MockBrain()
-        bus = MessageBus(strict_peers=False)
+        bus = MessageBus()
         bus.register(LLMObject(_defn("a"), brain))
 
         bus.deliver(_msg("__user__", "a", "hello"))
@@ -203,7 +148,7 @@ class TestTopology:
 class TestUnregister:
     def test_unregister_removes_object(self):
         brain = MockBrain()
-        bus = MessageBus(strict_peers=False)
+        bus = MessageBus()
         bus.register(LLMObject(_defn("a"), brain))
         bus.unregister("a")
 

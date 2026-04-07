@@ -4,6 +4,7 @@ from typing import Optional
 from .base import AbstractLLM, ChatMessage, user_message, system_message, assistant_message
 from .openai_client import OpenAIChatLLM
 from .anthropic_client import AnthropicChatLLM
+from .gemini_client import GeminiChatLLM
 
 
 def create_llm(
@@ -15,8 +16,8 @@ def create_llm(
     """Create an LLM client for the specified provider.
 
     Args:
-        provider: LLM provider - "openai" or "anthropic".
-        model: Model name (e.g., "gpt-4o", "claude-sonnet-4-20250514").
+        provider: LLM provider - "openai", "anthropic", or "google".
+        model: Model name (e.g., "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.5-pro").
         temperature: Sampling temperature.
         seed: Random seed for reproducibility (OpenAI only).
 
@@ -37,9 +38,14 @@ def create_llm(
             model=model,
             temperature=temperature,
         )
+    elif provider == "google":
+        return GeminiChatLLM(
+            model=model,
+            temperature=temperature,
+        )
     else:
         raise ValueError(
-            f"Unknown provider: {provider}. Use 'openai' or 'anthropic'."
+            f"Unknown provider: {provider}. Use 'openai', 'anthropic', or 'google'."
         )
 
 
@@ -48,6 +54,7 @@ __all__ = [
     "ChatMessage",
     "OpenAIChatLLM",
     "AnthropicChatLLM",
+    "GeminiChatLLM",
     "create_llm",
     "user_message",
     "system_message",

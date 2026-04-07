@@ -122,7 +122,7 @@ class BenchmarkHarness:
         """Run a scenario and evaluate assertions."""
         if self._brain is None:
             raise ValueError("BenchmarkHarness requires a brain to run scenarios")
-        rt = Runtime(self._brain, strict_peers=False)
+        rt = Runtime(self._brain)
         registry = MockRegistry()
 
         # Setup mocks

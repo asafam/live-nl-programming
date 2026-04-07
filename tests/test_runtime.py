@@ -23,7 +23,7 @@ def brain():
 
 @pytest.fixture
 def rt(brain):
-    return Runtime(brain, strict_peers=False)
+    return Runtime(brain)
 
 
 class TestLoadDirectory:
@@ -97,7 +97,7 @@ class TestChainProcessing:
             reply="C reply",
         ))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="a", role="A"))
         rt.create_object(ObjectDefinition(object_id="b", role="B"))
         rt.create_object(ObjectDefinition(object_id="c", role="C"))
@@ -128,7 +128,7 @@ class TestChainProcessing:
             outgoing_messages=[OutgoingMessage(recipient="a", content="loop")],
         ))
 
-        rt = Runtime(brain, max_chain_depth=3, strict_peers=False)
+        rt = Runtime(brain, max_chain_depth=3)
         rt.create_object(ObjectDefinition(object_id="a", role="A"))
 
         results = rt.send("a", "start loop")
@@ -159,7 +159,7 @@ class TestChainProcessing:
             reply="C reply",
         ))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="a", role="A"))
         rt.create_object(ObjectDefinition(object_id="b", role="B"))
         rt.create_object(ObjectDefinition(object_id="c", role="C"))
@@ -188,7 +188,7 @@ class TestInjectEvent:
             reply="got it",
         ))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="slack", role="Slack service"))
 
         results = rt.inject_event("slack", "New message in #support")
@@ -209,7 +209,7 @@ class TestInjectEvent:
             reply="handled",
         ))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="slack", role="Slack"))
         rt.create_object(ObjectDefinition(object_id="triage", role="Triage"))
 
@@ -224,7 +224,7 @@ class TestInjectEvent:
 class TestEventRegistry:
     def test_event_sources_registered(self):
         brain = MockBrain()
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="slack",
             role="Slack service",
@@ -238,7 +238,7 @@ class TestEventRegistry:
 
 class TestModify:
     def test_modify_preserves_state(self, brain):
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         brain.script("worker", LLMResponse(
             updated_state={"status": "has state"},
             reply="ok",
@@ -280,7 +280,7 @@ class TestTopology:
 
 class TestPersistence:
     def test_save_reload_roundtrip(self, brain, tmp_path):
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="worker",
             role="Worker role.",
@@ -290,7 +290,7 @@ class TestPersistence:
         assert path.exists()
 
         # Reload in a new runtime
-        rt2 = Runtime(brain, strict_peers=False)
+        rt2 = Runtime(brain)
         obj = rt2.load_file(path)
         assert obj.object_id == "worker"
         assert obj.definition.role == "Worker role."
@@ -333,7 +333,7 @@ class TestEventSources:
     def test_event_source_accessible(self):
         """Object with event_sources gets a provider accessible via get_event_source."""
         brain = MockBrain()
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="slack",
             role="Slack monitor",
@@ -346,7 +346,7 @@ class TestEventSources:
     def test_no_event_source_without_declaration(self):
         """Object without event_sources has no source."""
         brain = MockBrain()
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="worker", role="Worker"))
 
         source = rt.get_event_source("worker", "anything")
@@ -359,7 +359,7 @@ class TestEventSources:
             updated_state={"status": "got message"}, reply="Received",
         ))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="slack",
             role="Slack monitor",
@@ -386,7 +386,7 @@ class TestEventSources:
             updated_state={"status": "triaged"}, reply="handled",
         ))
 
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="slack",
             role="Slack monitor",
@@ -407,7 +407,7 @@ class TestEventSources:
         """Object with multiple event_sources gets separate providers."""
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={}, reply="ok"))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="monitor",
             role="Multi-source monitor",
@@ -426,7 +426,7 @@ class TestLiveMode:
         """start() launches the loop, stop() shuts it down."""
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={}, reply="ok"))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
 
         rt.start(poll_interval=0.01)
         assert rt.is_running
@@ -438,7 +438,7 @@ class TestLiveMode:
         """submit() enqueues work; results available after done is set."""
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={"status": "processed"}, reply="hello"))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="worker", role="Worker"))
 
         rt.start(poll_interval=0.01)
@@ -461,7 +461,7 @@ class TestLiveMode:
             outgoing_messages=[OutgoingMessage(recipient="b", content="from A")],
         ))
         brain.script("b", LLMResponse(updated_state={"status": "b done"}, reply="B"))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="a", role="A"))
         rt.create_object(ObjectDefinition(object_id="b", role="B"))
 
@@ -478,7 +478,7 @@ class TestLiveMode:
         """kill_object removes the object from the runtime."""
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={}, reply="ok"))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="a", role="A"))
         rt.create_object(ObjectDefinition(object_id="b", role="B"))
 
@@ -491,7 +491,7 @@ class TestLiveMode:
         """on_result fires for each ProcessingResult."""
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={}, reply="hi"))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(object_id="w", role="W"))
 
         received = []
@@ -508,7 +508,7 @@ class TestLiveMode:
         """inject_event routes through run-loop in live mode."""
         brain = MockBrain()
         brain.set_default(LLMResponse(updated_state={"status": "got event"}, reply="ok"))
-        rt = Runtime(brain, strict_peers=False)
+        rt = Runtime(brain)
         rt.create_object(ObjectDefinition(
             object_id="listener",
             role="Listener",
