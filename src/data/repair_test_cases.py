@@ -42,7 +42,9 @@ def _fix_triggered_by(tc: TestCase) -> bool:
     event_ids = {e.id for e in tc.events}
     changed = False
     for evt in tc.events:
-        if evt.triggered_by is not None and evt.triggered_by not in event_ids:
+        if evt.triggered_by is not None and (
+            evt.triggered_by not in event_ids or evt.triggered_by == evt.id
+        ):
             evt.triggered_by = None
             changed = True
     return changed
@@ -51,7 +53,7 @@ def _fix_triggered_by(tc: TestCase) -> bool:
 # ── Fix 2: re-run expectations (LLM) ─────────────────────────────────────────
 
 def _needs_expectation_rewrite(tc: TestCase) -> bool:
-    return bool(find_missing_step_data(tc))
+    return bool(find_missing_step_data(tc)) or any(e.expect is None for e in tc.events)
 
 
 # ── Sample loader ─────────────────────────────────────────────────────────────

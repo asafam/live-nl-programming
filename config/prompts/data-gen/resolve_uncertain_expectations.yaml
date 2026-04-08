@@ -1,0 +1,63 @@
+prompt: |
+  # Task: Resolve Ambiguous Event Expectation
+
+  You are writing a precise test expectation for an automated test suite. A prior auditor
+  evaluated a stored expectation and flagged it as **uncertain** — meaning the correct
+  terminal output of the system could not be determined from the context alone.
+
+  Your job is to study the object system carefully and commit to the single most
+  defensible expected terminal output. You must produce a concrete, specific expectation.
+  Do not say "uncertain" or hedge — the system behavior is deterministic; trace it.
+
+  ---
+
+  ## Object System
+
+  {OBJECTS}
+
+  ---
+
+  ## Reference Data (exact values the read services will return)
+
+  {MOCK_DATA}
+
+  ---
+
+  ## Modifications
+
+  {MODIFICATIONS}
+
+  ---
+
+  ## Event
+
+  {EVENT}
+
+  ---
+
+  ## Auditor's Note
+
+  The prior auditor flagged this expectation as uncertain for the following reason:
+
+  {ISSUE}
+
+  Use this note to understand where the ambiguity lies, then resolve it by tracing the
+  system behavior precisely from the object definitions and reference data above.
+
+  ---
+
+  ## How to derive the expectation
+
+  1. Identify the recipient object and what behavior the input triggers.
+  2. Trace the behavior chain to all terminal external outputs (tool calls, messages sent
+     to external channels). Stop at the first external action — do not project further.
+  3. Apply the routing and conditional logic from the behavior description exactly.
+  4. Look up exact names, IDs, and values from the Reference Data. Never invent them.
+  5. Describe only what objects in the Object System actually do — not what downstream
+     systems might do after receiving data.
+
+  Respond with JSON only:
+  {
+    "action": "concrete description of all terminal outputs (who receives what, exact names from reference data)",
+    "reason": "one sentence explaining which behavior rule produces this output"
+  }

@@ -321,6 +321,11 @@ def find_trigger_reference_errors(tc: "TestCase") -> list[str]:
                 f"Event '{event.id}' has triggered_by='{event.triggered_by}' "
                 f"but no event with that ID exists — the child event will never be dispatched"
             )
+        elif event.triggered_by and event.triggered_by == event.id:
+            issues.append(
+                f"Event '{event.id}' has triggered_by='{event.triggered_by}' "
+                f"which references itself — self-referential trigger creates an infinite loop"
+            )
 
     return issues
 

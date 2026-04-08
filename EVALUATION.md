@@ -1,6 +1,6 @@
 # Evaluation: LNL Runtime vs OpenClaw Baseline
 
-Both evaluators use the same test cases, the same LLM judge, and produce the same output schema for direct comparison.
+Both evaluators use the same test cases, the same LLM judge (or judge panel), and produce the same output schema for direct comparison.
 
 1. **LNL Runtime** (`evaluate`) — Multi-object: LLM-objects communicate via a message bus
 2. **OpenClaw Baseline** (`evaluate_baseline`) — Single OpenClaw agent handles the entire workflow
@@ -13,7 +13,8 @@ Both evaluators use the same test cases, the same LLM judge, and produce the sam
 
 ```bash
 source .venv/bin/activate
-# Requires OPENAI_API_KEY and/or ANTHROPIC_API_KEY in .env
+# Requires API keys in .env — whichever providers you use:
+#   OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY
 ```
 
 ### Running
@@ -33,6 +34,47 @@ python -m src.data.evaluate \
     --model gpt-4o \
     --judge-model claude-sonnet-4-6
 ```
+
+Use **multiple judges** for higher confidence — each `--llm-judge` flag adds a judge, and the panel decides by majority vote (ties count as fail):
+
+```bash
+python -m src.data.evaluate \
+    -i outputs/data/zapier/20260322_010211/test_cases.jsonl \
+    --model gpt-4o \
+    --llm-judge gpt-4o \
+    --llm-judge claude-sonnet-4-6
+```
+
+Each judge spec is either a bare model name (provider inferred from the name) or `provider/model`:
+
+```bash
+--llm-judge gpt-4o                         # inferred: openai
+--llm-judge claude-sonnet-4-6              # inferred: anthropic
+--llm-judge gemini-2.5-pro                 # inferred: google
+--llm-judge anthropic/claude-sonnet-4-6    # explicit provider
+```
+
+**Agreement rules:**
+- 2 judges: both must agree — disagreement counts as fail
+- 3+ judges: simple majority vote — ties count as fail
+
+Per-event results include a `judge_votes` field in the output JSONL when a panel is used, with each judge's individual verdict and reasoning:
+
+```json
+{
+  "event_id": "E001",
+  "passed": true,
+  "reasoning": "PASS (2/2 judges agree) — openai/gpt-4o=PASS: ...; anthropic/claude-sonnet-4-6=PASS: ...",
+  "judge_votes": [
+    {"judge": "openai/gpt-4o", "passed": true, "reasoning": "..."},
+    {"judge": "anthropic/claude-sonnet-4-6", "passed": true, "reasoning": "..."}
+  ]
+}
+```
+
+The `RunConfig` record (first line of the output JSONL) stores all judge specs in `judge_specs` for later reference.
+
+> **Note:** `--llm-judge` takes precedence over `--judge-model` / `--judge-provider`. Use `--judge-model` for a single dedicated judge; use `--llm-judge` (repeatable) for a panel.
 
 Add `--verbose` / `-v` to see per-event details during the run — what the judge expected, the evidence it saw, and its reasoning:
 
@@ -125,6 +167,14 @@ Overrides `--limit`. Useful for isolating flaky or incomplete test cases.
 - Testing initialization behavior without scenario changes
 - Debugging what happens when external systems first contact the objects
 - Verifying that seed_data and object definitions are correct before applying test logic
+
+**`--reuse-steps` / `--no-reuse-steps`** — Run base steps once per sample and reuse the resulting runtime state across all TC variants that share the same `sample_id`. Since the dataset has 6 variants per sample (different `mod_type` and `ambiguity` combinations), this reduces step executions from 498 to 83 — roughly a **6× reduction in step costs**. Enabled by default; use `--no-reuse-steps` to disable.
+
+How it works: the first variant of each sample runs steps normally. After steps complete, the runtime state (object states, conversation histories, definitions, mock executor call counts) is snapshotted. Each subsequent variant restores that snapshot and proceeds directly to modifications and events, skipping step re-execution entirely.
+
+Step `EventResult`s and raw event data are reused verbatim for all variants — they are identical by definition since all variants share the same base steps.
+
+> Note: has no effect on TCs without a `sample_id`, or when `--steps-only` is set.
 
 **`--debug-messages`** — Print all messages flowing through the message bus, including JSON envelopes for external events and internal peer communication. Shows sender, recipient, message type, and content.
 
@@ -244,14 +294,16 @@ cd plugins/openclaw-mock-external && npm run build
 | `--timeout` | Wall-clock seconds per step/event (default: 60) | Seconds per run (default: 120) |
 | `--model`, `-m` | Model for LLM-objects | Model for OpenClaw agent (sets provider/model/API key from `.env`) |
 | `--provider`, `-p` | `openai` or `anthropic` | `openai` or `anthropic` (overrides inference from `--model`) |
-| `--judge-model` | Judge model (default: same as `--model`; strongly prefer a separate stronger model) | Judge model (default: `gpt-4o-mini`) |
-| `--judge-provider` | Judge provider (inferred from model name) | Judge provider (default: `openai`) |
+| `--llm-judge` | Judge model spec, repeatable for a panel (e.g. `--llm-judge gpt-4o --llm-judge claude-sonnet-4-6`). Overrides `--judge-model`. | N/A |
+| `--judge-model` | Single judge model (default: same as `--model`). Ignored when `--llm-judge` is set. | Judge model (default: `gpt-4o-mini`) |
+| `--judge-provider` | Judge provider (inferred from model name). Ignored when `--llm-judge` is set. | Judge provider (default: `openai`) |
 | `--verbose`, `-v` | Print per-event evidence, expected, and judge reasoning | Print each message sent, agent response, and per-event pass/fail reasoning |
 | `--agent-id` | N/A | OpenClaw agent ID (default: `main`) |
 | `--gateway-url` | N/A | OpenClaw gateway URL (default: auto-detect) |
 | `--limit`, `-n` | First N test cases only | First N test cases only |
 | `--tc` | Specific test cases by 1-based index or ID (overrides `--limit`) | Same |
 | `--steps-only` | Run only steps; skip modifications and events | N/A |
+| `--reuse-steps` / `--no-reuse-steps` | Run steps once per sample; reuse state across variants (saves ~6× step cost). **Default: on.** | N/A |
 | `--debug-messages` | Print messages exchanged between LLM-objects | N/A |
 | `--mock-config` | YAML file(s) with shared mock tool definitions (repeatable) | N/A |
 | `--mock-server` | N/A | Enable MockServer + plugin tool integration |
