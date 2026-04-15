@@ -339,6 +339,47 @@ def _clear_agent_sessions(object_id: str, openclaw_home: Path) -> None:
     sessions_json.write_text("{}\n")
 
 
+async def _restart_worker(worker: "WorkerConfig") -> None:
+    """Restart a Docker worker container and wait for both services to be ready.
+
+    Called before each TC run in pool mode so the gateway starts with a clean
+    in-memory state (no cached agent state, no stale session handles).  The
+    entrypoint re-writes the config from the template on startup, so callers
+    must re-export workspaces and re-configure agents after this returns.
+    """
+    import subprocess as _sp
+
+    if worker.container_name:
+        print(f"  [{worker.name}] Restarting container for clean gateway state...")
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _sp.run(
+                ["docker", "restart", worker.container_name],
+                check=True, capture_output=True, timeout=60,
+            ),
+        )
+
+    # Wait for mock server
+    deadline = asyncio.get_event_loop().time() + 60.0
+    import httpx as _httpx
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            r = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _httpx.get(f"{worker.mock_server_url}/health", timeout=2)
+            )
+            if r.status_code == 200:
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+    else:
+        raise RuntimeError(f"[{worker.name}] Mock server not ready after restart")
+
+    # Wait for gateway
+    await _wait_for_gateway(worker.gateway_url, worker.data_dir)
+    print(f"  [{worker.name}] Container ready.")
+
+
 def _slot_objects(objects: list, slot_suffix: str) -> list:
     """Return copies of ObjectDef list with object_id and peer IDs suffixed for a concurrent slot.
 
@@ -490,13 +531,47 @@ async def _configure_openclaw_agents(
         tools_cfg.setdefault("sessions", {})["visibility"] = "all"
         await client.config_mgr.patch(json.dumps(config, indent=2), base_hash=base_hash)
 
-    # The gateway schedules a hot-reload ~2s after a config patch.  Sleeping
-    # here lets that restart begin before we start polling — without the sleep,
-    # _wait_for_gateway immediately reconnects to the still-running gateway
-    # (before the restart fires) and returns, so the restart fires mid-run.
-    await asyncio.sleep(4.0)
-    await _wait_for_gateway(gateway_url, openclaw_home)
+    # The gateway schedules a hot-reload ~2s after a config patch.  Wait for
+    # the connection to DROP (confirming the restart began) before polling for
+    # readiness — this avoids the race where _wait_for_gateway reconnects to
+    # the still-running old process before the restart fires.
+    await _wait_for_gateway_restart(gateway_url, openclaw_home)
     return provider
+
+
+async def _wait_for_gateway_restart(
+    gateway_url: Optional[str] = None,
+    openclaw_home: Optional[Path] = None,
+    drop_timeout_s: float = 10.0,
+    ready_timeout_s: float = 30.0,
+) -> None:
+    """Wait for a gateway restart to complete: first wait for the connection to
+    drop (confirming the old process exited), then wait for the new process to
+    accept connections.
+
+    This avoids the race in a plain _wait_for_gateway call: without waiting for
+    the drop, the poll immediately reconnects to the still-running old process,
+    returns success, and the restart fires mid-run.
+    """
+    from openclaw_sdk import OpenClawClient
+    import time as _time
+
+    kwargs = _openclaw_connect_kwargs(gateway_url, openclaw_home)
+
+    # Phase 1 — wait for the connection to drop (restart began)
+    deadline = _time.monotonic() + drop_timeout_s
+    while _time.monotonic() < deadline:
+        try:
+            async with await OpenClawClient.connect(**kwargs) as client:
+                await client.config_mgr.get()
+            # Still up — keep polling
+            await asyncio.sleep(0.5)
+        except Exception:
+            # Connection refused / dropped — restart has begun
+            break
+
+    # Phase 2 — wait for the new process to be ready
+    await _wait_for_gateway(gateway_url, openclaw_home, timeout_s=ready_timeout_s)
 
 
 async def _wait_for_gateway(
@@ -1246,8 +1321,9 @@ async def _run_all_tcs_concurrent(
 
     Pool mode (workers != None): each slot is a dedicated Docker container with
     its own isolated gateway and mock server.  No slot_suffix needed — containers
-    are already isolated.  Agent export and configure happen lazily on first use
-    of each worker so gateway restarts are staggered across workers.
+    are already isolated.  The container is restarted before each TC to guarantee
+    a clean gateway (no cached agent state), then agents are exported and
+    configured fresh on every run.
     """
     concurrency = len(workers) if workers else getattr(args, "concurrency", 1)
     sem = asyncio.Semaphore(concurrency)
@@ -1279,7 +1355,16 @@ async def _run_all_tcs_concurrent(
                     slot_mock_server = mock_server
                     slot_suffix = "" if slot == 0 else f"-c{slot}"
 
-                # ── Lazy export + configure (pool mode only; standard pre-exports) ──
+                # ── Pool mode: restart container before each TC for clean state ──
+                # The gateway caches agent state in memory; a restart guarantees
+                # a fresh process.  The entrypoint re-writes openclaw.json from
+                # the template on startup, so we clear seen_exports to force
+                # re-export and re-configure of agents after the restart.
+                if workers:
+                    await _restart_worker(worker)
+                    seen_exports_per_slot[slot].clear()
+
+                # ── Export + configure (pool mode: always after restart; standard: lazy) ──
                 if workers and tc.sample_id not in seen_exports_per_slot[slot]:
                     seen_exports_per_slot[slot].add(tc.sample_id)
                     agent_model = getattr(args, "model", None) or "gpt-4o"
@@ -1321,28 +1406,19 @@ async def _run_all_tcs_concurrent(
                     }
 
                 for run_idx in range(args.runs):
-                    # Clear agent session transcripts AND state.md before each run.
-                    #
-                    # Session transcript bleed: _global_counter resets to 0 each time
-                    # the script is invoked, so the first run always uses session name
-                    # "eval-ma-1". If a previous invocation wrote a transcript for that
-                    # name, the gateway reuses it — loading old conversation history
-                    # (stale captures, "Slack paused" directives, etc.).  Clearing ALL
-                    # sessions for each agent ensures a genuinely fresh start.
-                    #
-                    # State.md bleed: the gateway caches state.md in memory after
-                    # agent registration. Deleting state.md here ensures the on-disk
-                    # file is clean before _execute_tc_async's reset_agent_state
-                    # writes the authoritative initial state, and before the agent
-                    # re-reads it at session start.
-                    agent_ids = (
-                        [single_agent_id] if single_agent_id
-                        else [f"{obj.object_id}{slot_suffix}" for obj in tc.objects]
-                    )
-                    for aid in agent_ids:
-                        _clear_agent_sessions(aid, slot_openclaw_home)
-                        state_file = slot_openclaw_home / f"workspace-{aid}" / "state.md"
-                        state_file.unlink(missing_ok=True)
+                    # In pool mode the container was restarted before this TC,
+                    # so the gateway is already clean.  In standard (non-pool)
+                    # mode clear session transcripts and state.md to prevent
+                    # bleed from previous runs on the shared local gateway.
+                    if not workers:
+                        agent_ids = (
+                            [single_agent_id] if single_agent_id
+                            else [f"{obj.object_id}{slot_suffix}" for obj in tc.objects]
+                        )
+                        for aid in agent_ids:
+                            _clear_agent_sessions(aid, slot_openclaw_home)
+                            state_file = slot_openclaw_home / f"workspace-{aid}" / "state.md"
+                            state_file.unlink(missing_ok=True)
 
                     event_results, mod_results = await _execute_tc_async(
                         tc, slot_gateway_url, slot_openclaw_home, harness,

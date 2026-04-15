@@ -1,7 +1,12 @@
 #!/bin/bash
 # Entrypoint for the LNL OpenClaw worker container.
 # Starts the OpenClaw gateway and the LNL mock server as sibling processes.
-# Exits (triggering container restart) if either process dies.
+#
+# The gateway performs a full process restart when its config is patched by
+# evaluate_baseline.py (agents.list, agentToAgent, etc.). The monitor loop
+# below detects this and tracks the new PID so the container stays alive
+# across gateway self-restarts. The container only exits if the mock server
+# dies or the gateway dies without spawning a successor.
 set -euo pipefail
 
 # ── Copy plugin into the bind-mount dir (hidden at image build time) ─────────
@@ -30,7 +35,6 @@ cd /app && python3 -m src.data.mock_server \
 MOCK_PID=$!
 
 # Wait for the mock server to be ready before starting the gateway
-# (gateway startup can take a moment; mock server is quick)
 for i in $(seq 1 30); do
     if curl -sf http://localhost:18888/health > /dev/null 2>&1; then
         echo "[entrypoint] Mock server ready."
@@ -40,15 +44,39 @@ for i in $(seq 1 30); do
 done
 
 # ── Start the OpenClaw gateway ────────────────────────────────────────────────
-# Pass auth token via CLI flags so gateway auth works regardless of config file
-# state.  OPENCLAW_GATEWAY_TOKEN is injected by docker-compose from the host env.
 echo "[entrypoint] Starting OpenClaw gateway..."
 openclaw gateway run --auth token --token "${OPENCLAW_GATEWAY_TOKEN}" &
 OC_PID=$!
 
-# ── Monitor both processes — exit if either dies ──────────────────────────────
-wait -n ${MOCK_PID} ${OC_PID}
-EXIT_CODE=$?
-echo "[entrypoint] A child process exited (code ${EXIT_CODE}). Shutting down."
-kill ${MOCK_PID} ${OC_PID} 2>/dev/null || true
-exit ${EXIT_CODE}
+# ── Monitor loop ──────────────────────────────────────────────────────────────
+# The gateway self-restarts (full process fork+exec) when evaluate_baseline.py
+# patches the agent config. The old PID exits with code 0; a new PID takes over.
+# We poll every 2 seconds: if the mock server dies we abort; if the gateway PID
+# is gone we look for a successor and track it.
+echo "[entrypoint] Monitoring mock server (PID ${MOCK_PID}) and gateway (PID ${OC_PID})..."
+while true; do
+    sleep 2
+
+    # Mock server exit → unrecoverable; shut everything down
+    if ! kill -0 "${MOCK_PID}" 2>/dev/null; then
+        wait "${MOCK_PID}" 2>/dev/null || true
+        echo "[entrypoint] Mock server (PID ${MOCK_PID}) exited. Shutting down."
+        kill "${OC_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
+    # Gateway exit → check whether it self-restarted
+    if ! kill -0 "${OC_PID}" 2>/dev/null; then
+        # Give the new process a moment to start
+        sleep 2
+        NEW_PID=$(pgrep -f "openclaw gateway run" | head -1 || true)
+        if [ -n "${NEW_PID}" ]; then
+            echo "[entrypoint] Gateway restarted as PID ${NEW_PID} (was ${OC_PID})."
+            OC_PID="${NEW_PID}"
+        else
+            echo "[entrypoint] Gateway (PID ${OC_PID}) exited without restart. Shutting down."
+            kill "${MOCK_PID}" 2>/dev/null || true
+            exit 1
+        fi
+    fi
+done

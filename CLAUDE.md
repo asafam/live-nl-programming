@@ -32,8 +32,18 @@ python -m src.data.pipeline -i data/zapier/raw/templates.yaml --target-dir outpu
 python -m src.data.pipeline --samples outputs/data/zapier/templates_samples_object.jsonl  # skip stage 1 explicitly
 
 # Evaluation — see EVALUATION.md for full details
+# Convenience scripts (activate venv, run, write log to logs/evaluate/<results-name>.log):
+./scripts/run-eval.sh -i outputs/data/zapier/20260411_zapier_clean/test_cases.jsonl --model gpt-4o --runs 1
+./scripts/run-eval-baseline.sh -i outputs/data/zapier/20260411_zapier_clean/test_cases.jsonl --model gpt-4o --runs 1
+./scripts/run-eval-baseline.sh -i outputs/data/zapier/20260411_zapier_clean/test_cases.jsonl --pool docker/worker-pool.yaml --model gpt-4o --runs 1
+
+# Or invoke directly:
 python -m src.data.evaluate -i outputs/data/zapier/20260322_120000/test_cases.jsonl --runs 3
 python -m src.data.evaluate_baseline -i outputs/data/zapier/20260322_010211/test_cases.jsonl --runs 3
+
+# Docker pool — start before running baseline with --pool:
+./docker/start-pool.sh       # start (reads operator token automatically)
+./docker/start-pool.sh down  # stop
 ```
 
 ## Architecture
