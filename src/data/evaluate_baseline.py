@@ -836,26 +836,20 @@ async def _execute_tc_async(
     mod_results: list[ModificationResult] = partial_mods if partial_mods is not None else []
     prior_context: str = ""
 
-    # Pre-compute peer graph (used by per-event handle setup).
-    obj_peer_ids: dict[str, set[str]] = {
-        obj.object_id: {p.object_id for p in obj.peers}
-        for obj in tc.objects
-    }
-
     async def _make_event_handles(
         client: Any,
-        event_target: str,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         """Create fresh handles + session name for one event.
 
         Each event gets its own unique session name so it starts with a clean
         conversation context.  State persists across events via state.md files;
-        session history does NOT carry over (which would cause locked sessions
-        and confirmation-seeking carry-over from the previous event).
+        session history does NOT carry over (which prevents locked sessions and
+        stale context from a previous event polluting the current one).
 
-        Leaf agents (no peers) are pre-warmed so they're registered before the
-        entry agent's agentToAgent calls reach them.  Intermediate agents are
-        NOT pre-warmed — an init ping puts them in a chatbot state.
+        No pre-warming: OpenClaw auto-registers sessions when sessions_send is
+        called, so peer agents come up on demand without an init ping.
+        Pre-warming caused problems: init pings triggered agents to attempt
+        tool calls (with our executor-focused SOUL.md), causing timeouts.
         """
         OpenClawAgent._global_counter += 1
         sname = f"eval-ma-{OpenClawAgent._global_counter}"
@@ -867,19 +861,6 @@ async def _execute_tc_async(
             agent_id = f"{obj.object_id}{slot_suffix}"
             ev_session_names[obj.object_id] = sname
             ev_handles[obj.object_id] = client.get_agent(agent_id, session_name=sname)
-
-        # Pre-warm leaf agents (no peers) only.
-        leaf_handles = {
-            oid: h for oid, h in ev_handles.items()
-            if oid != event_target and not obj_peer_ids.get(oid)
-        }
-        init_msg = (
-            "[System]: Session initialisation ping — acknowledge with 'ready' only. "
-            "Do NOT call any tools or peers."
-        )
-        if leaf_handles:
-            tasks = [h.execute(init_msg) for h in leaf_handles.values()]
-            await asyncio.gather(*tasks, return_exceptions=True)
 
         return ev_handles, ev_session_names
 
@@ -902,7 +883,7 @@ async def _execute_tc_async(
             # Multi-agent: fresh handles per event so each trigger starts with a
             # clean session.  (Single-agent reuses the same handle throughout.)
             if not single_agent_id:
-                handles, session_names = await _make_event_handles(client, target_id)
+                handles, session_names = await _make_event_handles(client)
 
             lookup_id = single_agent_id if single_agent_id else target_id
             handle = handles.get(lookup_id)
