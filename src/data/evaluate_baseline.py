@@ -1002,6 +1002,7 @@ async def _execute_tc_async(
                     print(f"  State: {post_event_state[:200]}")
 
             if msg["kind"] == "step":
+                step_id = f"S{msg['index']+1:03d}"
                 expect = msg["expect"]
                 if expect is not None:
                     evidence = gather_evidence(
@@ -1011,11 +1012,12 @@ async def _execute_tc_async(
                     )
                     passed, reasoning, _votes, _in_tok, _out_tok = harness.evaluate_assertion(
                         expect.action, evidence, prior_context)
+                    print(f"    {step_id} {'✓' if passed else '✗'} {latency_ms/1000:.1f}s  {reasoning[:120]}", flush=True)
                     if verbose:
                         print(f"  Expected: {expect.action}")
                         print(f"  {'✓ PASS' if passed else '✗ FAIL'}: {reasoning[:200]}")
                     event_results.append(EventResult(
-                        event_id=f"S{msg['index']+1:03d}",
+                        event_id=step_id,
                         passed=passed, reasoning=reasoning,
                         expected=expect.action, evidence=evidence,
                         prior_context=prior_context, latency_ms=latency_ms,
@@ -1025,7 +1027,7 @@ async def _execute_tc_async(
             elif msg["kind"] == "mod":
                 mod = msg["item"]
                 tag = f"{mod.mod_type.value}/{mod.ambiguity.value}"
-                print(f"\n  ── [{tag}] {mod.id}: {mod.intent[:70]}", flush=True)
+                print(f"    ── [{tag}] {mod.id} {latency_ms/1000:.1f}s  {mod.intent[:70]}", flush=True)
                 mod_results.append(ModificationResult(mod_id=mod.id, latency_ms=latency_ms))
                 prior_context = _read_prior_context(tc, openclaw_home, single_agent_id)
 
@@ -1039,6 +1041,7 @@ async def _execute_tc_async(
                     )
                     passed, reasoning, _votes, _in_tok, _out_tok = harness.evaluate_assertion(
                         item.expect.action, evidence, prior_context)
+                    print(f"    {item.id} {'✓' if passed else '✗'} {latency_ms/1000:.1f}s  {reasoning[:120]}", flush=True)
                     if verbose:
                         print(f"  Expected: {item.expect.action}")
                         print(f"  {'✓ PASS' if passed else '✗ FAIL'}: {reasoning[:200]}")
@@ -1432,6 +1435,9 @@ async def _run_all_tcs_concurrent(
                             state_file = slot_openclaw_home / f"workspace-{aid}" / "state.md"
                             state_file.unlink(missing_ok=True)
 
+                    mod_type_str = tc.modifications[0].mod_type.value if tc.modifications else "none"
+                    print(f"\n  {tc.id}[{mod_type_str}] run={run_idx} [slot={slot}]", flush=True)
+                    tc_t0 = time.time()
                     event_results, mod_results = await _execute_tc_async(
                         tc, slot_gateway_url, slot_openclaw_home, harness,
                         slot_mock_server,
@@ -1441,6 +1447,7 @@ async def _run_all_tcs_concurrent(
                         None, None,
                         slot_suffix=slot_suffix,
                     )
+                    tc_elapsed_ms = (time.time() - tc_t0) * 1000
                     pass_rate = (
                         sum(1 for e in event_results if e.passed) / len(event_results)
                         if event_results else None
@@ -1455,6 +1462,7 @@ async def _run_all_tcs_concurrent(
                         events=event_results,
                         modifications=mod_results,
                         pass_rate=pass_rate,
+                        elapsed_ms=tc_elapsed_ms,
                     )
                     async with results_lock:
                         all_tc_results.append(tc_result)
@@ -1463,9 +1471,7 @@ async def _run_all_tcs_concurrent(
                         passed_n = sum(1 for e in event_results if e.passed)
                         total_n = len(event_results)
                         rate_str = f"{pass_rate:.0%}" if pass_rate is not None else "N/A"
-                        mod_type_str = tc.modifications[0].mod_type.value if tc.modifications else "none"
-                        print(f"  {tc.id}[{mod_type_str}] run={run_idx} [slot={slot}] "
-                              f"pass={passed_n}/{total_n} ({rate_str})")
+                        print(f"  → pass={passed_n}/{total_n} ({rate_str})  elapsed={tc_elapsed_ms/1000:.1f}s")
             except Exception as exc:
                 async with results_lock:
                     print(f"  TC {tc.id} [slot={slot}] FAILED: {exc}", file=sys.stderr)

@@ -303,6 +303,7 @@ class TestCaseResult(BaseModel):
     events: list[EventResult]
     modifications: list[ModificationResult]
     pass_rate: Optional[float]  # passed_events / total_events; None if no evaluable events
+    elapsed_ms: Optional[float] = None  # wall-clock time for the entire TC run in milliseconds
 
 class EvalSummary(BaseModel):
     """Aggregate metrics across all test cases and runs."""

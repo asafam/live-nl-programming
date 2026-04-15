@@ -950,11 +950,11 @@ def run(args: argparse.Namespace) -> Path:
 
         def _on_event_result(result: EventResult, is_step: bool, _args=args):
             tag = " (baseline)" if is_step else ""
+            lat = f"  {result.latency_ms/1000:.1f}s" if result.latency_ms else ""
             if not result.passed:
-                tc_log.append(f"  [FAIL] {result.event_id}{tag}: {result.expected[:70]}")
-                tc_log.append(f"         → {result.reasoning[:120]}")
-            elif getattr(_args, "verbose", False):
-                tc_log.append(f"  [PASS] {result.event_id}{tag}: {result.expected[:70]}")
+                tc_log.append(f"  {'✗'} {result.event_id}{tag}{lat}: {result.reasoning[:120]}")
+            else:
+                tc_log.append(f"  {'✓'} {result.event_id}{tag}{lat}: {result.reasoning[:80]}")
 
         def _on_mod_applied(mod, _tc=tc):
             tc_log.append(
@@ -998,6 +998,7 @@ def run(args: argparse.Namespace) -> Path:
             sum(1 for e in event_results if e.passed) / len(event_results)
             if event_results else None
         )
+        elapsed_s = int(time.monotonic() - tc_start)
         result = TestCaseResult(
             tc_id=tc.id,
             sample_id=tc.sample_id,
@@ -1009,14 +1010,14 @@ def run(args: argparse.Namespace) -> Path:
             events=event_results,
             modifications=mod_results,
             pass_rate=pass_rate,
+            elapsed_ms=elapsed_s * 1000.0,
         )
         passed_n = sum(1 for e in event_results if e.passed)
         total_n = len(event_results)
         rate_str = f"{pass_rate:.0%}" if pass_rate is not None else "N/A"
-        elapsed_s = int(time.monotonic() - tc_start)
         elapsed_str = f"{elapsed_s // 60:02d}:{elapsed_s % 60:02d}"
 
-        parts = [f"  → pass={passed_n}/{total_n} ({rate_str})  {elapsed_str}"]
+        parts = [f"  → pass={passed_n}/{total_n} ({rate_str})  elapsed={elapsed_str}"]
         detail = format_tc_event_detail(event_results)
         if detail:
             parts.append(f"     {detail}")
