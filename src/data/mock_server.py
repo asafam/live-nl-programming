@@ -74,7 +74,11 @@ _ORCHESTRATION_DIR = _MOCKS_DIR / "orchestration"
 
 
 def resolve_mock_configs(tc: TestCase) -> Optional[MockScript]:
-    """Scan a TestCase's object skills and event_sources for known system keywords.
+    """Scan a TestCase's object fields for known system keywords.
+
+    Scans skills, event_sources, behavior, and role so that systems referenced
+    only in free-text behavior descriptions (e.g. "store in Zapier Table",
+    "post to Slack channel") are included in the mock script.
 
     Returns a merged MockScript if any matching config files exist, else None.
     """
@@ -84,6 +88,10 @@ def resolve_mock_configs(tc: TestCase) -> Optional[MockScript]:
     for obj in tc.objects:
         all_text.extend(obj.skills)
         all_text.extend(obj.event_sources)
+        if obj.behavior:
+            all_text.append(obj.behavior)
+        if obj.role:
+            all_text.append(obj.role)
 
     combined = " ".join(all_text).lower()
 

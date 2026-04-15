@@ -113,14 +113,15 @@ def _agents_md(obj: ObjectDefinition, session_name: str = "main") -> str:
         peers_block = "\n".join(f"- **{p.object_id}**: {p.relationship}" for p in obj.peers)
         peer_ids = [p.object_id for p in obj.peers]
         peer_examples = "\n".join(
-            f'  - To message `{pid}`: `sessions_send(sessionKey="agent:{pid}:{session_name}", message="<your message>", timeoutSeconds=120)`'
+            f'  - To message `{pid}`: `sessions_send(sessionKey="agent:{pid}:{session_name}", message="<your message>", timeoutSeconds=240)`'
             for pid in peer_ids
         )
         comm_section = (
             f"## Communication\n\n"
             f"To send a message to a peer agent, use the `sessions_send` tool with the exact sessionKey below.\n"
             f"**Do NOT use the `message` tool** — that is for external channels (Slack, email, etc.).\n"
-            f"Always include `timeoutSeconds=120` so the peer has enough time to complete tool calls.\n\n"
+            f"**ALWAYS include `timeoutSeconds=240`** — peers may need to make multiple tool calls and\n"
+            f"send messages to their own downstream peers before responding. Never omit this parameter.\n\n"
             f"Exact calls for each peer:\n\n"
             f"{peer_examples}\n\n"
             f"Use external tools (e.g. `slack_send_message`, `zapier_tables_create_record`) "

@@ -464,9 +464,7 @@ async def _configure_single_openclaw_agent(
         agents_cfg["list"] = lst
         await client.config_mgr.patch(json.dumps(config, indent=2), base_hash=base_hash)
 
-    # Sleep to let the gateway's delayed restart (default ~2s) begin before polling.
-    await asyncio.sleep(4.0)
-    await _wait_for_gateway(gateway_url, openclaw_home)
+    await _wait_for_gateway_restart(gateway_url, openclaw_home)
     return provider
 
 
@@ -868,20 +866,34 @@ async def _execute_tc_async(
             # execute().  The entry-point agent (first step's target) doesn't need
             # pre-warming — its session registers on S001.  Its PEERS do: if they're
             # not registered yet when the entry agent calls sessions_send, the call
-            # blocks for 120 s.  Warming peers only (concurrently) avoids the nested
-            # sessions_send race that a full concurrent pre-warm would cause.
+            # blocks for up to the timeoutSeconds.
+            #
+            # Ordering: warm LEAF agents first (no peers), then INTERMEDIATE agents.
+            # If we warm intermediate agents and leaf agents concurrently, the
+            # intermediate agent may interpret the init ping as a real task and try
+            # to call its (not-yet-warmed) leaf peers, creating a slow nested chain
+            # that leaves the intermediate session busy when the real message arrives.
+            # Warming leaves first ensures peers are registered when intermediates warm.
+            obj_peer_ids: dict[str, set[str]] = {
+                obj.object_id: {p.object_id for p in obj.peers}
+                for obj in tc.objects
+            }
             entry_target = messages[0]["target"] if messages else None
-            peer_handles = {
+            all_non_entry = {
                 obj_id: handle
                 for obj_id, handle in handles.items()
                 if obj_id != entry_target
             }
-            if peer_handles:
-                init_tasks = [
-                    handle.execute("[System]: Session initialisation ping — please acknowledge briefly.")
-                    for handle in peer_handles.values()
-                ]
-                await asyncio.gather(*init_tasks, return_exceptions=True)
+            leaf_handles = {oid: h for oid, h in all_non_entry.items() if not obj_peer_ids.get(oid)}
+            intermediate_handles = {oid: h for oid, h in all_non_entry.items() if obj_peer_ids.get(oid)}
+
+            init_msg = "[System]: Session initialisation ping — acknowledge with 'ready' only. Do NOT call any tools or peers."
+            if leaf_handles:
+                leaf_tasks = [h.execute(init_msg) for h in leaf_handles.values()]
+                await asyncio.gather(*leaf_tasks, return_exceptions=True)
+            if intermediate_handles:
+                inter_tasks = [h.execute(init_msg) for h in intermediate_handles.values()]
+                await asyncio.gather(*inter_tasks, return_exceptions=True)
 
         for msg in messages:
             if steps_only and msg["kind"] != "step":
