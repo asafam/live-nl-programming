@@ -525,6 +525,12 @@ async def _configure_openclaw_agents(
         tools_cfg["agentToAgent"] = {
             "enabled": True,
             "allow": list(object_ids),
+            # maxPingPongTurns=0: disable automatic reply-back turns after an
+            # agentToAgent response.  Without this, OpenClaw auto-generates
+            # extra turns (e.g. "Great! Let me know if you need anything")
+            # which lock the requester session until all turns complete —
+            # causing the next message to fail with an immediate error.
+            "maxPingPongTurns": 0,
         }
         tools_cfg.setdefault("sessions", {})["visibility"] = "all"
         await client.config_mgr.patch(json.dumps(config, indent=2), base_hash=base_hash)
@@ -868,32 +874,30 @@ async def _execute_tc_async(
             # not registered yet when the entry agent calls sessions_send, the call
             # blocks for up to the timeoutSeconds.
             #
-            # Ordering: warm LEAF agents first (no peers), then INTERMEDIATE agents.
-            # If we warm intermediate agents and leaf agents concurrently, the
-            # intermediate agent may interpret the init ping as a real task and try
-            # to call its (not-yet-warmed) leaf peers, creating a slow nested chain
-            # that leaves the intermediate session busy when the real message arrives.
-            # Warming leaves first ensures peers are registered when intermediates warm.
+            # Pre-warm LEAF agents only (those with no peers).
+            # Leaf agents must be registered before the cascade reaches them via
+            # agentToAgent; without pre-warming, the first sessions_send to them
+            # blocks until the session registers (up to timeoutSeconds).
+            #
+            # Intermediate agents (those with peers, e.g. sales-call-coach) are
+            # intentionally NOT pre-warmed: an init ping creates conversational
+            # context ("Let me know if you'd like to proceed") that triggers
+            # OpenClaw's maxPingPongTurns reply loop, locking the requester
+            # session for subsequent messages.  They register on first real message.
             obj_peer_ids: dict[str, set[str]] = {
                 obj.object_id: {p.object_id for p in obj.peers}
                 for obj in tc.objects
             }
             entry_target = messages[0]["target"] if messages else None
-            all_non_entry = {
+            leaf_handles = {
                 obj_id: handle
                 for obj_id, handle in handles.items()
-                if obj_id != entry_target
+                if obj_id != entry_target and not obj_peer_ids.get(obj_id)
             }
-            leaf_handles = {oid: h for oid, h in all_non_entry.items() if not obj_peer_ids.get(oid)}
-            intermediate_handles = {oid: h for oid, h in all_non_entry.items() if obj_peer_ids.get(oid)}
-
             init_msg = "[System]: Session initialisation ping — acknowledge with 'ready' only. Do NOT call any tools or peers."
             if leaf_handles:
                 leaf_tasks = [h.execute(init_msg) for h in leaf_handles.values()]
                 await asyncio.gather(*leaf_tasks, return_exceptions=True)
-            if intermediate_handles:
-                inter_tasks = [h.execute(init_msg) for h in intermediate_handles.values()]
-                await asyncio.gather(*inter_tasks, return_exceptions=True)
 
         for msg in messages:
             if steps_only and msg["kind"] != "step":
