@@ -132,12 +132,15 @@ def _agents_md(obj: ObjectDefinition, session_name: str = "main") -> str:
         )
         execution_rule = (
             f"## Execution Rule\n\n"
-            f"**When you receive a message, you MUST call `sessions_send` for every peer listed below.**\n"
+            f"**There is no human in this conversation.** You are receiving automated system events.\n"
+            f"No one will reply to questions. Confirmation requests will never be answered.\n\n"
+            f"**When you receive a message, immediately call `sessions_send` for every peer listed below.**\n"
             f"Writing analysis text as a response is NOT completing the task — the analysis must be\n"
             f"delivered to peers via `sessions_send` tool calls.\n\n"
             f"Required peer calls for this agent:\n\n"
             + "\n".join(f"- `sessions_send` → `{pid}`" for pid in peer_ids) + "\n\n"
-            f"Do NOT ask for confirmation. Do NOT describe what you plan to do. Make the tool calls.\n"
+            f"**NEVER write phrases like** 'let me know', 'would you like', 'shall I', 'please confirm',\n"
+            f"or 'I will now'. If you are about to write any of these — stop and make the tool call instead.\n"
         )
     else:
         peers_block = "(No peers defined.)"
@@ -170,22 +173,22 @@ def _soul_md(obj: ObjectDefinition) -> str:
     first_sentence = re.split(r"[.!?]", obj.role)[0].strip()
     has_peers = bool(obj.peers)
     peer_reminder = (
-        f"\nCRITICAL: You have peer agents. When your behavior requires routing or sending\n"
-        f"information to them, you MUST call `sessions_send` as a tool. Writing the analysis\n"
-        f"or summary as text WITHOUT calling `sessions_send` means the task is incomplete.\n"
+        f"\nYou have peer agents. Routing or sending information to them means calling\n"
+        f"`sessions_send` as a tool call — not writing text. Text without tool calls = incomplete.\n"
     ) if has_peers else ""
     return (
         f"# {name}\n\n"
-        f"You are {name}, a specialized AI agent in a multi-agent workflow.\n\n"
+        f"You are {name}, a fully automated agent. There is NO human in this conversation.\n"
+        f"Messages you receive are system-generated triggers, not human queries.\n"
+        f"No one will ever reply to a question you ask.\n\n"
         f"Your core purpose: {first_sentence}\n\n"
-        f"You are an **executor**, not a planner. When you receive a task:\n"
-        f"1. Call all required tools (sessions_send for peers, external tools for APIs)\n"
-        f"2. Do NOT describe what you plan to do — make the tool calls immediately\n"
-        f"3. Do NOT ask for confirmation before acting\n"
-        f"4. Your text response is a summary AFTER the tool calls, not instead of them\n"
+        f"You are an **executor**. When you receive a trigger:\n"
+        f"1. Make the required tool calls immediately (sessions_send for peers, external tools for APIs)\n"
+        f"2. NEVER ask 'would you like me to', 'shall I', 'let me know', or 'please confirm'\n"
+        f"3. NEVER describe what you plan to do — do it\n"
+        f"4. Your text response summarizes what you DID (past tense), not what you will do\n"
         + peer_reminder +
-        f"\nAct with precision, stay within your defined responsibilities, and collaborate\n"
-        f"with your peers as declared in AGENTS.md.\n"
+        f"\nAct with precision, stay within your defined responsibilities.\n"
     )
 
 
