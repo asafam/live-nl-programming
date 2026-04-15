@@ -90,7 +90,7 @@ class TestChainProcessing:
         brain.script("b", LLMResponse(
             updated_state={"status": "b got it"},
             reply="B reply",
-            outgoing_messages=[OutgoingMessage(recipient="c", content="from B")],
+            outgoing_messages=[OutgoingMessage(recipient="c", content="from B", expects_reply=True)],
         ))
         brain.script("c", LLMResponse(
             updated_state={"status": "c got it"},
@@ -146,8 +146,8 @@ class TestChainProcessing:
             updated_state={"status": "a done"},
             reply="A reply",
             outgoing_messages=[
-                OutgoingMessage(recipient="b", content="from A"),
-                OutgoingMessage(recipient="c", content="from A"),
+                OutgoingMessage(recipient="b", content="from A", expects_reply=True),
+                OutgoingMessage(recipient="c", content="from A", expects_reply=True),
             ],
         ))
         brain.script("b", LLMResponse(
@@ -202,7 +202,7 @@ class TestInjectEvent:
         brain.script("slack", LLMResponse(
             updated_state={"status": "forwarded"},
             reply="forwarding",
-            outgoing_messages=[OutgoingMessage(recipient="triage", content="urgent ticket")],
+            outgoing_messages=[OutgoingMessage(recipient="triage", content="urgent ticket", expects_reply=True)],
         ))
         brain.script("triage", LLMResponse(
             updated_state={"status": "triaged"},
@@ -380,7 +380,7 @@ class TestEventSources:
         brain.script("slack", LLMResponse(
             updated_state={"status": "forwarded"},
             reply="forwarding",
-            outgoing_messages=[OutgoingMessage(recipient="triage", content="urgent ticket")],
+            outgoing_messages=[OutgoingMessage(recipient="triage", content="urgent ticket", expects_reply=True)],
         ))
         brain.script("triage", LLMResponse(
             updated_state={"status": "triaged"}, reply="handled",
@@ -458,7 +458,7 @@ class TestLiveMode:
         brain = MockBrain()
         brain.script("a", LLMResponse(
             updated_state={"status": "a done"}, reply="A",
-            outgoing_messages=[OutgoingMessage(recipient="b", content="from A")],
+            outgoing_messages=[OutgoingMessage(recipient="b", content="from A", expects_reply=True)],
         ))
         brain.script("b", LLMResponse(updated_state={"status": "b done"}, reply="B"))
         rt = Runtime(brain)

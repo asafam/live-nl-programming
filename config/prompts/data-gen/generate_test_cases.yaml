@@ -67,9 +67,9 @@ user_prompt: |
   `source`: `"__external__"` for system-originated events, `"__user__"` for user messages.
 
   Each test case may include:
-  - **Before events**: Trigger the SAME logic the modification will change. Shows "before" behavior.
-  - **After events**: Same type of external trigger, but now the modification applies. Shows "after" behavior.
-  - **Unrelated events**: A different external trigger that exercises logic unaffected by the modification.
+  - **Before events** (`role: pre_mod`): Trigger the SAME logic the modification will change. Shows "before" behavior.
+  - **After events** (`role: post_mod`): Same type of external trigger, but now the modification applies. Shows "after" behavior.
+  - **Unrelated events** (`role: irrelevant`): A different external trigger that exercises logic unaffected by the modification.
   - If multiple modifications: events between modifications to test intermediate states.
 
   Focus on writing high-quality `input` values — realistic external triggers that carry enough
@@ -103,6 +103,11 @@ user_prompt: |
   of those conditions. A partial trigger that satisfies only some conditions will cause the system
   to correctly wait or block — making the test case unresolvable.
 
+  Each event must include a `role` field that classifies it relative to the modification:
+  - `pre_mod`: fires **before** the modification; tests that baseline behavior is unaffected
+  - `post_mod`: fires **after** the modification; tests that the system correctly reflects the change
+  - `irrelevant`: fires at any time; tests functionality **unrelated** to the modification
+
   ```yaml
   events:
     - id: "E001"
@@ -110,14 +115,23 @@ user_prompt: |
       source: "__external__"
       recipient: "<entry-point object from sample>"
       when: "W02-1T09:00"
+      role: "pre_mod"
       input: "<external trigger content matching the sample's step pattern>"
     - id: "E002"
       call_type: "send_event"
       source: "__external__"
       recipient: "<entry-point object from sample>"
       when: "W02-2T10:00"
+      role: "post_mod"
       input: "<another external trigger>"
       triggered_by: "E001"   # optional: E001 causes E002 to fire
+    - id: "E003"
+      call_type: "send_event"
+      source: "__external__"
+      recipient: "<entry-point object from sample>"
+      when: "W02-3T11:00"
+      role: "irrelevant"
+      input: "<trigger that exercises logic unaffected by the modification>"
   ```
 
   **`triggered_by` constraint:** If an event is triggered as a downstream consequence of another

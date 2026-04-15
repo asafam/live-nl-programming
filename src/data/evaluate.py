@@ -34,14 +34,40 @@ from tqdm import tqdm
 
 load_dotenv()
 
+# ── Version ───────────────────────────────────────────────────────────────────
+
+def _build_version() -> str:
+    """Dynamic version string: git commit timestamp + short hash + '+dirty' if uncommitted changes."""
+    import subprocess as _sp
+    try:
+        ts = _sp.check_output(
+            ["git", "log", "-1", "--format=%cd", "--date=format:%Y%m%d_%H%M%S"],
+            stderr=_sp.DEVNULL, text=True
+        ).strip()
+        sha = _sp.check_output(
+            ["git", "log", "-1", "--format=%h"],
+            stderr=_sp.DEVNULL, text=True
+        ).strip()
+        dirty = _sp.call(
+            ["git", "diff", "--quiet", "HEAD"],
+            stderr=_sp.DEVNULL
+        ) != 0
+        base = f"{ts}_{sha}" if ts and sha else "unknown"
+        return f"{base}+dirty" if dirty else base
+    except Exception:
+        import os
+        mtime = os.path.getmtime(__file__)
+        from datetime import datetime
+        return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
+
+_VERSION: str = _build_version()
+
 from src.data.schema import (
     EvalSummary,
     EventResult,
     MockConfig,
     MockToolDef,
     ModificationResult,
-    RawEventData,
-    RawTestCaseResult,
     RunConfig,
     TestCase,
     TestCaseResult,
@@ -49,6 +75,7 @@ from src.data.schema import (
 )
 from src.data.utils import (
     add_common_args,
+    format_tc_event_detail,
     infer_provider,
     load_jsonl,
     print_run_info,
@@ -114,7 +141,6 @@ class StepsSnapshot:
     tool_call_counts: dict[str, int]        # tool_name → _call_count after steps
     tool_call_logs: dict[str, list]         # tool_name → call_log after steps
     step_event_results: list               # EventResult list for steps (reused verbatim)
-    step_raw_events: list                  # RawEventData list for steps (replayed)
     prior_context: str                     # _format_prior_state after steps
 
 
@@ -122,7 +148,6 @@ def _take_snapshot(
     rt,
     mock_executors: list,
     step_event_results: list,
-    step_raw_events: list,
     prior_context: str,
 ) -> StepsSnapshot:
     """Capture runtime state after steps complete."""
@@ -149,7 +174,6 @@ def _take_snapshot(
         tool_call_counts=tool_counts,
         tool_call_logs=tool_logs,
         step_event_results=list(step_event_results),
-        step_raw_events=list(step_raw_events),
         prior_context=prior_context,
     )
 
@@ -233,7 +257,7 @@ def gather_evidence(
             msg = ml.message
             arrow = "↩" if msg.type.value == "reply" else "→"
             sender = f"[{msg.sender}]" if msg.type.value == "event" else msg.sender
-            lines.append(f"  {sender} {arrow} {msg.recipient} ({msg.type.value}): {msg.content[:200]}")
+            lines.append(f"  {sender} {arrow} {msg.recipient} ({msg.type.value}): {str(msg.content)[:200]}")
         this_event_parts.append("Message bus activity:\n" + "\n".join(lines))
 
     # Replies from the chain triggered by this event
@@ -274,7 +298,7 @@ def gather_evidence(
 def _print_message(msg) -> None:
     """Print a message exchange between LLM-objects."""
     arrow = "↩" if msg.type.value == "reply" else "→"
-    content = msg.content[:120].replace("\n", " ")
+    content = str(msg.content)[:120].replace("\n", " ")
     # Mark external event sources clearly to distinguish from LLM-object IDs
     sender = f"[{msg.sender}]" if msg.type.value == "event" else msg.sender
     tqdm.write(f"      {sender} {arrow} {msg.recipient} ({msg.type.value}): {content}")
@@ -288,6 +312,7 @@ def _execute_test_case_inner(
     timeout_s: Optional[float] = None,
     steps_only: bool = False,
     max_chain_depth: int = 20,
+    max_tool_rounds: int = 10,
     global_mock_tools: "list[MockToolDef] | None" = None,
     progress_callback=None,
     on_event_result=None,
@@ -335,7 +360,9 @@ def _execute_test_case_inner(
     # The evaluator dispatches one event at a time and waits; the background
     # run-loop is not needed and would break _run_with_timeout (ThreadPoolExecutor
     # shutdown(wait=True) hangs when the foreground thread is blocked on item.done).
-    rt = Runtime(brain, tool_registry=tool_registry, max_chain_depth=max_chain_depth)
+    from src.lnl.runtime import SystemConfig
+    sys_cfg = SystemConfig(max_tool_rounds=max_tool_rounds)
+    rt = Runtime(brain, tool_registry=tool_registry, max_chain_depth=max_chain_depth, system_config=sys_cfg)
     if debug_messages and progress_callback:
         rt.set_message_listener(lambda msg: (_print_message(msg), progress_callback(msg)))
     elif debug_messages:
@@ -358,7 +385,6 @@ def _execute_test_case_inner(
         trigger_map=trigger_map,
         on_event_result=on_event_result,
         on_mod_applied=on_mod_applied,
-        on_raw_event=on_raw_event,
     )
 
 
@@ -408,6 +434,7 @@ def _new_tool_calls(mock_executors: list, snapshots: list[int]) -> list[list[dic
     return [ex.call_log[s:] for ex, s in zip(mock_executors, snapshots)]
 
 
+
 def _run_test_case_timeline(
     tc: TestCase,
     rt,
@@ -419,7 +446,6 @@ def _run_test_case_timeline(
     trigger_map: "dict[str, list] | None" = None,
     on_event_result=None,   # callable(EventResult, is_step: bool)
     on_mod_applied=None,    # callable(Modification)
-    on_raw_event=None,      # callable(RawEventData) — fired before judge, for artifact capture
     steps_snapshot: "Optional[StepsSnapshot]" = None,   # restore from this; skip step execution
     snapshot_out: "Optional[list]" = None,              # append StepsSnapshot here after steps
 ) -> tuple[list[EventResult], list[ModificationResult]]:
@@ -436,14 +462,9 @@ def _run_test_case_timeline(
         _restore_snapshot(rt, execs, steps_snapshot)
         event_results.extend(steps_snapshot.step_event_results)
         prior_context = steps_snapshot.prior_context
-        if on_raw_event:
-            for raw in steps_snapshot.step_raw_events:
-                on_raw_event(raw)
         if on_event_result:
             for ev in steps_snapshot.step_event_results:
                 on_event_result(ev, True)
-    else:
-        _step_raw_events: list = []
 
     for i, step in enumerate(tc.steps):
         if steps_snapshot is not None:
@@ -475,29 +496,20 @@ def _run_test_case_timeline(
                 new_calls = _new_tool_calls(execs, exec_snap)
                 evidence = gather_evidence(rt, results, step.target, bus_messages=bus_msgs, tool_calls=new_calls)
                 condition = step.expect.action
-                raw = RawEventData(
+                passed, reasoning, votes, j_in_tok, j_out_tok = harness.evaluate_assertion(condition, evidence, prior_context)
+                event_results.append(EventResult(
                     event_id=f"S{i+1:03d}",
+                    passed=passed,
+                    reasoning=reasoning,
                     expected=condition,
                     evidence=evidence,
                     prior_context=prior_context,
                     input_tokens=in_tok,
                     output_tokens=out_tok,
                     latency_ms=latency_ms,
-                )
-                if snapshot_out is not None:
-                    _step_raw_events.append(raw)
-                if on_raw_event:
-                    on_raw_event(raw)
-                passed, reasoning, votes = harness.evaluate_assertion(condition, evidence, prior_context)
-                event_results.append(EventResult(
-                    event_id=f"S{i+1:03d}",
-                    passed=passed,
-                    reasoning=reasoning,
-                    expected=condition,
-                    input_tokens=in_tok,
-                    output_tokens=out_tok,
-                    latency_ms=latency_ms,
-                    judge_votes=votes if len(votes) > 1 else [],
+                    judge_input_tokens=j_in_tok,
+                    judge_output_tokens=j_out_tok,
+                    judge_votes=votes,
                 ))
                 if on_event_result:
                     on_event_result(event_results[-1], True)
@@ -505,8 +517,7 @@ def _run_test_case_timeline(
 
     # Capture snapshot after steps complete (first TC in a sample group)
     if snapshot_out is not None and steps_snapshot is None:
-        step_results_so_far = [e for e in event_results]
-        snapshot_out.append(_take_snapshot(rt, execs, step_results_so_far, _step_raw_events, prior_context))
+        snapshot_out.append(_take_snapshot(rt, execs, list(event_results), prior_context))
 
     if steps_only:
         return event_results, mod_results
@@ -550,6 +561,8 @@ def _run_test_case_timeline(
                 passed=False,
                 reasoning=f"Timeout after {timeout_s}s",
                 expected=evt.expect.action,
+                prior_context=ctx,
+                role=getattr(evt, "role", None),
                 latency_ms=lat_ms,
             ))
         else:
@@ -558,26 +571,21 @@ def _run_test_case_timeline(
             bus_msgs = rt.message_log[log_snap:]
             new_calls = _new_tool_calls(execs, exec_s)
             evidence = gather_evidence(rt, res, evt.recipient, bus_messages=bus_msgs, tool_calls=new_calls)
-            if on_raw_event:
-                on_raw_event(RawEventData(
-                    event_id=evt.id,
-                    expected=evt.expect.action,
-                    evidence=evidence,
-                    prior_context=ctx,
-                    input_tokens=in_tok,
-                    output_tokens=out_tok,
-                    latency_ms=lat_ms,
-                ))
-            passed, reasoning, votes = harness.evaluate_assertion(evt.expect.action, evidence, ctx)
+            passed, reasoning, votes, j_in_tok, j_out_tok = harness.evaluate_assertion(evt.expect.action, evidence, ctx)
             event_results.append(EventResult(
                 event_id=evt.id,
                 passed=passed,
                 reasoning=reasoning,
                 expected=evt.expect.action,
+                evidence=evidence,
+                prior_context=ctx,
+                role=getattr(evt, "role", None),
                 input_tokens=in_tok,
                 output_tokens=out_tok,
                 latency_ms=lat_ms,
-                judge_votes=votes if len(votes) > 1 else [],
+                judge_input_tokens=j_in_tok,
+                judge_output_tokens=j_out_tok,
+                judge_votes=votes,
             ))
 
     for _, kind, item in timeline:
@@ -631,11 +639,11 @@ def execute_test_case(
     debug_messages: bool = False,
     steps_only: bool = False,
     max_chain_depth: int = 20,
+    max_tool_rounds: int = 10,
     global_mock_tools: "list[MockToolDef] | None" = None,
     progress_callback=None,
     on_event_result=None,
     on_mod_applied=None,
-    on_raw_event=None,
     steps_snapshot: "Optional[StepsSnapshot]" = None,
     snapshot_out: "Optional[list]" = None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
@@ -650,7 +658,6 @@ def execute_test_case(
         progress_callback: Optional callable(msg) invoked on every bus message delivery.
         on_event_result: Optional callable(EventResult, is_step: bool) for real-time display.
         on_mod_applied: Optional callable(Modification) called before each modification runs.
-        on_raw_event: Optional callable(RawEventData) fired before each judge call, for artifact capture.
     """
     return _execute_test_case_inner(
         tc, brain, harness,
@@ -658,11 +665,11 @@ def execute_test_case(
         timeout_s=timeout_s,
         steps_only=steps_only,
         max_chain_depth=max_chain_depth,
+        max_tool_rounds=max_tool_rounds,
         global_mock_tools=global_mock_tools,
         progress_callback=progress_callback,
         on_event_result=on_event_result,
         on_mod_applied=on_mod_applied,
-        on_raw_event=on_raw_event,
         steps_snapshot=steps_snapshot,
         snapshot_out=snapshot_out,
     )
@@ -674,10 +681,6 @@ def default_output_path(input_path: Path) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return input_path.parent / "runs" / f"{input_path.stem}_eval_{ts}.jsonl"
 
-
-def runs_path_from_eval_path(eval_path: Path) -> Path:
-    """Derive the _runs.jsonl artifact path from an _eval.jsonl path."""
-    return eval_path.parent / eval_path.name.replace("_eval_", "_runs_", 1)
 
 
 # ── Verbose output ────────────────────────────────────────────────────────────
@@ -770,6 +773,7 @@ def run(args: argparse.Namespace) -> Path:
 
     timeout_s: Optional[float] = getattr(args, "timeout", None)
 
+    print(f"evaluate {_VERSION}")
     print(f"Loaded {len(test_cases)} test cases from {args.input}")
     # Build judge spec list — --llm-judge takes precedence; fall back to --judge-model / --model.
     # Each spec is "model" or "provider/model".
@@ -910,8 +914,6 @@ def run(args: argparse.Namespace) -> Path:
     _snapshot_events: dict[tuple, threading.Event] = {}
     _snapshot_registry_lock = threading.Lock()
 
-    runs_output = runs_path_from_eval_path(args.output)
-
     def _run_one(tc_idx: int, tc: TestCase, run_idx: int) -> Optional[TestCaseResult]:
         mod_type_str = tc.modifications[0].mod_type.value if tc.modifications else "none"
         label = f"{tc.id}[{mod_type_str}]"
@@ -921,7 +923,6 @@ def run(args: argparse.Namespace) -> Path:
         tqdm.write(f"\n{label}")
         msg_count = [0]
         tc_start = time.monotonic()
-        raw_events: list[RawEventData] = []
 
         # Resolve snapshot for --reuse-steps
         steps_snapshot: Optional[StepsSnapshot] = None
@@ -945,18 +946,18 @@ def run(args: argparse.Namespace) -> Path:
                 with _snapshot_registry_lock:
                     steps_snapshot = _snapshots.get(key)
 
-        def _on_event_result(result: EventResult, is_step: bool, _args=args):
-            status = "PASS" if result.passed else "FAIL"
-            tag = " (baseline)" if is_step else ""
-            tqdm.write(f"  [{status}] {result.event_id}{tag}: {result.expected[:70]}")
-            if not result.passed:
-                tqdm.write(f"         → {result.reasoning[:120]}")
+        tc_log: list[str] = []  # buffered per-TC output, flushed atomically at end
 
-        def _on_raw_event(raw: RawEventData):
-            raw_events.append(raw)
+        def _on_event_result(result: EventResult, is_step: bool, _args=args):
+            tag = " (baseline)" if is_step else ""
+            if not result.passed:
+                tc_log.append(f"  [FAIL] {result.event_id}{tag}: {result.expected[:70]}")
+                tc_log.append(f"         → {result.reasoning[:120]}")
+            elif getattr(_args, "verbose", False):
+                tc_log.append(f"  [PASS] {result.event_id}{tag}: {result.expected[:70]}")
 
         def _on_mod_applied(mod, _tc=tc):
-            tqdm.write(
+            tc_log.append(
                 f"  ── [{mod.mod_type.value}/{mod.ambiguity.value}] {mod.id}: "
                 f"{mod.intent[:70]}"
             )
@@ -969,27 +970,30 @@ def run(args: argparse.Namespace) -> Path:
                 f"{_label}  msgs={_count[0]}  {elapsed:.0f}s", refresh=True
             )
 
-        event_results, mod_results = execute_test_case(
-            tc, brain, harness, timeout_s,
-            debug_messages=getattr(args, "debug_messages", False),
-            steps_only=getattr(args, "steps_only", False),
-            max_chain_depth=args.max_chain_depth,
-            global_mock_tools=global_mock_tools or None,
-            progress_callback=_on_message,
-            on_event_result=_on_event_result,
-            on_mod_applied=_on_mod_applied,
-            on_raw_event=_on_raw_event,
-            steps_snapshot=steps_snapshot,
-            snapshot_out=snapshot_out,
-        )
-
-        # Store completed snapshot and signal waiting workers
-        if reuse_steps and snapshot_out and tc.sample_id:
-            key = (tc.sample_id, run_idx)
-            with _snapshot_registry_lock:
-                if snapshot_out:
-                    _snapshots[key] = snapshot_out[0]
-                _snapshot_events[key].set()
+        try:
+            event_results, mod_results = execute_test_case(
+                tc, brain, harness, timeout_s,
+                debug_messages=getattr(args, "debug_messages", False),
+                steps_only=getattr(args, "steps_only", False),
+                max_chain_depth=args.max_chain_depth,
+                max_tool_rounds=args.max_tool_rounds,
+                global_mock_tools=global_mock_tools or None,
+                progress_callback=_on_message,
+                on_event_result=_on_event_result,
+                on_mod_applied=_on_mod_applied,
+                steps_snapshot=steps_snapshot,
+                snapshot_out=snapshot_out,
+            )
+        finally:
+            # Always store snapshot and signal waiting workers — even on failure —
+            # so consumers are never left waiting on a dead event.
+            if reuse_steps and snapshot_out is not None and tc.sample_id:
+                key = (tc.sample_id, run_idx)
+                with _snapshot_registry_lock:
+                    if snapshot_out:
+                        _snapshots[key] = snapshot_out[0]
+                    if key in _snapshot_events:
+                        _snapshot_events[key].set()
         pass_rate = (
             sum(1 for e in event_results if e.passed) / len(event_results)
             if event_results else None
@@ -1006,24 +1010,18 @@ def run(args: argparse.Namespace) -> Path:
             modifications=mod_results,
             pass_rate=pass_rate,
         )
-        raw_result = RawTestCaseResult(
-            tc_id=tc.id,
-            sample_id=tc.sample_id,
-            tc_index=tc_idx,
-            seed=seed,
-            name=tc.name,
-            domain=tc.domain,
-            run_index=run_idx,
-            events=raw_events,
-            modifications=mod_results,
-        )
         passed_n = sum(1 for e in event_results if e.passed)
         total_n = len(event_results)
         rate_str = f"{pass_rate:.0%}" if pass_rate is not None else "N/A"
-        tqdm.write(f"  → pass={passed_n}/{total_n} ({rate_str})")
-        with write_lock:
-            with open(runs_output, "a") as rf:
-                rf.write(raw_result.model_dump_json() + "\n")
+        elapsed_s = int(time.monotonic() - tc_start)
+        elapsed_str = f"{elapsed_s // 60:02d}:{elapsed_s % 60:02d}"
+
+        parts = [f"  → pass={passed_n}/{total_n} ({rate_str})  {elapsed_str}"]
+        detail = format_tc_event_detail(event_results)
+        if detail:
+            parts.append(f"     {detail}")
+        tc_log.extend(parts)
+        tqdm.write("\n".join([f"\n{tc.id}[{tc.modifications[0].mod_type.value if tc.modifications else ''}]"] + tc_log))
         return result
 
     # Build list of pending (tc_idx, tc, run_idx) tuples
@@ -1037,10 +1035,10 @@ def run(args: argparse.Namespace) -> Path:
 
     is_continuation = bool(completed or completed_legacy)
     run_config = RunConfig(
+        version=_VERSION,
         timestamp=datetime.now().isoformat(),
         input_path=str(args.input),
         output_path=str(args.output),
-        runs_path=str(runs_output),
         model=args.model,
         provider=args.provider,
         judge_model=judge_model,
@@ -1058,42 +1056,80 @@ def run(args: argparse.Namespace) -> Path:
         is_continuation=is_continuation,
     )
 
-    # Initialize runs artifact file (truncate on new run, append on continuation)
-    if not is_continuation:
-        runs_output.parent.mkdir(parents=True, exist_ok=True)
-        runs_output.write_text("")  # create/truncate
-    print(f"Runs:   {runs_output}")
+    # With --reuse-steps, split into two phases to avoid blocking worker threads:
+    # Phase 1 — one TC per (sample_id, run_idx): runs steps, captures snapshot.
+    # Phase 2 — remaining variants: snapshot already ready, skip steps, full parallelism.
+    # Without --reuse-steps (or no sample_ids), a single phase covers all runs.
+    if reuse_steps:
+        seen_keys: set = set()
+        producers: list = []
+        consumers: list = []
+        for item in pending_runs:
+            tc_idx, tc, run_idx = item
+            key = (tc.sample_id or tc.id, run_idx)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                producers.append(item)
+            else:
+                consumers.append(item)
+        run_phases = [("Phase 1/2: steps", producers), ("Phase 2/2: variants", consumers)]
+    else:
+        run_phases = [("", pending_runs)]
 
     with open(args.output, file_mode) as f:
         f.write(run_config.model_dump_json() + "\n")
         f.flush()
         with tqdm(total=total_runs, initial=n_skipped, unit="run", desc="Evaluating") as pbar:
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(_run_one, tc_idx, tc, run_idx): (tc_idx, tc, run_idx)
-                    for tc_idx, tc, run_idx in pending_runs
-                }
-                for future in as_completed(futures):
-                    tc_idx, tc, run_idx = futures[future]
-                    label = f"{tc.id}"
-                    try:
-                        tc_result = future.result()
-                        with write_lock:
-                            f.write(tc_result.model_dump_json() + "\n")
-                            f.flush()
-                            all_tc_results.append(tc_result)
-                    except Exception as e:
-                        tqdm.write(f"FAILED {label} run={run_idx}: {e}", file=sys.stderr)
-                    pbar.update(1)
+                for phase_label, phase_runs in run_phases:
+                    if not phase_runs:
+                        continue
+                    if phase_label and any(p[1] for p in run_phases if p[0] != phase_label):
+                        tqdm.write(f"\n── {phase_label} ({len(phase_runs)} runs) ──")
+                    futures = {
+                        executor.submit(_run_one, tc_idx, tc, run_idx): (tc_idx, tc, run_idx)
+                        for tc_idx, tc, run_idx in phase_runs
+                    }
+                    for future in as_completed(futures):
+                        tc_idx, tc, run_idx = futures[future]
+                        label = f"{tc.id}"
+                        try:
+                            tc_result = future.result()
+                            with write_lock:
+                                f.write(tc_result.model_dump_json() + "\n")
+                                f.flush()
+                                all_tc_results.append(tc_result)
+                        except Exception as e:
+                            tqdm.write(f"FAILED {label} run={run_idx}: {e}", file=sys.stderr)
+                        pbar.update(1)
 
     # Write summary
     summary = _compute_summary(all_tc_results)
     with open(args.output, "a") as f:
         f.write(summary.model_dump_json() + "\n")
 
+    def _fmt(v) -> str:
+        return f"{v:.3f}" if v is not None else "N/A"
+
     print()
     print(f"Complete. Output: {args.output}")
-    print(f"Mean pass rate: {summary.mean_pass_rate:.3f}  std: {summary.pass_rate_std:.3f}")
+    def _fmts(v, s) -> str:
+        return f"{_fmt(v)}  std: {_fmt(s)}"
+
+    has_inconclusive = summary.inconclusive_tcs > 0
+
+    def _fmt_mod(conclusive, conclusive_std, all_val, all_std) -> str:
+        if not has_inconclusive:
+            return _fmts(conclusive, conclusive_std)
+        return f"Inconclusive  ({_fmts(all_val, all_std)})"
+
+    print(f"Mean pass rate:      {_fmts(summary.mean_pass_rate, summary.pass_rate_std)}")
+    print(f"Steps pass rate:     {_fmts(summary.steps_pass_rate, summary.steps_pass_rate_std)}")
+    print(f"Mod pass rate:       {_fmt_mod(summary.mod_pass_rate, summary.mod_pass_rate_std, summary.mod_pass_rate_all, summary.mod_pass_rate_all_std)}  (pre+post+irrelevant)")
+    print(f"  Pre-mod:           {_fmt_mod(summary.pre_mod_pass_rate, summary.pre_mod_pass_rate_std, summary.pre_mod_pass_rate_all, summary.pre_mod_pass_rate_all_std)}")
+    print(f"  Post-mod:          {_fmt_mod(summary.post_mod_pass_rate, summary.post_mod_pass_rate_std, summary.post_mod_pass_rate_all, summary.post_mod_pass_rate_all_std)}")
+    print(f"  Irrelevant:        {_fmt_mod(summary.irrelevant_pass_rate, summary.irrelevant_pass_rate_std, summary.irrelevant_pass_rate_all, summary.irrelevant_pass_rate_all_std)}")
+    print(f"Inconclusive TCs:    {summary.inconclusive_tcs}")
     return args.output
 
 
@@ -1152,12 +1188,110 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     ]
     pass_rate_std = mean(per_tc_stds)
 
+    # Steps pass rate + std (base TCs only, per-TC rates)
+    per_tc_step_rates: list[float] = []
+    for r in results:
+        if r.tc_id not in base_tc_ids:
+            continue
+        step_evts = [e for e in r.events if _STEP_EVENT_ID.match(e.event_id)]
+        if step_evts:
+            per_tc_step_rates.append(sum(1 for e in step_evts if e.passed) / len(step_evts))
+    steps_pass_rate = mean(per_tc_step_rates) if per_tc_step_rates else None
+    steps_pass_rate_std = statistics.stdev(per_tc_step_rates) if len(per_tc_step_rates) > 1 else (0.0 if per_tc_step_rates else None)
+
+    # Inconclusive TCs: TCs where any run had at least one step failure
+    inconclusive_tc_ids: set[str] = set()
+    for r in results:
+        step_evts = [e for e in r.events if _STEP_EVENT_ID.match(e.event_id)]
+        if step_evts and any(not e.passed for e in step_evts):
+            inconclusive_tc_ids.add(r.tc_id)
+
+    # Role-based pass rates + std: exclude events from inconclusive TCs, per-TC rates
+    def _role_pass_rate_and_std(role_val) -> tuple[Optional[float], Optional[float]]:
+        per_tc: list[float] = []
+        for r in results:
+            if r.tc_id in inconclusive_tc_ids:
+                continue
+            evts = [e for e in r.events if e.role == role_val]
+            if evts:
+                per_tc.append(sum(1 for e in evts if e.passed) / len(evts))
+        rate = mean(per_tc) if per_tc else None
+        std = statistics.stdev(per_tc) if len(per_tc) > 1 else (0.0 if per_tc else None)
+        return rate, std
+
+    conclusive_events = [
+        e for r in results if r.tc_id not in inconclusive_tc_ids
+        for e in r.events
+    ]
+    mod_events = [e for e in conclusive_events if e.role in ("pre_mod", "post_mod", "irrelevant")]
+    mod_pass_rate = (sum(1 for e in mod_events if e.passed) / len(mod_events)) if mod_events else None
+
+    # mod std: per-TC rate across all mod events combined
+    per_tc_mod_rates: list[float] = []
+    for r in results:
+        if r.tc_id in inconclusive_tc_ids:
+            continue
+        evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant")]
+        if evts:
+            per_tc_mod_rates.append(sum(1 for e in evts if e.passed) / len(evts))
+    mod_pass_rate_std = statistics.stdev(per_tc_mod_rates) if len(per_tc_mod_rates) > 1 else (0.0 if per_tc_mod_rates else None)
+
+    pre_mod_pass_rate, pre_mod_pass_rate_std = _role_pass_rate_and_std("pre_mod")
+    post_mod_pass_rate, post_mod_pass_rate_std = _role_pass_rate_and_std("post_mod")
+    irrelevant_pass_rate, irrelevant_pass_rate_std = _role_pass_rate_and_std("irrelevant")
+
+    # Role-based pass rates including inconclusive TCs (indicative)
+    def _role_pass_rate_and_std_all(role_val) -> tuple[Optional[float], Optional[float]]:
+        per_tc: list[float] = []
+        for r in results:
+            evts = [e for e in r.events if e.role == role_val]
+            if evts:
+                per_tc.append(sum(1 for e in evts if e.passed) / len(evts))
+        rate = mean(per_tc) if per_tc else None
+        std = statistics.stdev(per_tc) if len(per_tc) > 1 else (0.0 if per_tc else None)
+        return rate, std
+
+    all_mod_events = [
+        e for r in results for e in r.events
+        if e.role in ("pre_mod", "post_mod", "irrelevant")
+    ]
+    mod_pass_rate_all = (sum(1 for e in all_mod_events if e.passed) / len(all_mod_events)) if all_mod_events else None
+    per_tc_mod_rates_all: list[float] = []
+    for r in results:
+        evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant")]
+        if evts:
+            per_tc_mod_rates_all.append(sum(1 for e in evts if e.passed) / len(evts))
+    mod_pass_rate_all_std = statistics.stdev(per_tc_mod_rates_all) if len(per_tc_mod_rates_all) > 1 else (0.0 if per_tc_mod_rates_all else None)
+
+    pre_mod_pass_rate_all, pre_mod_pass_rate_all_std = _role_pass_rate_and_std_all("pre_mod")
+    post_mod_pass_rate_all, post_mod_pass_rate_all_std = _role_pass_rate_and_std_all("post_mod")
+    irrelevant_pass_rate_all, irrelevant_pass_rate_all_std = _role_pass_rate_and_std_all("irrelevant")
+
     return EvalSummary(
         total_test_cases=total_test_cases,
         total_runs=total_runs,
         total_events=len(all_events),
         mean_pass_rate=mean_pass_rate,
         pass_rate_std=pass_rate_std,
+        steps_pass_rate=steps_pass_rate,
+        steps_pass_rate_std=steps_pass_rate_std,
+        mod_pass_rate=mod_pass_rate,
+        mod_pass_rate_std=mod_pass_rate_std,
+        mod_pass_rate_all=mod_pass_rate_all,
+        mod_pass_rate_all_std=mod_pass_rate_all_std,
+        pre_mod_pass_rate=pre_mod_pass_rate,
+        pre_mod_pass_rate_std=pre_mod_pass_rate_std,
+        pre_mod_pass_rate_all=pre_mod_pass_rate_all,
+        pre_mod_pass_rate_all_std=pre_mod_pass_rate_all_std,
+        post_mod_pass_rate=post_mod_pass_rate,
+        post_mod_pass_rate_std=post_mod_pass_rate_std,
+        post_mod_pass_rate_all=post_mod_pass_rate_all,
+        post_mod_pass_rate_all_std=post_mod_pass_rate_all_std,
+        irrelevant_pass_rate=irrelevant_pass_rate,
+        irrelevant_pass_rate_std=irrelevant_pass_rate_std,
+        irrelevant_pass_rate_all=irrelevant_pass_rate_all,
+        irrelevant_pass_rate_all_std=irrelevant_pass_rate_all_std,
+        inconclusive_tcs=len(inconclusive_tc_ids),
         mean_event_input_tokens=mean([e.input_tokens for e in all_events]),
         mean_event_output_tokens=mean([e.output_tokens for e in all_events]),
         mean_event_latency_ms=mean([e.latency_ms for e in all_events]),
@@ -1209,13 +1343,13 @@ Examples:
         type=float,
         default=180.0,
         metavar="SECONDS",
-        help="Wall-clock timeout per step/event (not per test case); timed-out steps are marked failed and execution continues (default: 60)",
+        help="Wall-clock timeout per step/event (not per test case); timed-out steps are marked failed and execution continues (default: 180)",
     )
     parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         default=False,
-        help="Also print per-event evidence (expected/status/judge always shown)",
+        help="Print passing events inline (failures always shown); add --debug-messages for full message traces",
     )
     parser.add_argument(
         "--debug-messages",
@@ -1269,6 +1403,12 @@ Examples:
         choices=["openai", "anthropic", "google"],
         default=None,
         help="Provider for judge model (inferred from judge-model if not specified). Ignored when --llm-judge is set.",
+    )
+    parser.add_argument(
+        "--max-tool-rounds",
+        type=int,
+        default=10,
+        help="Max ReAct tool calls per object invocation (default: 10). Increase for objects with many skills/data tools.",
     )
     parser.add_argument(
         "--max-chain-depth",

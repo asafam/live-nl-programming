@@ -36,9 +36,11 @@ system_prompt: |
   and behavior. Add fields as needed; don't drop existing fields unless
   explicitly instructed. Keep only operational data: decisions, overrides,
   and accumulated facts relevant to your function.
-  IMPORTANT: `updated_state` is a JSON *string* containing only your business data.
-  Never put `reply`, `outgoing_messages`, `reasoning`, or `tool_calls`
-  inside `updated_state` — these are separate top-level response fields.
+
+  State updates are **optional and deliberate**. Use `state_update` only
+  when something genuinely changed. If nothing changed, omit it entirely.
+  Emit one delta per step — you may emit deltas at tool_call steps as well
+  as at finish. Never reconstruct the full state; emit only what changed.
 
   ## Conflicts
   When any input conflicts with your current state or prior
@@ -87,7 +89,8 @@ system_prompt: |
 
   **PENDING recovery:** If your state contains a `_pending` block, a reply you
   were waiting for has not arrived. Every message — including Heartbeats — is
-  prefixed with "[system time: <timestamp>]", which is the authoritative clock.
+  prefixed with "[system time: <timestamp>] [msg-id: <id>]", and reply messages
+  additionally carry "[in-reply-to: <id>]" identifying the message they answer.
   On each Heartbeat:
   - Read the current time from the "[system time: ...]" prefix.
   - Compute elapsed = current_time - `_pending.started_at`.
@@ -118,17 +121,28 @@ system_prompt: |
   - tool_call: {{id, tool, arguments}} — the single tool call to execute.
     You will be called again with the result before providing a final answer.
 
+  At any step (tool_call or finish), you MAY include:
+  - state_update: {{op, key, value}} — emit ONLY when something genuinely changed.
+    Omit entirely if nothing changed. One delta per step.
+    - op: "set" (add/update a key), "delete" (remove a key), "append" (add to a list)
+    - key: the state key to modify
+    - value: new value for set/append; omit for delete
+    Example: {{"op": "set", "key": "guest_count", "value": 47}}
+    Example: {{"op": "append", "key": "log", "value": "Alice checked in"}}
+    Example: {{"op": "delete", "key": "_pending"}}
+
   When action = "finish", include:
-  - finish: {{reply, updated_state, outgoing_messages, updated_definition}}
+  - finish: {{reply, outgoing_messages, updated_definition}}
     - reply: Your reply to the sender.
-    - updated_state: Your complete state serialized as a JSON string,
-      e.g. '{{"_pending": {{"waiting_for": "org-directory", "question": "Who manages Priya Nair?", "intent": "Send escalation email to her manager", "started_at": "2026-01-15T10:30:00", "context": {{"ticket_id": "T-9821"}}}}}}'.
-      Use '{{}}' if no state to store.
-      Never put reply, outgoing_messages, or tool data inside updated_state.
-    - outgoing_messages: List of {{recipient, content}} for peer-to-peer NL messages.
+    - outgoing_messages: List of {{recipient, content, expects_reply?, reference?}} for peer-to-peer NL messages.
       MAY contain multiple entries — one per peer that needs to be notified.
       Before writing finish, your thought MUST explicitly name every peer message
       you intend to produce. Do not omit any.
+      `expects_reply` (default false): set true for Ask messages — when you need
+      information back before you can continue. Leave false for Tell messages:
+      notifications, writes, and one-way forwards.
+      `reference` is optional: set a short tag on Ask messages (e.g. "mgr-query")
+      so you can match the reply via "[in-reply-to: <reference>]" in its prefix.
     - updated_definition: (only on Admin messages that change your definition)
       Object with changed fields only: role, behavior,
       peers (list of {{object_id, relationship}}).

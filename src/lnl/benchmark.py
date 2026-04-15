@@ -168,7 +168,7 @@ class BenchmarkHarness:
         assertion_results = []
         for assertion in scenario.assertions:
             actual = self._gather_actual(assertion, rt, registry, all_results)
-            passed, reasoning = self.evaluate_assertion(assertion.condition, actual)
+            passed, reasoning, _, _, _ = self.evaluate_assertion(assertion.condition, actual)
             assertion_results.append(AssertionResult(
                 assertion=assertion,
                 passed=passed,
@@ -204,11 +204,12 @@ class BenchmarkHarness:
 
     def evaluate_assertion(
         self, condition: str, actual: str, context: str = ""
-    ) -> tuple[bool, str, list[dict]]:
+    ) -> tuple[bool, str, list[dict], int, int]:
         """Evaluate an assertion condition against actual evidence using the judge.
 
-        Returns (passed, reasoning, votes). votes is a list of per-judge dicts
-        when a PanelJudge is used, or a single-entry list for single judges.
+        Returns (passed, reasoning, votes, judge_input_tokens, judge_output_tokens).
+        votes is a list of per-judge dicts when a PanelJudge is used, or a
+        single-entry list for single judges.
         """
         return self._judge.evaluate_with_votes(condition, actual, context)
 
@@ -239,7 +240,7 @@ class BenchmarkHarness:
             for entry in rt.message_log:
                 log_entries.append(
                     f"{entry.message.sender} -> {entry.message.recipient}: "
-                    f"{entry.message.content[:100]} [delivered={entry.delivered}]"
+                    f"{str(entry.message.content)[:100]} [delivered={entry.delivered}]"
                 )
             return "\n".join(log_entries) if log_entries else "(empty log)"
 

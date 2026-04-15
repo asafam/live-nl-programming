@@ -1,0 +1,9 @@
+system: zapier
+tools:
+  - method: zapier_tables_create_record
+    immediate:
+      template: "record_id: {tool_call_id}, written to table '{table}'"
+
+  - method: zapier_tables_list_records
+    immediate:
+      template: "[]"

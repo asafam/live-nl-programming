@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.23-2"
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "${OPENCLAW_GATEWAY_TOKEN}"
+    }
+  },
+  "plugins": {
+    "allow": ["lnl-mock-external"]
+  },
+  "tools": {
+    "sessions": {
+      "visibility": "all"
+    },
+    "agentToAgent": {
+      "enabled": true
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": false
+  },
+  "agents": {
+    "list": []
+  }
+}

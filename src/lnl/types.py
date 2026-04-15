@@ -50,6 +50,10 @@ class Message:
     topic: Optional[str] = None
     depth_remaining: int = 10  # hops remaining before chain is cut
     timestamp: datetime.datetime = field(default_factory=_utcnow)
+    id: str = ""                         # runtime-assigned deterministic ID
+    in_reply_to: Optional[str] = None    # ID of the message being replied to
+    reference: Optional[str] = None      # LLM-assigned correlation tag (copied from OutgoingMessage)
+    expects_reply: bool = False          # True = Ask (sender wants a reply); False = Tell (propagated from OutgoingMessage)
 
 
 @dataclass
@@ -57,6 +61,8 @@ class OutgoingMessage:
     """An outgoing message produced by the LLM."""
     recipient: str
     content: str
+    reference: Optional[str] = None   # LLM-assigned correlation tag for request-reply tracking
+    expects_reply: bool = False        # True = Ask (sender wants a reply); False = Tell (fire-and-forget)
 
 
 @dataclass
@@ -116,13 +122,22 @@ class ProcessingResult:
     source_message_type: Optional[MessageType] = None  # type of the message that was processed
     depth_remaining: int = 10  # propagated from the processed message
     sequence: int = 0          # assigned by Runtime for ordering concurrent results
+    source_message_id: str = ""  # ID of the message that was processed
+
+
+@dataclass
+class StateDelta:
+    """A single state change operation emitted by the LLM at any ReAct step."""
+    op: str    # "set" | "delete" | "append"
+    key: str
+    value: Any = None  # required for set/append; ignored for delete
 
 
 @dataclass
 class ReactFinish:
-    """The finish action in a ReAct step — commits state, reply, and outgoing messages."""
+    """The finish action in a ReAct step — commits reply and outgoing messages."""
     reply: str
-    updated_state: str = ""
+    updated_state: str = ""  # legacy compat for MockBrain/tests; not in LLM schema
     outgoing_messages: list[OutgoingMessage] = field(default_factory=list)
     updated_definition: Optional[dict] = None  # set when an ADMIN message triggers a definition change
 
@@ -132,6 +147,7 @@ class ReactStep:
     """One step in a ReAct loop: an explicit thought and a single action."""
     thought: str
     action: str  # "tool_call" | "finish"
+    state_update: Optional[StateDelta] = None  # optional at any step; accumulated by runtime
     tool_call: Optional[ToolCall] = None
     finish: Optional[ReactFinish] = None
 

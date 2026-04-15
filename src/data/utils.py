@@ -231,6 +231,54 @@ def setup_output(
         return completed, "a"
 
 
+def format_tc_event_detail(event_results: list) -> str:
+    """Format per-TC pass-rate detail string for eval reporting.
+
+    Returns a parenthesised detail string like:
+      (base=3/3 (100%),  pre-mod=2/2 (100%),  post-mod=1/1 (100%))
+    or, when base steps are not all passing:
+      (base=2/3 (67%),  mod=inconclusive  (pre-mod=1/2 (50%),  post-mod=0/1 (0%)))
+    Returns an empty string when there is nothing to report.
+    """
+    def _fmt_role(role_val) -> Optional[str]:
+        evts = [e for e in event_results if getattr(e, "role", None) == role_val]
+        if not evts:
+            return None
+        n_pass = sum(1 for e in evts if e.passed)
+        return f"{n_pass}/{len(evts)} ({n_pass/len(evts):.0%})"
+
+    steps_evts = [e for e in event_results if e.event_id.startswith("S")]
+    steps_n = sum(1 for e in steps_evts if e.passed)
+    steps_total = len(steps_evts)
+    steps_100pct = (steps_total == 0) or (steps_n == steps_total)
+
+    detail_parts: list[str] = []
+    if steps_total:
+        detail_parts.append(f"base={steps_n}/{steps_total} ({steps_n/steps_total:.0%})")
+
+    pre   = _fmt_role("pre_mod")
+    post  = _fmt_role("post_mod")
+    irrel = _fmt_role("irrelevant")
+
+    if steps_100pct:
+        if pre:
+            detail_parts.append(f"pre-mod={pre}")
+        if post:
+            detail_parts.append(f"post-mod={post}")
+        if irrel:
+            detail_parts.append(f"irrelevant={irrel}")
+    elif steps_evts and (pre or post or irrel):
+        # Base steps failed → mod rates are indicative only; wrap each in parens
+        if pre:
+            detail_parts.append(f"(pre-mod={pre})")
+        if post:
+            detail_parts.append(f"(post-mod={post})")
+        if irrel:
+            detail_parts.append(f"(irrelevant={irrel})")
+
+    return f"({',  '.join(detail_parts)})" if detail_parts else ""
+
+
 def print_run_info(
     provider: str,
     model: str,

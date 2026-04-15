@@ -1,0 +1,17 @@
+system: notion
+tools:
+  - method: notion_create_page
+    immediate:
+      template: "id: {tool_call_id}, title: '{title}', url: https://notion.so/{tool_call_id}"
+
+  - method: notion_update_page
+    immediate:
+      template: "id: {page_id}, updated: true"
+
+  - method: notion_get_page
+    immediate:
+      template: "id: {page_id}, title: 'Page', url: https://notion.so/{page_id}"
+
+  - method: notion_query_database
+    immediate:
+      template: "[]"

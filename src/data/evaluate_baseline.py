@@ -1,10 +1,9 @@
 """
-Baseline evaluation runner — OpenClaw multi-agent comparison for the LNL experiment.
+Baseline evaluation runner — OpenClaw single/multi-agent comparison for the LNL experiment.
 
-Runs the same TestCases as evaluate.py but uses OpenClaw agents — one agent
-per LNL-object — instead of the LNL runtime. Each object is exported as a
-separate OpenClaw agent workspace. Steps, modifications, and events are routed
-to the correct agent by recipient/target field.
+Runs the same TestCases as evaluate.py but uses an OpenClaw agent instead of the
+LNL runtime. By default, uses a single combined agent that receives all object
+definitions and handles all messages. With --multi-agent, uses one agent per LNL-object.
 
 Requires:
     - OpenClaw daemon running (openclaw gateway status)
@@ -14,17 +13,25 @@ Usage:
     python -m src.data.evaluate_baseline \\
         -i outputs/data/zapier/20260322_010211/test_cases.jsonl \\
         --runs 3
+
+    # Multi-agent mode (one agent per object):
+    python -m src.data.evaluate_baseline \\
+        -i outputs/data/zapier/20260322_010211/test_cases.jsonl \\
+        --multi-agent --runs 3
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import concurrent.futures
+import dataclasses
 import json
 import re
 import statistics
 import sys
 import time
+
+import httpx
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -44,47 +51,381 @@ from src.data.schema import (
 )
 from src.data.mock_server import MockServer, merge_tc_mock_tools, resolve_mock_configs
 from src.data.utils import (
+    format_tc_event_detail,
     infer_provider,
     load_jsonl,
 )
 from src.lnl.openclaw_export import (
+    export_single_agent_workspace,
     export_workflow_from_objects,
     reset_agent_state,
+    reset_single_agent_state,
 )
+
+# ── Remote mock server client ─────────────────────────────────────────────────
+
+class RemoteMockServer:
+    """Thin HTTP client for a mock server running inside a Docker container.
+
+    Drop-in replacement for MockServer when the server is already running
+    remotely. Pass its URL via --mock-server-url and this class handles
+    /configure, /log, and /health calls without starting a local process.
+    """
+
+    def __init__(self, url: str):
+        self._url = url.rstrip("/")
+        # Set before configure() to include mock script in the /configure payload.
+        self._pending_mock_script: Any = None
+
+    def start(self) -> None:
+        pass  # server already running in the container
+
+    def wait_ready(self, timeout: float = 30.0) -> None:
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = httpx.get(f"{self._url}/health", timeout=2.0)
+                if resp.status_code == 200:
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+        raise RuntimeError(f"Remote mock server at {self._url} not ready after {timeout}s")
+
+    def configure(self, session_key: str, slot_id: str = "default") -> None:
+        payload: dict[str, Any] = {"session_key": session_key, "slot_id": slot_id}
+        if self._pending_mock_script is not None:
+            payload["mock_script"] = self._pending_mock_script.model_dump()
+            self._pending_mock_script = None
+        httpx.post(f"{self._url}/configure", json=payload, timeout=10.0).raise_for_status()
+
+    def get_log(self, slot_id: str = "default") -> list[dict]:
+        resp = httpx.get(f"{self._url}/log", params={"slot_id": slot_id}, timeout=10.0)
+        resp.raise_for_status()
+        return resp.json().get("calls", [])
+
+    def stop(self) -> None:
+        pass  # container lifecycle is managed externally
+
+
+# ── Docker worker pool ────────────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class WorkerConfig:
+    """Connection details for a single OpenClaw Docker worker container.
+
+    data_dir      — host path that is bind-mounted into the container as
+                    /home/node/.openclaw.  evaluate_baseline.py writes workspace
+                    and agent files here; the gateway inside the container reads
+                    them via the mount.
+    container_home — the path the gateway sees for those same files (default:
+                    /home/node/.openclaw).  This is substituted into the agent
+                    workspace/agentDir entries that are written to the gateway
+                    config API, so they resolve correctly inside the container.
+    """
+    name: str
+    gateway_url: str
+    mock_server_url: str
+    data_dir: Path
+    container_home: str = "/home/node/.openclaw"
+    container_name: Optional[str] = None  # Docker container name for auto-restart
+
+    @property
+    def token(self) -> Optional[str]:
+        return _load_openclaw_token(self.data_dir)
+
+
+def _load_pool_config(path: Path) -> list[WorkerConfig]:
+    """Load a worker-pool YAML file and return a list of WorkerConfig objects."""
+    import yaml
+    raw = yaml.safe_load(path.read_text())
+    workers = []
+    for entry in raw.get("workers", []):
+        workers.append(WorkerConfig(
+            name=entry["name"],
+            gateway_url=entry["gateway_url"],
+            mock_server_url=entry["mock_server_url"],
+            data_dir=Path(entry["data_dir"]).expanduser(),
+            container_home=entry.get("container_home", "/home/node/.openclaw"),
+            container_name=entry.get("container_name"),
+        ))
+    if not workers:
+        raise ValueError(f"No workers defined in pool config: {path}")
+    return workers
+
+
+def _load_device_operator_token() -> Optional[str]:
+    """Read the local SDK device operator token from ~/.openclaw/identity/device-auth.json.
+
+    This is the token the SDK sends in connect.params.auth.token during the
+    connect handshake.  The container gateway must be configured with this same
+    value as its auth token, otherwise the handshake fails with 'token mismatch'.
+    """
+    auth_path = Path.home() / ".openclaw" / "identity" / "device-auth.json"
+    if not auth_path.exists():
+        return None
+    try:
+        data = json.loads(auth_path.read_text())
+        return data.get("tokens", {}).get("operator", {}).get("token") or None
+    except Exception:
+        return None
+
+
+def _write_worker_gateway_config(data_dir: Path, operator_token: str) -> None:
+    """Write (or patch) data_dir/openclaw.json so the gateway uses operator_token for auth.
+
+    Preserves any extra fields already present in the file (e.g. agent list,
+    plugin config the gateway wrote back).  Falls back to writing a fresh
+    minimal config if the existing file is unreadable.
+    """
+    config_path = data_dir / "openclaw.json"
+    cfg: dict = {}
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+        except Exception:
+            pass
+    cfg.setdefault("gateway", {}).setdefault("auth", {})
+    cfg["gateway"]["auth"]["mode"] = "token"
+    cfg["gateway"]["auth"]["token"] = operator_token
+    cfg["gateway"].setdefault("mode", "local")
+    cfg.setdefault("plugins", {"allow": ["lnl-mock-external"]})
+    cfg.setdefault("tools", {"sessions": {"visibility": "all"}})
+    cfg.setdefault("commands", {"native": "auto", "nativeSkills": "auto", "restart": True})
+    cfg.setdefault("agents", {"list": []})
+    config_path.write_text(json.dumps(cfg, indent=2))
+
+
+def _ensure_worker_gateway_token(worker: "WorkerConfig", operator_token: str) -> bool:
+    """Ensure the worker's gateway is configured with operator_token.
+
+    Returns True if the container was restarted (caller should re-wait for health).
+    """
+    import subprocess as _sp
+    worker.data_dir.mkdir(parents=True, exist_ok=True)
+    current_token = _load_openclaw_token(worker.data_dir)
+    if current_token == operator_token:
+        return False  # already correct
+
+    print(f"  [{worker.name}] Gateway token mismatch — updating config and restarting container...")
+    _write_worker_gateway_config(worker.data_dir, operator_token)
+
+    if worker.container_name:
+        try:
+            _sp.run(["docker", "restart", worker.container_name],
+                    check=True, capture_output=True, timeout=30)
+        except Exception as exc:
+            print(f"  [{worker.name}] WARNING: docker restart failed: {exc}. "
+                  "Container may still use the old token.")
+            return False
+    else:
+        print(f"  [{worker.name}] WARNING: no container_name set; cannot auto-restart. "
+              "Restart the container manually for the new token to take effect.")
+        return False
+    return True
+
+
+# ── Version ───────────────────────────────────────────────────────────────────
+
+def _build_version() -> str:
+    """Dynamic version string: git commit timestamp + short hash + '+dirty' if uncommitted changes."""
+    import subprocess as _sp
+    try:
+        ts = _sp.check_output(
+            ["git", "log", "-1", "--format=%cd", "--date=format:%Y%m%d_%H%M%S"],
+            stderr=_sp.DEVNULL, text=True
+        ).strip()
+        sha = _sp.check_output(
+            ["git", "log", "-1", "--format=%h"],
+            stderr=_sp.DEVNULL, text=True
+        ).strip()
+        dirty = _sp.call(
+            ["git", "diff", "--quiet", "HEAD"],
+            stderr=_sp.DEVNULL
+        ) != 0
+        base = f"{ts}_{sha}" if ts and sha else "unknown"
+        return f"{base}+dirty" if dirty else base
+    except Exception:
+        import os
+        mtime = os.path.getmtime(__file__)
+        from datetime import datetime
+        return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
+
+_VERSION: str = _build_version()
 
 # ── OpenClaw agent configuration ─────────────────────────────────────────────
 
-_OAUTH_PROVIDER_MAP = {
-    "openai": "openai-codex",
-}
+def _load_openclaw_token(openclaw_home: Optional[Path] = None) -> Optional[str]:
+    """Read the gateway auth token from openclaw.json, if present."""
+    config_path = (openclaw_home or Path.home() / ".openclaw") / "openclaw.json"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+            return cfg.get("gateway", {}).get("auth", {}).get("token") or None
+        except Exception:
+            pass
+    return None
 
 
-def _resolve_openclaw_provider(agent_id: str, provider: str) -> str:
-    """Detect which provider the agent is authenticated for."""
-    oauth_alias = _OAUTH_PROVIDER_MAP.get(provider)
-    if oauth_alias is None:
-        return provider
+_DEFAULT_GATEWAY_WS_URL = "ws://127.0.0.1:18789"
 
-    auth_path = (
-        Path.home()
-        / ".openclaw"
-        / "agents"
-        / agent_id
-        / "agent"
-        / "auth-profiles.json"
-    )
-    if not auth_path.exists():
-        return provider
 
-    import json as _json
+def _reset_agent_session(object_id: str, openclaw_home: Path) -> None:
+    """Delete the 'main' session transcript for an agent so the next run starts fresh.
+
+    In multi-agent mode all agents use session_name="main". Without resetting,
+    conversation history from a previous run bleeds into the next one.
+    """
+    sessions_dir = openclaw_home / "agents" / object_id / "sessions"
+    sessions_json = sessions_dir / "sessions.json"
+    if not sessions_json.exists():
+        return
     try:
-        data = _json.loads(auth_path.read_text())
+        store = json.loads(sessions_json.read_text())
     except Exception:
-        return provider
+        return
 
-    configured = {p.split(":")[0] for p in data.get("profiles", {}).keys()}
-    if oauth_alias in configured and provider not in configured:
-        return oauth_alias
+    main_key = f"agent:{object_id}:main"
+    entry = store.pop(main_key, None)
+    if entry:
+        # Delete the JSONL transcript file so the gateway starts fresh
+        transcript = Path(entry.get("sessionFile", ""))
+        if transcript.exists():
+            transcript.unlink(missing_ok=True)
+        sessions_json.write_text(json.dumps(store, indent=2))
+
+
+def _clear_agent_sessions(object_id: str, openclaw_home: Path) -> None:
+    """Delete ALL session transcripts for an agent so the next run starts with a clean history.
+
+    _global_counter resets to 0 on each script invocation, so the first run always
+    uses session name "eval-ma-1".  If a previous invocation left a transcript under
+    that name, the gateway reuses it — injecting old conversation history.  This
+    function wipes sessions.json and all transcript JSONL files so no name can collide.
+
+    Transcript paths stored in sessions.json use the *container* path
+    (/home/node/.openclaw/...). For pool mode the files live on the host under
+    openclaw_home, so we translate by replacing the container home prefix.
+    """
+    sessions_dir = openclaw_home / "agents" / object_id / "sessions"
+    if not sessions_dir.exists():
+        return
+    sessions_json = sessions_dir / "sessions.json"
+    # Delete every JSONL transcript file referenced in sessions.json
+    if sessions_json.exists():
+        try:
+            store = json.loads(sessions_json.read_text())
+            for entry in store.values():
+                raw_path = entry.get("sessionFile", "")
+                if not raw_path:
+                    continue
+                transcript = Path(raw_path)
+                # Remap container-absolute path to host path via openclaw_home
+                if transcript.is_absolute() and not transcript.exists():
+                    try:
+                        # Container home is /home/node/.openclaw; strip and re-root
+                        rel = transcript.relative_to(Path("/home/node/.openclaw"))
+                        transcript = openclaw_home / rel
+                    except ValueError:
+                        pass
+                transcript.unlink(missing_ok=True)
+        except Exception:
+            pass
+    # Also delete any orphaned JSONL files not referenced in sessions.json
+    for f in sessions_dir.glob("*.jsonl"):
+        f.unlink(missing_ok=True)
+    # Reset the session index to empty
+    sessions_json.write_text("{}\n")
+
+
+def _slot_objects(objects: list, slot_suffix: str) -> list:
+    """Return copies of ObjectDef list with object_id and peer IDs suffixed for a concurrent slot.
+
+    Slot 0 (slot_suffix="") returns the original list unchanged.
+    Slots 1+ (slot_suffix="-c1", "-c2", ...) get distinct IDs so their gateway agent
+    registrations and workspace dirs don't collide with each other.
+    """
+    if not slot_suffix:
+        return objects
+    from src.data.schema import ObjectDef, PeerDecl
+    slotted = []
+    for obj in objects:
+        slotted_peers = [
+            PeerDecl(object_id=f"{p.object_id}{slot_suffix}", relationship=p.relationship)
+            for p in obj.peers
+        ]
+        slotted.append(obj.model_copy(update={
+            "object_id": f"{obj.object_id}{slot_suffix}",
+            "peers": slotted_peers,
+        }))
+    return slotted
+
+
+def _openclaw_connect_kwargs(gateway_url: Optional[str] = None, openclaw_home: Optional[Path] = None) -> dict:
+    """Build kwargs for OpenClawClient.connect(), including auth token if configured."""
+    import os
+    kwargs: dict[str, Any] = {
+        "gateway_ws_url": gateway_url or _DEFAULT_GATEWAY_WS_URL,
+    }
+    token = os.environ.get("OPENCLAW_GATEWAY_TOKEN") or _load_openclaw_token(openclaw_home)
+    if token:
+        kwargs["api_key"] = token  # ClientConfig.api_key → ProtocolGateway(token=...)
+    return kwargs
+
+
+
+
+async def _configure_single_openclaw_agent(
+    agent_id: str,
+    provider: str,
+    model: str,
+    openclaw_home: Path,
+    gateway_url: Optional[str],
+    path_prefix: Optional[Path] = None,
+) -> str:
+    """Register a single combined agent in the OpenClaw daemon config.
+
+    Args:
+        path_prefix: When set, use this path for workspace/agentDir entries in
+            the gateway config instead of openclaw_home.  Use this when the host
+            path (openclaw_home) and the container-internal path differ — e.g.
+            Docker pool mode where openclaw_home is the bind-mount source and
+            path_prefix is /home/node/.openclaw inside the container.
+
+    Returns the provider string used (passed through unchanged).
+    """
+    import json
+    import json5
+    from openclaw_sdk import OpenClawClient
+
+    config_home = path_prefix or openclaw_home
+    async with await OpenClawClient.connect(**_openclaw_connect_kwargs(gateway_url, openclaw_home)) as client:
+        result = await client.config_mgr.get()
+        raw = result.get("raw") or "{}"
+        if not isinstance(raw, str):
+            raw = "{}"
+        base_hash = result.get("hash")
+        config = json5.loads(raw)
+        agents_cfg = config.setdefault("agents", {})
+        lst = agents_cfg.setdefault("list", [])
+
+        # Remove old entries for this agent ID (will be replaced below)
+        lst = [a for a in lst if a.get("id") != agent_id]
+        lst.append({
+            "id": agent_id,
+            "name": agent_id.replace("-", " ").title(),
+            "workspace": str(config_home / f"workspace-{agent_id}"),
+            "agentDir": str(config_home / "agents" / agent_id / "agent"),
+            "model": {"primary": f"{provider}/{model}"},
+        })
+
+        agents_cfg["list"] = lst
+        await client.config_mgr.patch(json.dumps(config, indent=2), base_hash=base_hash)
+
+    # Sleep to let the gateway's delayed restart (default ~2s) begin before polling.
+    await asyncio.sleep(4.0)
+    await _wait_for_gateway(gateway_url, openclaw_home)
     return provider
 
 
@@ -94,29 +435,29 @@ async def _configure_openclaw_agents(
     model: str,
     openclaw_home: Path,
     gateway_url: Optional[str],
+    path_prefix: Optional[Path] = None,
 ) -> str:
     """Register all objects as agents in the OpenClaw daemon config.
 
-    Returns the effective provider used (may switch to OAuth variant).
+    Args:
+        path_prefix: When set, use this path for workspace/agentDir entries in
+            the gateway config instead of openclaw_home.  See
+            _configure_single_openclaw_agent for details.
+
+    Returns the provider string used (passed through unchanged).
     """
     import json
     import json5
     from openclaw_sdk import OpenClawClient
 
-    # Resolve provider from the first object (all share same auth)
-    effective_provider = _resolve_openclaw_provider(
-        objects[0].object_id if objects else "main", provider
-    )
-
-    connect_kwargs: dict[str, Any] = {}
-    if gateway_url:
-        connect_kwargs["gateway_ws_url"] = gateway_url
-
+    config_home = path_prefix or openclaw_home
     object_ids = {obj.object_id for obj in objects}
 
-    async with await OpenClawClient.connect(**connect_kwargs) as client:
+    async with await OpenClawClient.connect(**_openclaw_connect_kwargs(gateway_url, openclaw_home)) as client:
         result = await client.config_mgr.get()
-        raw = result.get("raw", "{}")
+        raw = result.get("raw") or "{}"
+        if not isinstance(raw, str):
+            raw = "{}"
         base_hash = result.get("hash")
         config = json5.loads(raw)
         agents_cfg = config.setdefault("agents", {})
@@ -129,22 +470,59 @@ async def _configure_openclaw_agents(
             lst.append({
                 "id": obj.object_id,
                 "name": obj.object_id.replace("-", " ").title(),
-                "workspace": str(openclaw_home / f"workspace-{obj.object_id}"),
-                "agentDir": str(openclaw_home / "agents" / obj.object_id / "agent"),
-                "model": {"primary": f"{effective_provider}/{model}"},
+                "workspace": str(config_home / f"workspace-{obj.object_id}"),
+                "agentDir": str(config_home / "agents" / obj.object_id / "agent"),
+                "model": {"primary": f"{provider}/{model}"},
             })
 
         agents_cfg["list"] = lst
-        config["tools"] = {
-            "agentToAgent": {
-                "enabled": True,
-                "allow": list(object_ids),
-            }
+        # Enable agentToAgent so agents can reach peers the same way LNL objects
+        # communicate via outgoing_messages through the MessageBus.
+        # sessions.visibility="all" is required so an agent can call sessions_send
+        # targeting another agent's session (default "tree" only allows own spawned sessions).
+        # Merge into existing tools config rather than replacing it — replacing
+        # all tool settings can trigger additional gateway restart cycles.
+        tools_cfg = config.setdefault("tools", {})
+        tools_cfg["agentToAgent"] = {
+            "enabled": True,
+            "allow": list(object_ids),
         }
-
+        tools_cfg.setdefault("sessions", {})["visibility"] = "all"
         await client.config_mgr.patch(json.dumps(config, indent=2), base_hash=base_hash)
 
-    return effective_provider
+    # The gateway schedules a hot-reload ~2s after a config patch.  Sleeping
+    # here lets that restart begin before we start polling — without the sleep,
+    # _wait_for_gateway immediately reconnects to the still-running gateway
+    # (before the restart fires) and returns, so the restart fires mid-run.
+    await asyncio.sleep(4.0)
+    await _wait_for_gateway(gateway_url, openclaw_home)
+    return provider
+
+
+async def _wait_for_gateway(
+    gateway_url: Optional[str] = None,
+    openclaw_home: Optional[Path] = None,
+    timeout_s: float = 30.0,
+) -> None:
+    """Poll until the gateway accepts a connection, then return.
+
+    Raises:
+        asyncio.TimeoutError: if the gateway does not respond within timeout_s.
+    """
+    from openclaw_sdk import OpenClawClient
+    import time as _time
+
+    deadline = _time.monotonic() + timeout_s
+    while _time.monotonic() < deadline:
+        try:
+            async with await OpenClawClient.connect(**_openclaw_connect_kwargs(gateway_url, openclaw_home)) as client:
+                await client.config_mgr.get()
+            return  # gateway is up
+        except Exception:
+            await asyncio.sleep(1.0)
+    raise asyncio.TimeoutError(
+        f"OpenClaw gateway did not become ready within {timeout_s:.0f}s"
+    )
 
 
 # ── Timestamp parsing ────────────────────────────────────────────────────────
@@ -195,56 +573,86 @@ def gather_evidence(
 # ── OpenClaw agent wrapper ───────────────────────────────────────────────────
 
 class OpenClawAgent:
-    """Wraps the OpenClaw SDK for single-message execution against a named agent."""
+    """Holds metadata for an OpenClaw agent used during evaluation.
+
+    Actual session management is done by _execute_tc_async, which opens
+    persistent connections for all agents simultaneously. This class exists
+    to carry agent_id and gateway_url into the execution path, and to maintain
+    the global counter that ensures unique session names across TC runs.
+    """
+
+    # Global counter ensures session names are unique across all TCs in a run,
+    # preventing the gateway from reusing a cached session from a previous TC.
+    _global_counter: int = 0
 
     def __init__(self, agent_id: str, gateway_url: Optional[str] = None):
         self._agent_id = agent_id
         self._gateway_url = gateway_url
-        self._session_counter = 0
 
-    async def _execute_single_message(self, content: str) -> dict[str, Any]:
-        """Send one message to this agent in a fresh session. Returns {content, latency_ms}."""
-        from openclaw_sdk import OpenClawClient
 
-        connect_kwargs: dict[str, Any] = {}
-        if self._gateway_url:
-            connect_kwargs["gateway_ws_url"] = self._gateway_url
+# ── Cascade wait helper ───────────────────────────────────────────────────────
 
-        self._session_counter += 1
-        session_name = f"eval-{self._agent_id}-{self._session_counter}"
+async def _wait_mock_quiescence(
+    mock_server: "MockServer",
+    max_wait_s: float = 10.0,
+    quiet_s: float = 1.5,
+    slot_id: str = "default",
+) -> None:
+    """Poll mock server log until no new tool calls arrive for quiet_s seconds.
 
-        t0 = time.time()
-        async with await OpenClawClient.connect(**connect_kwargs) as client:
-            agent = client.get_agent(self._agent_id, session_name=session_name)
-            result = await agent.execute(content)
-        latency_ms = (time.time() - t0) * 1000
+    Used after execute() returns to wait for agentToAgent cascade completions.
+    Since get_log() is non-destructive (configure() clears the log, not get_log()),
+    we can poll repeatedly to detect when the call count stabilises.
 
-        return {
-            "content": result.content if result.success else f"(error: {result.content})",
-            "latency_ms": latency_ms,
-        }
+    Args:
+        slot_id: Concurrent slot to poll (default "default" for non-concurrent runs).
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max_wait_s
+    last_count = len(mock_server.get_log(slot_id=slot_id))
+    quiet_since = loop.time()
 
-    def send_message(self, content: str) -> dict[str, Any]:
-        """Synchronous wrapper: send one message to this agent."""
-        return asyncio.run(self._execute_single_message(content))
+    while True:
+        await asyncio.sleep(0.3)
+        now = loop.time()
+        if now >= deadline:
+            break
+        current_count = len(mock_server.get_log(slot_id=slot_id))
+        if current_count > last_count:
+            last_count = current_count
+            quiet_since = now
+        elif now - quiet_since >= quiet_s:
+            break  # no new calls for quiet_s — cascade complete
 
 
 # ── Prior context ────────────────────────────────────────────────────────────
 
-def _read_prior_context(tc: TestCase, openclaw_home: Path) -> str:
+def _read_prior_context(
+    tc: TestCase,
+    openclaw_home: Path,
+    single_agent_id: Optional[str] = None,
+) -> str:
     """Read state.md for all objects as prior-state context for the judge.
 
     Equivalent to evaluate.py's _format_prior_state(rt): gives the judge a
     snapshot of what each agent knew before the current event fired.
+    In single-agent mode, reads from the combined workspace.
     """
     lines = ["=== PRIOR STATE ==="]
-    for obj in tc.objects:
-        ws = openclaw_home / f"workspace-{obj.object_id}"
-        state_file = ws / "state.md"
+    if single_agent_id:
+        state_file = openclaw_home / f"workspace-{single_agent_id}" / "state.md"
         if state_file.exists():
             text = state_file.read_text().strip()
             if text:
-                lines.append(f"[{obj.object_id}]:\n{text}")
+                lines.append(text)
+    else:
+        for obj in tc.objects:
+            ws = openclaw_home / f"workspace-{obj.object_id}"
+            state_file = ws / "state.md"
+            if state_file.exists():
+                text = state_file.read_text().strip()
+                if text:
+                    lines.append(f"[{obj.object_id}]:\n{text}")
     return "\n\n".join(lines)
 
 
@@ -260,23 +668,49 @@ def _tool_call_matches(match: dict[str, str], args: dict) -> bool:
 
 # ── Core execution ───────────────────────────────────────────────────────────
 
-def _execute_test_case_inner(
+async def _execute_tc_async(
     tc: TestCase,
-    agents: dict[str, OpenClawAgent],
+    gateway_url: Optional[str],
     openclaw_home: Path,
     harness,
-    mock_server: Optional["MockServer"] = None,
-    verbose: bool = False,
-    steps_only: bool = False,
+    mock_server: Optional["MockServer"],
+    verbose: bool,
+    steps_only: bool,
+    single_agent_id: Optional[str],
+    partial_events: Optional[list],
+    partial_mods: Optional[list],
+    slot_suffix: str = "",
 ) -> tuple[list[EventResult], list[ModificationResult]]:
-    """Run a single TestCase against per-object OpenClaw agents and return results.
+    """Async core: open persistent sessions for ALL agents simultaneously, then send messages.
 
-    Routes each step/event to the correct agent by recipient/target field.
-    Resets each agent's state.md to its initial state before processing.
+    Persistent sessions fix the agentToAgent label-collision problem.
+    Previously each agent.execute() call created a brand-new session that tried
+    to claim label=agent_id. In sequential evaluation the target agent had no
+    active session when the source forwarded via agentToAgent, and stale sessions
+    from the previous message caused 'label already in use' errors.
+
+    With all sessions open at once the gateway can route agentToAgent to any peer
+    without collision — they're all live for the duration of this TC run.
     """
-    # Reset state.md for all objects before this run
-    for obj in tc.objects:
-        reset_agent_state(obj.object_id, obj.state_description, openclaw_home)
+    from openclaw_sdk import OpenClawClient
+    from src.lnl.openclaw_export import rewrite_agents_md
+
+    # Reset state before run.
+    if single_agent_id:
+        reset_single_agent_state(tc.objects, openclaw_home, single_agent_id)
+    else:
+        for obj in tc.objects:
+            reset_agent_state(f"{obj.object_id}{slot_suffix}", obj.state_description, openclaw_home)
+
+    # Multi-agent: generate a unique session name so this run never collides with
+    # stale in-memory sessions from previous runs.  AGENTS.md is rewritten with the
+    # correct peer sessionKey refs before we open any connection.
+    if not single_agent_id:
+        OpenClawAgent._global_counter += 1
+        run_session_name = f"eval-ma-{OpenClawAgent._global_counter}"
+        rewrite_agents_md(tc.objects, openclaw_home, run_session_name, slot_suffix=slot_suffix)
+    else:
+        run_session_name = None  # unused in single-agent path
 
     # Build trigger map: event_id → list of triggered events (test-case schema)
     trigger_map: dict[str, list[Any]] = {}
@@ -284,15 +718,11 @@ def _execute_test_case_inner(
         if evt.triggered_by:
             trigger_map.setdefault(evt.triggered_by, []).append(evt)
 
-    # Build tool trigger map: tool_name → MockToolDef, for in-process trigger dispatch.
-    # Mirrors MockInProcessExecutor's trigger mechanism in evaluate.py:
-    # when a tool call fires and its match conditions pass, the evaluator synchronously
-    # sends trigger.message_template to trigger.target_object_id — no /hooks/wake needed.
+    # Build tool trigger map for in-process trigger dispatch (mirrors evaluate.py)
     tool_trigger_map = {t.tool_name: t for t in tc.mock_tools if t.triggers}
 
-    # Build ordered message list
+    # Build ordered message list (identical logic to the old sync version)
     messages: list[dict[str, Any]] = []
-
     for i, step in enumerate(tc.steps):
         messages.append({
             "kind": "step",
@@ -333,132 +763,230 @@ def _execute_test_case_inner(
                     "content": f"[Event from {triggered.source} (triggered by {item.id})]: {triggered.input}",
                 })
 
-    event_results: list[EventResult] = []
-    mod_results: list[ModificationResult] = []
-    run_mock_log: list[dict] = []  # accumulated tool call evidence across all messages this run
+    event_results: list[EventResult] = partial_events if partial_events is not None else []
+    mod_results: list[ModificationResult] = partial_mods if partial_mods is not None else []
     prior_context: str = ""
 
-    for msg in messages:
-        # After steps phase, return early if steps_only mode
-        if steps_only and msg["kind"] != "step":
-            break
+    # ── Open ONE connection; register ALL agent sessions before any message is sent ──
+    # This ensures every label is claimed upfront so agentToAgent routing works without
+    # 'label already in use' collisions between sequential messages.
+    async with await OpenClawClient.connect(**_openclaw_connect_kwargs(gateway_url, openclaw_home)) as client:
+        session_names: dict[str, str] = {}
+        handles: dict[str, Any] = {}
 
-        target_id = msg["target"]
-        agent = agents.get(target_id)
-        if agent is None:
-            if verbose:
-                print(f"  Warning: no agent for target {target_id!r}, skipping")
-            continue
+        if single_agent_id:
+            OpenClawAgent._global_counter += 1
+            sname = f"eval-{single_agent_id}-{OpenClawAgent._global_counter}"
+            session_names[single_agent_id] = sname
+            handles[single_agent_id] = client.get_agent(single_agent_id, session_name=sname)
+        else:
+            # Multi-agent: use a unique per-run session name so each run's sessions
+            # never collide with stale in-memory sessions from previous runs.
+            # AGENTS.md was already rewritten above with matching peer sessionKey refs.
+            for obj in tc.objects:
+                agent_id = f"{obj.object_id}{slot_suffix}"
+                session_names[obj.object_id] = run_session_name
+                handles[obj.object_id] = client.get_agent(agent_id, session_name=run_session_name)
 
-        # Configure mock server with the correct session key before each message so
-        # callbacks and orchestration reactions can wake the right OpenClaw session.
-        if mock_server:
-            next_session_key = f"eval-{target_id}-{agent._session_counter + 1}"
-            mock_server.configure(next_session_key)
+            # Pre-warm peer agent sessions before the first real message fires.
+            # get_agent() makes no network call; sessions are only registered on first
+            # execute().  The entry-point agent (first step's target) doesn't need
+            # pre-warming — its session registers on S001.  Its PEERS do: if they're
+            # not registered yet when the entry agent calls sessions_send, the call
+            # blocks for 120 s.  Warming peers only (concurrently) avoids the nested
+            # sessions_send race that a full concurrent pre-warm would cause.
+            entry_target = messages[0]["target"] if messages else None
+            peer_handles = {
+                obj_id: handle
+                for obj_id, handle in handles.items()
+                if obj_id != entry_target
+            }
+            if peer_handles:
+                init_tasks = [
+                    handle.execute("[System]: Session initialisation ping — please acknowledge briefly.")
+                    for handle in peer_handles.values()
+                ]
+                await asyncio.gather(*init_tasks, return_exceptions=True)
 
-        result = agent.send_message(msg["content"])
-        content = result["content"]
-        latency_ms = result["latency_ms"]
+        for msg in messages:
+            if steps_only and msg["kind"] != "step":
+                break
 
-        if mock_server:
-            time.sleep(0.3)
-            new_calls = mock_server.get_log()
-            run_mock_log.extend(new_calls)
+            target_id = msg["target"]
+            lookup_id = single_agent_id if single_agent_id else target_id
+            handle = handles.get(lookup_id)
+            if handle is None:
+                if verbose:
+                    print(f"  Warning: no handle for target {lookup_id!r}, skipping")
+                continue
 
-            # Synchronously dispatch events triggered by tool calls in this message.
-            # This mirrors MockInProcessExecutor.execute() in evaluate.py: instead of
-            # relying on /hooks/wake (which fires after the session closes), we dispatch
-            # the triggered message directly to the correct agent right now.
-            for call in new_calls:
-                if call.get("is_callback") or call.get("is_orchestration"):
-                    continue
-                tool_def = tool_trigger_map.get(call["method"])
-                if tool_def is None:
-                    continue
-                if not _tool_call_matches(tool_def.match, call.get("args", {})):
-                    continue
-                for trigger in tool_def.triggers:
-                    tgt_agent = agents.get(trigger.target_object_id)
-                    if tgt_agent is None:
-                        if verbose:
-                            print(f"  Warning: trigger target {trigger.target_object_id!r} not in agents, skipping")
+            # Configure mock server session key (also clears the per-message log).
+            # The full OpenClaw session key is agent:{agent_id}:{session_name}.
+            if mock_server:
+                sname = session_names[lookup_id]
+                agent_id_for_key = f"{lookup_id}{slot_suffix}" if not single_agent_id else lookup_id
+                mock_key = f"agent:{agent_id_for_key}:{sname}"
+                mock_server.configure(mock_key, slot_id=slot_suffix or "default")
+
+            t0 = time.time()
+            result = await handle.execute(msg["content"])
+            latency_ms = (time.time() - t0) * 1000
+            content = result.content if result.success else f"(error: {result.content})"
+
+            # Collect tool calls for this event only
+            event_tool_calls: list[dict] = []
+
+            if mock_server:
+                if single_agent_id:
+                    # Single-agent: no agentToAgent chains, short wait suffices
+                    await asyncio.sleep(0.3)
+                else:
+                    # Multi-agent: wait for any agentToAgent cascade to complete
+                    await _wait_mock_quiescence(mock_server, slot_id=slot_suffix or "default")
+                event_tool_calls = mock_server.get_log(slot_id=slot_suffix or "default")
+
+                # In-process triggers: dispatch tool-triggered messages directly
+                # (mirrors MockInProcessExecutor in evaluate.py)
+                for call in list(event_tool_calls):
+                    if call.get("is_callback") or call.get("is_orchestration"):
                         continue
-                    try:
-                        trigger_msg = trigger.message_template.format(**call.get("args", {}))
-                    except KeyError:
-                        trigger_msg = trigger.message_template
-                    triggered_content = f"[Event from {trigger.source}]: {trigger_msg}"
+                    tool_def = tool_trigger_map.get(call["method"])
+                    if tool_def is None:
+                        continue
+                    if not _tool_call_matches(tool_def.match, call.get("args", {})):
+                        continue
+                    for trigger in tool_def.triggers:
+                        tgt_id = trigger.target_object_id
+                        tgt_lookup = single_agent_id if single_agent_id else tgt_id
+                        tgt_handle = handles.get(tgt_lookup)
+                        if tgt_handle is None:
+                            if verbose:
+                                print(f"  Warning: trigger target {tgt_id!r} not in handles, skipping")
+                            continue
+                        if mock_server:
+                            tgt_sname = session_names[tgt_lookup]
+                            tgt_agent_id_for_key = f"{tgt_lookup}{slot_suffix}" if not single_agent_id else tgt_lookup
+                            tgt_mock_key = f"agent:{tgt_agent_id_for_key}:{tgt_sname}"
+                            mock_server.configure(tgt_mock_key, slot_id=slot_suffix or "default")
+                        try:
+                            trigger_msg = trigger.message_template.format(**call.get("args", {}))
+                        except KeyError as _ke:
+                            import logging as _logging
+                            _logging.getLogger(__name__).warning(
+                                "Tool trigger key missing: %s  tool=%s  template=%r  args=%s",
+                                _ke, call["method"], trigger.message_template, call.get("args", {})
+                            )
+                            trigger_msg = trigger.message_template
+                        triggered_content = f"[Event from {trigger.source}]: {trigger_msg}"
+                        if verbose:
+                            print(f"  [TRIGGER→{tgt_id}] {triggered_content[:120]}")
+                        await tgt_handle.execute(triggered_content)
+                        if single_agent_id:
+                            await asyncio.sleep(0.3)
+                        else:
+                            await _wait_mock_quiescence(mock_server, max_wait_s=5.0, quiet_s=0.5,
+                                                        slot_id=slot_suffix or "default")
+                        trigger_calls = mock_server.get_log(slot_id=slot_suffix or "default")
+                        event_tool_calls.extend(trigger_calls)
+
+            # Read post-execution state(s)
+            # Quiescence ensures the cascade is complete; state.md is written synchronously
+            # by the agent before execute() returns or before the cascade's execute() returns.
+            if single_agent_id:
+                sf = openclaw_home / f"workspace-{single_agent_id}" / "state.md"
+                post_event_state = sf.read_text().strip() if sf.exists() else ""
+            else:
+                state_parts = []
+                for obj in tc.objects:
+                    sf = openclaw_home / f"workspace-{obj.object_id}{slot_suffix}" / "state.md"
+                    if sf.exists():
+                        text = sf.read_text().strip()
+                        if text:
+                            state_parts.append(f"[{obj.object_id}]:\n{text}")
+                post_event_state = "\n\n".join(state_parts)
+
+            if verbose:
+                kind_label = {"step": "STEP", "mod": "MOD", "event": "EVENT"}.get(msg["kind"], "?")
+                route_label = f"{target_id}→{single_agent_id}" if single_agent_id else target_id
+                print(f"\n{'─'*60}")
+                print(f"[{kind_label}→{route_label}] {msg['content'][:120]}")
+                print(f"  Agent: {content[:300]}")
+                if post_event_state:
+                    print(f"  State: {post_event_state[:200]}")
+
+            if msg["kind"] == "step":
+                expect = msg["expect"]
+                if expect is not None:
+                    evidence = gather_evidence(
+                        content,
+                        tool_calls=event_tool_calls if mock_server else None,
+                        state_content=post_event_state,
+                    )
+                    passed, reasoning, _votes, _in_tok, _out_tok = harness.evaluate_assertion(
+                        expect.action, evidence, prior_context)
                     if verbose:
-                        print(f"  [TRIGGER→{trigger.target_object_id}] {triggered_content[:120]}")
-                    next_key = f"eval-{trigger.target_object_id}-{tgt_agent._session_counter + 1}"
-                    mock_server.configure(next_key)
-                    tgt_agent.send_message(triggered_content)
-                    time.sleep(0.3)
-                    run_mock_log.extend(mock_server.get_log())
+                        print(f"  Expected: {expect.action}")
+                        print(f"  {'✓ PASS' if passed else '✗ FAIL'}: {reasoning[:200]}")
+                    event_results.append(EventResult(
+                        event_id=f"S{msg['index']+1:03d}",
+                        passed=passed, reasoning=reasoning,
+                        expected=expect.action, evidence=evidence,
+                        prior_context=prior_context, latency_ms=latency_ms,
+                    ))
+                prior_context = _read_prior_context(tc, openclaw_home, single_agent_id)
 
-        # Read the target agent's post-execution state.md — reflects decisions the
-        # agent persisted during this session (e.g. "approved", updated queue, etc.)
-        target_state_file = openclaw_home / f"workspace-{target_id}" / "state.md"
-        post_event_state = target_state_file.read_text().strip() if target_state_file.exists() else ""
+            elif msg["kind"] == "mod":
+                mod = msg["item"]
+                tag = f"{mod.mod_type.value}/{mod.ambiguity.value}"
+                print(f"\n  ── [{tag}] {mod.id}: {mod.intent[:70]}", flush=True)
+                mod_results.append(ModificationResult(mod_id=mod.id, latency_ms=latency_ms))
+                prior_context = _read_prior_context(tc, openclaw_home, single_agent_id)
 
-        if verbose:
-            kind_label = {"step": "STEP", "mod": "MOD", "event": "EVENT"}.get(msg["kind"], "?")
-            print(f"\n{'─'*60}")
-            print(f"[{kind_label}→{target_id}] {msg['content'][:120]}")
-            print(f"  Agent: {content[:300]}")
-            if post_event_state:
-                print(f"  State: {post_event_state[:200]}")
-
-        if msg["kind"] == "step":
-            expect = msg["expect"]
-            if expect is not None:
-                evidence = gather_evidence(
-                    content,
-                    tool_calls=run_mock_log if mock_server else None,
-                    state_content=post_event_state,
-                )
-                passed, reasoning, _votes = harness.evaluate_assertion(expect.action, evidence, prior_context)
-                if verbose:
-                    print(f"  Expected: {expect.action}")
-                    print(f"  {'✓ PASS' if passed else '✗ FAIL'}: {reasoning[:200]}")
-                event_results.append(EventResult(
-                    event_id=f"S{msg['index']+1:03d}",
-                    passed=passed,
-                    reasoning=reasoning,
-                    expected=expect.action,
-                    latency_ms=latency_ms,
-                ))
-            prior_context = _read_prior_context(tc, openclaw_home)
-
-        elif msg["kind"] == "mod":
-            mod_results.append(ModificationResult(
-                mod_id=msg["item"].id,
-                latency_ms=latency_ms,
-            ))
-            prior_context = _read_prior_context(tc, openclaw_home)
-
-        else:  # event
-            item = msg["item"]
-            if item.expect is not None:
-                evidence = gather_evidence(
-                    content,
-                    tool_calls=run_mock_log if mock_server else None,
-                    state_content=post_event_state,
-                )
-                passed, reasoning, _votes = harness.evaluate_assertion(item.expect.action, evidence, prior_context)
-                if verbose:
-                    print(f"  Expected: {item.expect.action}")
-                    print(f"  {'✓ PASS' if passed else '✗ FAIL'}: {reasoning[:200]}")
-                event_results.append(EventResult(
-                    event_id=item.id,
-                    passed=passed,
-                    reasoning=reasoning,
-                    expected=item.expect.action,
-                    latency_ms=latency_ms,
-                ))
-            prior_context = _read_prior_context(tc, openclaw_home)
+            else:  # event
+                item = msg["item"]
+                if item.expect is not None:
+                    evidence = gather_evidence(
+                        content,
+                        tool_calls=event_tool_calls if mock_server else None,
+                        state_content=post_event_state,
+                    )
+                    passed, reasoning, _votes, _in_tok, _out_tok = harness.evaluate_assertion(
+                        item.expect.action, evidence, prior_context)
+                    if verbose:
+                        print(f"  Expected: {item.expect.action}")
+                        print(f"  {'✓ PASS' if passed else '✗ FAIL'}: {reasoning[:200]}")
+                    event_results.append(EventResult(
+                        event_id=item.id, passed=passed, reasoning=reasoning,
+                        expected=item.expect.action, evidence=evidence,
+                        prior_context=prior_context, latency_ms=latency_ms,
+                        role=item.role,
+                    ))
+                prior_context = _read_prior_context(tc, openclaw_home, single_agent_id)
 
     return event_results, mod_results
+
+
+def _execute_test_case_inner(
+    tc: TestCase,
+    agents: dict[str, OpenClawAgent],
+    openclaw_home: Path,
+    harness,
+    mock_server: Optional["MockServer"] = None,
+    verbose: bool = False,
+    steps_only: bool = False,
+    single_agent_id: Optional[str] = None,
+    _partial_events: Optional[list] = None,
+    _partial_mods: Optional[list] = None,
+    slot_suffix: str = "",
+) -> tuple[list[EventResult], list[ModificationResult]]:
+    """Sync wrapper: delegate to _execute_tc_async with persistent multi-agent sessions."""
+    gateway_url = next(iter(agents.values()))._gateway_url if agents else None
+    return asyncio.run(_execute_tc_async(
+        tc, gateway_url, openclaw_home, harness,
+        mock_server, verbose, steps_only, single_agent_id,
+        _partial_events, _partial_mods,
+        slot_suffix=slot_suffix,
+    ))
 
 
 def execute_test_case(
@@ -470,26 +998,67 @@ def execute_test_case(
     mock_server: Optional[MockServer] = None,
     verbose: bool = False,
     steps_only: bool = False,
+    single_agent_id: Optional[str] = None,
+    slot_suffix: str = "",
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase with an optional wall-clock timeout."""
     if timeout_s is None:
         return _execute_test_case_inner(tc, agents, openclaw_home, harness,
                                         mock_server=mock_server, verbose=verbose,
-                                        steps_only=steps_only)
+                                        steps_only=steps_only,
+                                        single_agent_id=single_agent_id,
+                                        slot_suffix=slot_suffix)
+
+    partial_events: list[EventResult] = []
+    partial_mods: list[ModificationResult] = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_execute_test_case_inner, tc, agents, openclaw_home,
-                                 harness, mock_server, verbose, steps_only)
+        future = executor.submit(
+            _execute_test_case_inner, tc, agents, openclaw_home,
+            harness, mock_server, verbose, steps_only, single_agent_id,
+            partial_events, partial_mods, slot_suffix,
+        )
         try:
             return future.result(timeout=timeout_s)
         except concurrent.futures.TimeoutError:
             future.cancel()
-            event_results = [
-                EventResult(event_id=evt.id, passed=False, reasoning=f"Timeout after {timeout_s}s")
-                for evt in tc.events
-            ]
-            mod_results = [ModificationResult(mod_id=mod.id) for mod in tc.modifications]
-            return event_results, mod_results
+            # Preserve whatever was completed; mark the rest as timed-out failures.
+            # Note: future.cancel() doesn't stop a running thread — it may continue
+            # appending real results to partial_events after we add placeholders.
+            # We snapshot collected IDs now, add placeholders for the rest, then
+            # deduplicate keeping the last occurrence of each event_id so real
+            # results (appended later by the thread) win over placeholders.
+            collected_event_ids = {e.event_id for e in partial_events}
+            for i, step in enumerate(tc.steps):
+                eid = f"S{i+1:03d}"
+                if eid not in collected_event_ids and step.expect is not None:
+                    partial_events.append(EventResult(
+                        event_id=eid, passed=False,
+                        reasoning=f"Timeout after {timeout_s}s",
+                    ))
+            for evt in tc.events:
+                if evt.id not in collected_event_ids and evt.expect is not None:
+                    partial_events.append(EventResult(
+                        event_id=evt.id, passed=False,
+                        reasoning=f"Timeout after {timeout_s}s",
+                        role=getattr(evt, "role", None),
+                    ))
+            collected_mod_ids = {m.mod_id for m in partial_mods}
+            for mod in tc.modifications:
+                if mod.id not in collected_mod_ids:
+                    partial_mods.append(ModificationResult(mod_id=mod.id))
+
+            # Deduplicate: last occurrence of each id wins (real result > placeholder)
+            seen: dict[str, int] = {}
+            for i, e in enumerate(partial_events):
+                seen[e.event_id] = i
+            deduped = [partial_events[i] for i in sorted(seen.values())]
+
+            seen_mods: dict[str, int] = {}
+            for i, m in enumerate(partial_mods):
+                seen_mods[m.mod_id] = i
+            deduped_mods = [partial_mods[i] for i in sorted(seen_mods.values())]
+            return deduped, deduped_mods
 
 
 # ── Output path ──────────────────────────────────────────────────────────────
@@ -547,12 +1116,107 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     per_tc_stds = [statistics.stdev(rates) for rates in by_tc.values() if len(rates) > 1]
     pass_rate_std = mean(per_tc_stds)
 
+    # Steps pass rate + std (base TCs only, per-TC rates)
+    per_tc_step_rates: list[float] = []
+    for r in results:
+        if r.tc_id not in base_tc_ids:
+            continue
+        step_evts = [e for e in r.events if _STEP_EVENT_ID.match(e.event_id)]
+        if step_evts:
+            per_tc_step_rates.append(sum(1 for e in step_evts if e.passed) / len(step_evts))
+    steps_pass_rate = mean(per_tc_step_rates) if per_tc_step_rates else None
+    steps_pass_rate_std = statistics.stdev(per_tc_step_rates) if len(per_tc_step_rates) > 1 else (0.0 if per_tc_step_rates else None)
+
+    inconclusive_tc_ids: set[str] = set()
+    for r in results:
+        if any(_STEP_EVENT_ID.match(e.event_id) and not e.passed for e in r.events):
+            inconclusive_tc_ids.add(r.tc_id)
+
+    # Role-based pass rates + std: exclude events from inconclusive TCs, per-TC rates
+    def _role_pass_rate_and_std(role_val) -> tuple[Optional[float], Optional[float]]:
+        per_tc: list[float] = []
+        for r in results:
+            if r.tc_id in inconclusive_tc_ids:
+                continue
+            evts = [e for e in r.events if e.role == role_val]
+            if evts:
+                per_tc.append(sum(1 for e in evts if e.passed) / len(evts))
+        rate = mean(per_tc) if per_tc else None
+        std = statistics.stdev(per_tc) if len(per_tc) > 1 else (0.0 if per_tc else None)
+        return rate, std
+
+    conclusive_events = [
+        e for r in results if r.tc_id not in inconclusive_tc_ids
+        for e in r.events
+    ]
+    mod_events = [e for e in conclusive_events if e.role in ("pre_mod", "post_mod", "irrelevant")]
+    mod_pass_rate = (sum(1 for e in mod_events if e.passed) / len(mod_events)) if mod_events else None
+
+    per_tc_mod_rates: list[float] = []
+    for r in results:
+        if r.tc_id in inconclusive_tc_ids:
+            continue
+        evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant")]
+        if evts:
+            per_tc_mod_rates.append(sum(1 for e in evts if e.passed) / len(evts))
+    mod_pass_rate_std = statistics.stdev(per_tc_mod_rates) if len(per_tc_mod_rates) > 1 else (0.0 if per_tc_mod_rates else None)
+
+    pre_mod_pass_rate, pre_mod_pass_rate_std = _role_pass_rate_and_std("pre_mod")
+    post_mod_pass_rate, post_mod_pass_rate_std = _role_pass_rate_and_std("post_mod")
+    irrelevant_pass_rate, irrelevant_pass_rate_std = _role_pass_rate_and_std("irrelevant")
+
+    # Role-based pass rates including inconclusive TCs (indicative)
+    def _role_pass_rate_and_std_all(role_val) -> tuple[Optional[float], Optional[float]]:
+        per_tc: list[float] = []
+        for r in results:
+            evts = [e for e in r.events if e.role == role_val]
+            if evts:
+                per_tc.append(sum(1 for e in evts if e.passed) / len(evts))
+        rate = mean(per_tc) if per_tc else None
+        std = statistics.stdev(per_tc) if len(per_tc) > 1 else (0.0 if per_tc else None)
+        return rate, std
+
+    all_mod_events = [
+        e for r in results for e in r.events
+        if e.role in ("pre_mod", "post_mod", "irrelevant")
+    ]
+    mod_pass_rate_all = (sum(1 for e in all_mod_events if e.passed) / len(all_mod_events)) if all_mod_events else None
+    per_tc_mod_rates_all: list[float] = []
+    for r in results:
+        evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant")]
+        if evts:
+            per_tc_mod_rates_all.append(sum(1 for e in evts if e.passed) / len(evts))
+    mod_pass_rate_all_std = statistics.stdev(per_tc_mod_rates_all) if len(per_tc_mod_rates_all) > 1 else (0.0 if per_tc_mod_rates_all else None)
+
+    pre_mod_pass_rate_all, pre_mod_pass_rate_all_std = _role_pass_rate_and_std_all("pre_mod")
+    post_mod_pass_rate_all, post_mod_pass_rate_all_std = _role_pass_rate_and_std_all("post_mod")
+    irrelevant_pass_rate_all, irrelevant_pass_rate_all_std = _role_pass_rate_and_std_all("irrelevant")
+
     return EvalSummary(
         total_test_cases=total_test_cases,
         total_runs=total_runs,
         total_events=len(all_events),
         mean_pass_rate=mean_pass_rate,
         pass_rate_std=pass_rate_std,
+        steps_pass_rate=steps_pass_rate,
+        steps_pass_rate_std=steps_pass_rate_std,
+        mod_pass_rate=mod_pass_rate,
+        mod_pass_rate_std=mod_pass_rate_std,
+        mod_pass_rate_all=mod_pass_rate_all,
+        mod_pass_rate_all_std=mod_pass_rate_all_std,
+        pre_mod_pass_rate=pre_mod_pass_rate,
+        pre_mod_pass_rate_std=pre_mod_pass_rate_std,
+        pre_mod_pass_rate_all=pre_mod_pass_rate_all,
+        pre_mod_pass_rate_all_std=pre_mod_pass_rate_all_std,
+        post_mod_pass_rate=post_mod_pass_rate,
+        post_mod_pass_rate_std=post_mod_pass_rate_std,
+        post_mod_pass_rate_all=post_mod_pass_rate_all,
+        post_mod_pass_rate_all_std=post_mod_pass_rate_all_std,
+        irrelevant_pass_rate=irrelevant_pass_rate,
+        irrelevant_pass_rate_std=irrelevant_pass_rate_std,
+        irrelevant_pass_rate_all=irrelevant_pass_rate_all,
+        irrelevant_pass_rate_all_std=irrelevant_pass_rate_all_std,
+        inconclusive_tcs=len(inconclusive_tc_ids),
         mean_event_input_tokens=mean([e.input_tokens for e in all_events]),
         mean_event_output_tokens=mean([e.output_tokens for e in all_events]),
         mean_event_latency_ms=mean([e.latency_ms for e in all_events]),
@@ -562,12 +1226,184 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     )
 
 
+# ── Concurrent TC runner ─────────────────────────────────────────────────────
+
+async def _run_all_tcs_concurrent(
+    test_cases: list,
+    args: argparse.Namespace,
+    openclaw_home: Path,
+    harness,
+    mock_server: Optional["MockServer"],
+    single_agent_id: Optional[str],
+    output_file,
+    timeout_s: Optional[float],
+    workers: Optional[list["WorkerConfig"]] = None,
+) -> list:
+    """Run all TCs concurrently up to args.concurrency at a time.
+
+    Standard mode: each slot uses isolated workspace dirs (workspace-{id}-cN)
+    and unique session names on the shared gateway.
+
+    Pool mode (workers != None): each slot is a dedicated Docker container with
+    its own isolated gateway and mock server.  No slot_suffix needed — containers
+    are already isolated.  Agent export and configure happen lazily on first use
+    of each worker so gateway restarts are staggered across workers.
+    """
+    concurrency = len(workers) if workers else getattr(args, "concurrency", 1)
+    sem = asyncio.Semaphore(concurrency)
+    slot_queue: asyncio.Queue[int] = asyncio.Queue()
+    for s in range(concurrency):
+        slot_queue.put_nowait(s)
+
+    results_lock = asyncio.Lock()
+    all_tc_results: list = []
+    # Per-slot dedup: track which sample_ids have been exported for each slot
+    seen_exports_per_slot: dict[int, set[str]] = {s: set() for s in range(concurrency)}
+
+    async def _run_one(tc_idx: int, tc) -> None:
+        async with sem:
+            slot = await slot_queue.get()
+            try:
+                # ── Resolve gateway / mock server / openclaw_home for this slot ──
+                if workers:
+                    worker = workers[slot]
+                    slot_gateway_url = worker.gateway_url
+                    slot_openclaw_home = worker.data_dir
+                    slot_container_home = Path(worker.container_home)
+                    slot_mock_server: Any = RemoteMockServer(worker.mock_server_url)
+                    slot_suffix = ""  # container-isolated; no ID suffix needed
+                else:
+                    slot_gateway_url = args.gateway_url
+                    slot_openclaw_home = openclaw_home
+                    slot_container_home = None
+                    slot_mock_server = mock_server
+                    slot_suffix = "" if slot == 0 else f"-c{slot}"
+
+                # ── Lazy export + configure (pool mode only; standard pre-exports) ──
+                if workers and tc.sample_id not in seen_exports_per_slot[slot]:
+                    seen_exports_per_slot[slot].add(tc.sample_id)
+                    agent_model = getattr(args, "model", None) or "gpt-4o"
+                    agent_provider = getattr(args, "provider", None) or infer_provider(agent_model)
+                    if single_agent_id:
+                        export_single_agent_workspace(tc.objects, slot_openclaw_home,
+                                                      agent_id=single_agent_id, force=True)
+                        await _configure_single_openclaw_agent(
+                            single_agent_id, agent_provider, agent_model,
+                            slot_openclaw_home, slot_gateway_url,
+                            path_prefix=slot_container_home,
+                        )
+                    else:
+                        export_workflow_from_objects(tc.objects, slot_openclaw_home,
+                                                     force=True, write_config=False)
+                        await _configure_openclaw_agents(
+                            tc.objects, agent_provider, agent_model,
+                            slot_openclaw_home, slot_gateway_url,
+                            path_prefix=slot_container_home,
+                        )
+
+                if slot_mock_server is not None:
+                    tc_mock_script = resolve_mock_configs(tc)
+                    tc_mock_script = merge_tc_mock_tools(tc_mock_script, tc.mock_tools)
+                    if workers:
+                        # RemoteMockServer: stash script so configure() sends it in the POST body
+                        slot_mock_server._pending_mock_script = tc_mock_script
+                    else:
+                        mock_server._state.get_slot(slot_suffix or "default").mock_script = tc_mock_script  # type: ignore[union-attr]
+
+                if single_agent_id:
+                    agents = {single_agent_id: OpenClawAgent(single_agent_id, gateway_url=slot_gateway_url)}
+                else:
+                    agents = {
+                        f"{obj.object_id}{slot_suffix}": OpenClawAgent(
+                            f"{obj.object_id}{slot_suffix}", gateway_url=slot_gateway_url
+                        )
+                        for obj in tc.objects
+                    }
+
+                for run_idx in range(args.runs):
+                    # Clear agent session transcripts AND state.md before each run.
+                    #
+                    # Session transcript bleed: _global_counter resets to 0 each time
+                    # the script is invoked, so the first run always uses session name
+                    # "eval-ma-1". If a previous invocation wrote a transcript for that
+                    # name, the gateway reuses it — loading old conversation history
+                    # (stale captures, "Slack paused" directives, etc.).  Clearing ALL
+                    # sessions for each agent ensures a genuinely fresh start.
+                    #
+                    # State.md bleed: the gateway caches state.md in memory after
+                    # agent registration. Deleting state.md here ensures the on-disk
+                    # file is clean before _execute_tc_async's reset_agent_state
+                    # writes the authoritative initial state, and before the agent
+                    # re-reads it at session start.
+                    agent_ids = (
+                        [single_agent_id] if single_agent_id
+                        else [f"{obj.object_id}{slot_suffix}" for obj in tc.objects]
+                    )
+                    for aid in agent_ids:
+                        _clear_agent_sessions(aid, slot_openclaw_home)
+                        state_file = slot_openclaw_home / f"workspace-{aid}" / "state.md"
+                        state_file.unlink(missing_ok=True)
+
+                    event_results, mod_results = await _execute_tc_async(
+                        tc, slot_gateway_url, slot_openclaw_home, harness,
+                        slot_mock_server,
+                        getattr(args, "verbose", False),
+                        getattr(args, "steps_only", False),
+                        single_agent_id,
+                        None, None,
+                        slot_suffix=slot_suffix,
+                    )
+                    pass_rate = (
+                        sum(1 for e in event_results if e.passed) / len(event_results)
+                        if event_results else None
+                    )
+                    tc_result = TestCaseResult(
+                        tc_id=tc.id,
+                        sample_id=tc.sample_id,
+                        tc_index=tc_idx,
+                        name=tc.name,
+                        domain=tc.domain,
+                        run_index=run_idx,
+                        events=event_results,
+                        modifications=mod_results,
+                        pass_rate=pass_rate,
+                    )
+                    async with results_lock:
+                        all_tc_results.append(tc_result)
+                        output_file.write(tc_result.model_dump_json() + "\n")
+                        output_file.flush()
+                        passed_n = sum(1 for e in event_results if e.passed)
+                        total_n = len(event_results)
+                        rate_str = f"{pass_rate:.0%}" if pass_rate is not None else "N/A"
+                        mod_type_str = tc.modifications[0].mod_type.value if tc.modifications else "none"
+                        print(f"  {tc.id}[{mod_type_str}] run={run_idx} [slot={slot}] "
+                              f"pass={passed_n}/{total_n} ({rate_str})")
+            except Exception as exc:
+                async with results_lock:
+                    print(f"  TC {tc.id} [slot={slot}] FAILED: {exc}", file=sys.stderr)
+            finally:
+                slot_queue.put_nowait(slot)
+
+    await asyncio.gather(*[_run_one(i, tc) for i, tc in enumerate(test_cases)])
+    return all_tc_results
+
+
 # ── Main runner ──────────────────────────────────────────────────────────────
 
 def run(args: argparse.Namespace) -> Path:
     """Run baseline evaluation. Returns the output path."""
+    print(f"evaluate_baseline {_VERSION}")
+    import os
     if args.output is None:
         args.output = default_output_path(args.input)
+
+    # Ensure the gateway token is available as an env var so the SDK picks it up
+    # regardless of which code path triggers a connection.
+    openclaw_home: Path = Path(getattr(args, "openclaw_home", "~/.openclaw")).expanduser()
+    if not os.environ.get("OPENCLAW_GATEWAY_TOKEN"):
+        token = _load_openclaw_token(openclaw_home)
+        if token:
+            os.environ["OPENCLAW_GATEWAY_TOKEN"] = token
 
     if not args.input.exists():
         print(f"Error: Input file not found: {args.input}", file=sys.stderr)
@@ -611,43 +1447,95 @@ def run(args: argparse.Namespace) -> Path:
         test_cases = deduped
 
     timeout_s: Optional[float] = getattr(args, "timeout", None)
-    openclaw_home: Path = Path(getattr(args, "openclaw_home", "~/.openclaw")).expanduser()
 
     agent_model: Optional[str] = getattr(args, "model", None)
     agent_provider: Optional[str] = getattr(args, "provider", None)
     if agent_model and not agent_provider:
         agent_provider = infer_provider(agent_model)
 
-    judge_model = args.judge_model or agent_model or "gpt-4o"
+    judge_model = args.judge_model or "claude-sonnet-4-6"
     judge_provider = args.judge_provider or infer_provider(judge_model)
 
+    multi_agent: bool = getattr(args, "multi_agent", False)
+    single_agent_id: Optional[str] = None if multi_agent else "lnl-eval"
+
+    # ── Docker worker pool ────────────────────────────────────────────────────
+    pool_config_path = getattr(args, "pool", None)
+    workers: Optional[list[WorkerConfig]] = None
+    if pool_config_path:
+        workers = _load_pool_config(Path(pool_config_path))
+        # Pool mode: each worker authenticates with its own token from data_dir/openclaw.json.
+        # Clear any global env var so _openclaw_connect_kwargs reads per-worker tokens instead.
+        os.environ.pop("OPENCLAW_GATEWAY_TOKEN", None)
+
+        # Sync gateway auth token: the SDK sends the local device operator token in
+        # connect.params.auth.token (from ~/.openclaw/identity/device-auth.json).
+        # The container gateway must be configured with this same value.
+        operator_token = _load_device_operator_token()
+        if operator_token:
+            restarted_workers: list[WorkerConfig] = []
+            for w in workers:
+                if _ensure_worker_gateway_token(w, operator_token):
+                    restarted_workers.append(w)
+            if restarted_workers:
+                # Wait for restarted containers to become healthy before proceeding.
+                print("  Waiting for restarted containers to become ready...")
+                for w in restarted_workers:
+                    RemoteMockServer(w.mock_server_url).wait_ready(timeout=60.0)
+                    print(f"  [{w.name}] ready.")
+        else:
+            print("  WARNING: No local device operator token found. "
+                  "Gateway auth may fail. Run 'openclaw login' or ensure "
+                  "~/.openclaw/identity/device-auth.json exists.")
+
     print(f"Loaded {len(test_cases)} test cases from {args.input}")
-    print(f"Mode: baseline (OpenClaw multi-agent)")
-    print(f"OpenClaw home: {openclaw_home}")
+    print(f"Mode: baseline (OpenClaw {'multi-agent' if multi_agent else 'single-agent'})")
+    if workers:
+        print(f"Pool: {len(workers)} workers")
+        for w in workers:
+            w.data_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  {w.name}: gateway={w.gateway_url}  mock={w.mock_server_url}  data={w.data_dir}")
+    else:
+        print(f"OpenClaw home: {openclaw_home}")
     if agent_model:
         print(f"Agent model: {agent_provider}/{agent_model}")
     print(f"Judge: {judge_provider}/{judge_model}")
     print(f"Runs per test case: {args.runs}")
     print(f"Timeout per run: {timeout_s}s" if timeout_s else "Timeout: none")
-    if args.gateway_url:
+    if args.gateway_url and not workers:
         print(f"Gateway: {args.gateway_url}")
     print()
 
-    # Build MockServer (optional)
+    # Build MockServer (optional) — local or remote (Docker container)
+    # In pool mode each worker has its own RemoteMockServer created per-slot.
     mock_server: Optional[MockServer] = None
-    if getattr(args, "mock_server", False):
-        openclaw_http_url = getattr(args, "openclaw_http_url", "http://localhost:18789")
-        mock_port = getattr(args, "mock_server_port", 18888)
-        llm_mode = getattr(args, "mock_llm_mode", False)
-        print(f"Mock server: enabled (port {mock_port}, {'LLM' if llm_mode else 'script'} mode)")
-        mock_server = MockServer(
-            openclaw_url=openclaw_http_url,
-            port=mock_port,
-            llm_mode=llm_mode,
-        )
-        mock_server.start()
-        mock_server.wait_ready()
-        print("Mock server: ready")
+    if workers:
+        print("Mock server: per-worker (pool mode)")
+        for w in workers:
+            rs = RemoteMockServer(w.mock_server_url)
+            rs.wait_ready()
+            print(f"  {w.name} mock server: ready")
+    else:
+        mock_server_url = getattr(args, "mock_server_url", None)
+        if mock_server_url:
+            print(f"Mock server: remote at {mock_server_url}")
+            mock_server = RemoteMockServer(mock_server_url)  # type: ignore[assignment]
+            mock_server.wait_ready()
+            print("Mock server: ready")
+        elif getattr(args, "mock_server", False):
+            openclaw_http_url = getattr(args, "openclaw_http_url", "http://localhost:18789")
+            mock_port = getattr(args, "mock_server_port", 18888)
+            llm_mode = getattr(args, "mock_llm_mode", False)
+            print(f"Mock server: enabled (port {mock_port}, {'LLM' if llm_mode else 'script'} mode)")
+            mock_server = MockServer(
+                openclaw_url=openclaw_http_url,
+                openclaw_hook_token=_load_openclaw_token(openclaw_home),
+                port=mock_port,
+                llm_mode=llm_mode,
+            )
+            mock_server.start()
+            mock_server.wait_ready()
+            print("Mock server: ready")
 
 
     if judge_provider == "openai":
@@ -669,31 +1557,113 @@ def run(args: argparse.Namespace) -> Path:
     seen_samples: set[str] = set()
     effective_provider = agent_provider or "openai"
 
-    with open(args.output, "w") as f:
-        for tc_idx, tc in enumerate(test_cases):
-            # Export + register agents when object structure is new (dedup by sample_id)
-            if tc.sample_id not in seen_samples:
-                print(f"  Exporting agents for sample {tc.sample_id!r} "
-                      f"({len(tc.objects)} objects: {[o.object_id for o in tc.objects]})")
-                export_workflow_from_objects(tc.objects, openclaw_home, force=True)
+    # Serialize all runtime params (including defaults) for the metadata header
+    def _serialize_arg(v: object) -> object:
+        if isinstance(v, Path):
+            return str(v)
+        return v
 
+    run_params = {k: _serialize_arg(v) for k, v in vars(args).items()}
+    meta_record = {
+        "type": "meta",
+        "timestamp": datetime.now().isoformat(),
+        "version": _VERSION,
+        "params": run_params,
+    }
+
+
+    concurrency = len(workers) if workers else getattr(args, "concurrency", 1)
+
+    with open(args.output, "w") as f:
+        f.write(json.dumps(meta_record) + "\n")
+
+        if workers:
+            # ── Docker worker pool ─────────────────────────────────────────────
+            # Each slot is a dedicated container.  Export + configure happen
+            # lazily inside _run_all_tcs_concurrent so gateway restarts are
+            # staggered across workers rather than happening all at once here.
+            print(f"Pool: dispatching {len(test_cases)} TCs across {len(workers)} workers ...")
+            all_tc_results = asyncio.run(_run_all_tcs_concurrent(
+                test_cases, args, openclaw_home, harness, None,
+                single_agent_id, f, timeout_s, workers=workers,
+            ))
+        elif concurrency > 1 and not single_agent_id:
+            # ── Concurrent multi-agent mode ───────────────────────────────────
+            # Pre-export all unique samples for all concurrent slots, THEN dispatch.
+            print(f"Concurrency: {concurrency} slots (multi-agent)")
+            seen_exports: set[str] = set()
+            for tc in test_cases:
+                if tc.sample_id in seen_exports:
+                    continue
+                seen_exports.add(tc.sample_id)
+                print(f"  Exporting slot-0 agents for sample {tc.sample_id!r} "
+                      f"({[o.object_id for o in tc.objects]})")
+                export_workflow_from_objects(tc.objects, openclaw_home, force=True, write_config=False)
                 if agent_model or agent_provider:
                     effective_provider = asyncio.run(_configure_openclaw_agents(
-                        tc.objects,
-                        agent_provider or "openai",
-                        agent_model or "gpt-4o",
-                        openclaw_home,
-                        args.gateway_url,
+                        tc.objects, agent_provider or "openai", agent_model or "gpt-4o",
+                        openclaw_home, args.gateway_url,
                     ))
-                    print(f"  Configured agents: {effective_provider}/{agent_model or 'gpt-4o'}")
+                for slot in range(1, concurrency):
+                    slot_suffix = f"-c{slot}"
+                    slotted_objs = _slot_objects(tc.objects, slot_suffix)
+                    print(f"  Exporting slot-{slot} agents ({[o.object_id for o in slotted_objs]})")
+                    export_workflow_from_objects(slotted_objs, openclaw_home, force=True, write_config=False)
+                    if agent_model or agent_provider:
+                        asyncio.run(_configure_openclaw_agents(
+                            slotted_objs, agent_provider or "openai", agent_model or "gpt-4o",
+                            openclaw_home, args.gateway_url,
+                        ))
+            print(f"  Running {len(test_cases)} TCs with concurrency={concurrency} ...")
+            all_tc_results = asyncio.run(_run_all_tcs_concurrent(
+                test_cases, args, openclaw_home, harness, mock_server,
+                single_agent_id, f, timeout_s,
+            ))
+        # ── Sequential mode ─ runs when concurrency == 1 or single-agent ────────
+        _ran_concurrent = workers is not None or (concurrency > 1 and not single_agent_id)
+        for tc_idx, tc in enumerate(test_cases):
+            if _ran_concurrent:
+                break  # skip sequential loop when concurrent mode already ran all TCs
+            # Export + register agents when object structure is new (dedup by sample_id)
+            if tc.sample_id not in seen_samples:
+
+                if single_agent_id:
+                    print(f"  Exporting single agent '{single_agent_id}' for sample {tc.sample_id!r} "
+                          f"({len(tc.objects)} objects: {[o.object_id for o in tc.objects]})")
+                    export_single_agent_workspace(tc.objects, openclaw_home, agent_id=single_agent_id, force=True)
+                    if agent_model or agent_provider:
+                        effective_provider = asyncio.run(_configure_single_openclaw_agent(
+                            single_agent_id,
+                            agent_provider or "openai",
+                            agent_model or "gpt-4o",
+                            openclaw_home,
+                            args.gateway_url,
+                        ))
+                        print(f"  Configured agent: {effective_provider}/{agent_model or 'gpt-4o'}")
+                else:
+                    print(f"  Exporting agents for sample {tc.sample_id!r} "
+                          f"({len(tc.objects)} objects: {[o.object_id for o in tc.objects]})")
+                    export_workflow_from_objects(tc.objects, openclaw_home, force=True, write_config=False)
+                    if agent_model or agent_provider:
+                        effective_provider = asyncio.run(_configure_openclaw_agents(
+                            tc.objects,
+                            agent_provider or "openai",
+                            agent_model or "gpt-4o",
+                            openclaw_home,
+                            args.gateway_url,
+                        ))
+                        print(f"  Configured agents: {effective_provider}/{agent_model or 'gpt-4o'}")
 
                 seen_samples.add(tc.sample_id)
 
-            # Build per-object agents dict (fresh per TC so session counters reset)
-            agents = {
-                obj.object_id: OpenClawAgent(obj.object_id, gateway_url=args.gateway_url)
-                for obj in tc.objects
-            }
+            # Build agents dict (fresh per TC so session counters reset)
+            if single_agent_id:
+                agents = {single_agent_id: OpenClawAgent(single_agent_id, gateway_url=args.gateway_url)}
+            else:
+                agents = {
+                    obj.object_id: OpenClawAgent(obj.object_id, gateway_url=args.gateway_url)
+                    for obj in tc.objects
+                }
 
             if mock_server is not None:
                 tc_mock_script = resolve_mock_configs(tc)
@@ -701,7 +1671,8 @@ def run(args: argparse.Namespace) -> Path:
                 mock_server._state.mock_script = tc_mock_script
 
             for run_idx in range(args.runs):
-                label = f"{tc.id} run={run_idx}"
+                mod_type_str = tc.modifications[0].mod_type.value if tc.modifications else "none"
+                label = f"{tc.id}[{mod_type_str}] run={run_idx}"
                 print(f"  Evaluating {label} ...", end=" ", flush=True)
                 try:
                     event_results, mod_results = execute_test_case(
@@ -709,6 +1680,7 @@ def run(args: argparse.Namespace) -> Path:
                         mock_server=mock_server,
                         verbose=getattr(args, "verbose", False),
                         steps_only=getattr(args, "steps_only", False),
+                        single_agent_id=single_agent_id,
                     )
                     pass_rate = (
                         sum(1 for e in event_results if e.passed) / len(event_results)
@@ -728,10 +1700,50 @@ def run(args: argparse.Namespace) -> Path:
                     f.write(tc_result.model_dump_json() + "\n")
                     f.flush()
                     all_tc_results.append(tc_result)
-                    rate_str = f"{pass_rate:.2f}" if pass_rate is not None else "N/A"
-                    print(f"pass_rate={rate_str}")
+                    passed_n = sum(1 for e in event_results if e.passed)
+                    total_n = len(event_results)
+                    rate_str = f"{pass_rate:.0%}" if pass_rate is not None else "N/A"
+                    detail = format_tc_event_detail(event_results)
+                    suffix = f"  {detail}" if detail else ""
+                    print(f"pass={passed_n}/{total_n} ({rate_str}){suffix}")
                 except Exception as e:
-                    print(f"FAILED: {e}", file=sys.stderr)
+                    err_str = str(e)
+                    # "Not connected" typically means the gateway restarted mid-run
+                    # (config patch triggers a restart). Retry once after waiting.
+                    if "not connected" in err_str.lower() or "connect" in err_str.lower():
+                        print(f"RETRYING (gateway reconnect): {e}", file=sys.stderr)
+                        try:
+                            asyncio.run(_wait_for_gateway(getattr(args, "gateway_url", None), openclaw_home))
+                            event_results, mod_results = execute_test_case(
+                                tc, agents, openclaw_home, harness, timeout_s,
+                                mock_server=mock_server,
+                                verbose=getattr(args, "verbose", False),
+                                steps_only=getattr(args, "steps_only", False),
+                                single_agent_id=single_agent_id,
+                            )
+                            pass_rate = (
+                                sum(1 for e in event_results if e.passed) / len(event_results)
+                                if event_results else None
+                            )
+                            tc_result = TestCaseResult(
+                                tc_id=tc.id, sample_id=tc.sample_id, tc_index=tc_idx,
+                                name=tc.name, domain=tc.domain, run_index=run_idx,
+                                events=event_results, modifications=mod_results,
+                                pass_rate=pass_rate,
+                            )
+                            f.write(tc_result.model_dump_json() + "\n")
+                            f.flush()
+                            all_tc_results.append(tc_result)
+                            passed_n = sum(1 for e in event_results if e.passed)
+                            total_n = len(event_results)
+                            rate_str = f"{pass_rate:.0%}" if pass_rate is not None else "N/A"
+                            detail = format_tc_event_detail(event_results)
+                            suffix = f"  {detail}" if detail else ""
+                            print(f"pass={passed_n}/{total_n} ({rate_str}){suffix}")
+                        except Exception as e2:
+                            print(f"FAILED (retry): {e2}", file=sys.stderr)
+                    else:
+                        print(f"FAILED: {e}", file=sys.stderr)
 
     summary = _compute_summary(all_tc_results)
     with open(args.output, "a") as f:
@@ -740,9 +1752,28 @@ def run(args: argparse.Namespace) -> Path:
     if mock_server is not None:
         mock_server.stop()
 
+    def _fmt(v):
+        return f"{v:.3f}" if v is not None else "N/A"
+
     print()
     print(f"Complete. Output: {args.output}")
-    print(f"Mean pass rate: {summary.mean_pass_rate:.3f}  std: {summary.pass_rate_std:.3f}")
+    def _fmts(v, s) -> str:
+        return f"{_fmt(v)}  std: {_fmt(s)}"
+
+    has_inconclusive = summary.inconclusive_tcs > 0
+
+    def _fmt_mod(conclusive, conclusive_std, all_val, all_std) -> str:
+        if not has_inconclusive:
+            return _fmts(conclusive, conclusive_std)
+        return f"Inconclusive  ({_fmts(all_val, all_std)})"
+
+    print(f"Mean pass rate:      {_fmts(summary.mean_pass_rate, summary.pass_rate_std)}")
+    print(f"Steps pass rate:     {_fmts(summary.steps_pass_rate, summary.steps_pass_rate_std)}")
+    print(f"Mod pass rate:       {_fmt_mod(summary.mod_pass_rate, summary.mod_pass_rate_std, summary.mod_pass_rate_all, summary.mod_pass_rate_all_std)}  (pre+post+irrelevant)")
+    print(f"  Pre-mod:           {_fmt_mod(summary.pre_mod_pass_rate, summary.pre_mod_pass_rate_std, summary.pre_mod_pass_rate_all, summary.pre_mod_pass_rate_all_std)}")
+    print(f"  Post-mod:          {_fmt_mod(summary.post_mod_pass_rate, summary.post_mod_pass_rate_std, summary.post_mod_pass_rate_all, summary.post_mod_pass_rate_all_std)}")
+    print(f"  Irrelevant:        {_fmt_mod(summary.irrelevant_pass_rate, summary.irrelevant_pass_rate_std, summary.irrelevant_pass_rate_all, summary.irrelevant_pass_rate_all_std)}")
+    print(f"Inconclusive TCs:    {summary.inconclusive_tcs}")
     return args.output
 
 
@@ -764,10 +1795,10 @@ Examples:
                         help="Output JSONL path (default: {stem}_baseline.jsonl next to input)")
     parser.add_argument("--runs", type=int, default=1,
                         help="Number of runs per test case (default: 1)")
-    parser.add_argument("--timeout", type=float, default=120.0, metavar="SECONDS",
-                        help="Wall-clock timeout per test case run (default: 120)")
-    parser.add_argument("--model", "-m", default=None, metavar="MODEL",
-                        help="Model for OpenClaw agents (e.g. gpt-4o). Provider inferred from name.")
+    parser.add_argument("--timeout", type=float, default=180.0, metavar="SECONDS",
+                        help="Wall-clock timeout per test case run (default: 180)")
+    parser.add_argument("--model", "-m", default="claude-sonnet-4-6", metavar="MODEL",
+                        help="Model for OpenClaw agents (default: claude-sonnet-4-6). Provider inferred from name.")
     parser.add_argument("--provider", "-p", choices=["openai", "anthropic", "google"], default=None,
                         help="LLM provider (overrides inference from --model)")
     parser.add_argument("--verbose", "-v", action="store_true", default=False,
@@ -777,15 +1808,15 @@ Examples:
     parser.add_argument("--openclaw-home", default="~/.openclaw",
                         help="Root OpenClaw directory for agent workspaces (default: ~/.openclaw)")
     parser.add_argument("--judge-model", default=None,
-                        help="Model for LLM-as-judge (default: same as --model)")
+                        help="Model for LLM-as-judge (default: claude-sonnet-4-6)")
     parser.add_argument("--judge-provider", choices=["openai", "anthropic", "google"], default=None,
                         help="Provider for judge model (inferred from --judge-model if not specified)")
     parser.add_argument("--limit", "-n", type=int, default=None,
                         help="Process only the first N test cases")
     parser.add_argument("--tc", nargs="+", metavar="INDEX_OR_ID",
                         help="Run specific test cases by 1-based index or ID. Overrides --limit.")
-    parser.add_argument("--mock-server", action="store_true", default=False,
-                        help="Enable mock external system integration (Slack, Email, Jira, etc.)")
+    parser.add_argument("--mock-server", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable mock external system integration (default: enabled). Use --no-mock-server to disable.")
     parser.add_argument("--mock-server-port", type=int, default=18888,
                         help="Port for the mock server (default: 18888)")
     parser.add_argument("--mock-llm-mode", action="store_true", default=False,
@@ -795,6 +1826,21 @@ Examples:
                              "Deduplicates by sample_id.")
     parser.add_argument("--openclaw-http-url", default="http://localhost:18789",
                         help="OpenClaw gateway HTTP URL for callback injection (default: http://localhost:18789)")
+    parser.add_argument("--mock-server-url", default=None, metavar="URL",
+                        help="URL of a remote mock server already running (e.g. in a Docker container). "
+                             "When set, skips starting a local mock server and connects to this URL instead.")
+    parser.add_argument("--single-agent", dest="multi_agent", action="store_false",
+                        help="Use a single combined agent for all LNL-objects instead of one agent per object.")
+    parser.set_defaults(multi_agent=True)
+    parser.add_argument("--concurrency", "-j", type=int, default=1, metavar="N",
+                        help="Number of TCs to run concurrently (default: 1). "
+                             "N>1 requires --multi-agent. Each concurrent slot gets isolated "
+                             "workspace dirs (workspace-{id}-cN) and session names.")
+    parser.add_argument("--pool", default=None, metavar="YAML",
+                        help="Path to a worker-pool YAML file (see docker/worker-pool.yaml). "
+                             "Distributes TCs across Docker worker containers, each with its own "
+                             "isolated OpenClaw gateway and mock server. Overrides --concurrency, "
+                             "--gateway-url, and --mock-server-url.")
     return parser
 
 

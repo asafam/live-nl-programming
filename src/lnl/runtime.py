@@ -150,6 +150,10 @@ class Runtime:
         self._results_lock = threading.Lock()
         self._sequence_counter = 0
 
+        # Deterministic message ID counter
+        self._msg_counter = 0
+        self._msg_counter_lock = threading.Lock()
+
         # One transaction active at a time; _dispatch_lock serializes _dispatch calls
         self._current_transaction: Optional[_Transaction] = None
         self._dispatch_lock = threading.Lock()
@@ -170,6 +174,13 @@ class Runtime:
 
         # Wire bus schedule callback — objects schedule themselves when mail arrives
         self._bus.set_schedule_callback(self._schedule_object)
+
+    def _next_msg_id(self, sender: str) -> str:
+        """Return a deterministic message ID: '<sender>-<n>' with a monotonic counter."""
+        with self._msg_counter_lock:
+            n = self._msg_counter
+            self._msg_counter += 1
+        return f"{sender}-{n}"
 
     # --- Loading ---
 
@@ -257,6 +268,7 @@ class Runtime:
             type=MessageType.DOMAIN,
             content=content,
             depth_remaining=self._max_chain_depth,
+            id=self._next_msg_id(sender),
         )
         if self._running.is_set():
             item = _WorkItem(message=msg)
@@ -301,6 +313,7 @@ class Runtime:
             type=MessageType.DOMAIN,
             content=content,
             depth_remaining=self._max_chain_depth,
+            id=self._next_msg_id(sender),
         )
         if self._running.is_set():
             item = _WorkItem(message=msg)
@@ -323,6 +336,7 @@ class Runtime:
             content=content,
             topic=topic,
             depth_remaining=self._max_chain_depth,
+            id=self._next_msg_id(sender),
         )
         if self._running.is_set():
             item = _WorkItem(message=msg)
@@ -343,7 +357,15 @@ class Runtime:
         if transaction:
             transaction.increment()
 
-        future = self._pool.submit(obj.read, self._on_result)
+        try:
+            future = self._pool.submit(obj.read, self._on_result)
+        except RuntimeError:
+            # Pool already shut down (e.g. a reply arrives just after the last
+            # TC completes and the executor is torn down). Safe to ignore —
+            # the evaluation is over and there is no transaction to decrement.
+            if transaction:
+                transaction.decrement()
+            return
 
         with self._futures_lock:
             self._active_futures[obj.object_id] = future
@@ -381,7 +403,7 @@ class Runtime:
             "[seq=%d] %s processed msg from %s (%s) → reply=%s, outgoing=%s",
             result.sequence, obj_id, result.in_reply_to,
             result.source_message_type.value if result.source_message_type else "?",
-            repr(result.reply[:80]) if result.reply else "(empty)",
+            repr(str(result.reply)[:80]) if result.reply else "(empty)",
             [o.recipient for o in result.outgoing_messages],
         )
 
@@ -408,6 +430,8 @@ class Runtime:
                     type=MessageType.REPLY,
                     content=result.reply,
                     depth_remaining=next_depth,
+                    id=self._next_msg_id(obj_id),
+                    in_reply_to=result.source_message_id,
                 )
                 self._bus.deliver(reply_msg)
                 logger.debug("  ↩ reply routed: %s → %s", obj_id, result.in_reply_to)
@@ -429,11 +453,19 @@ class Runtime:
                 type=MessageType.DOMAIN,
                 content=out.content,
                 depth_remaining=next_depth,
+                id=self._next_msg_id(obj_id),
+                reference=out.reference,
+                expects_reply=out.expects_reply,
             )
             self._bus.deliver(chained)
-            logger.debug("  → outgoing: %s → %s: %s", obj_id, out.recipient, repr(out.content[:80]))
-            with self._awaiting_lock:
-                self._awaiting_reply.setdefault(obj_id, set()).add(out.recipient)
+            logger.debug(
+                "  → outgoing (%s): %s → %s: %s",
+                "ask" if out.expects_reply else "tell",
+                obj_id, out.recipient, repr(str(out.content)[:80]),
+            )
+            if out.expects_reply:
+                with self._awaiting_lock:
+                    self._awaiting_reply.setdefault(obj_id, set()).add(out.recipient)
 
     def _dispatch(
         self,
@@ -474,6 +506,7 @@ class Runtime:
                 type=MessageType.EVENT,
                 content=envelope.content,
                 depth_remaining=self._max_chain_depth,
+                id=self._next_msg_id(envelope.source_id),
             )
             self._bus.deliver(msg)
 

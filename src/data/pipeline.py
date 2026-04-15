@@ -288,6 +288,41 @@ def _autopatch_sample(sample, blocking: dict) -> tuple[bool, dict]:
         else:
             remaining.pop("find_unreachable_objects")
 
+    # --- Patch: peer_graph_cycles (remove back-edges into entry points) ---
+    # Strategy: for each cycle A → B → … → A, identify edges that point back
+    # to an entry point (has event_sources). Remove those edges from the
+    # non-entry-point objects. This breaks the cycle with minimal disruption:
+    # downstream workers can still send outward, just not back to the trigger.
+    if "find_peer_graph_cycles" in remaining:
+        entry_ids = {o.object_id for o in sample.objects if o.event_sources}
+        unfixed_cycles = []
+        for issue in remaining["find_peer_graph_cycles"]:
+            # Parse "Peer graph cycle detected: A → B → A — ..."
+            m = re.search(r"Peer graph cycle detected: ([\w →-]+?) —", issue)
+            if not m:
+                unfixed_cycles.append(issue)
+                continue
+            # Nodes in cycle (first and last are the same repeated entry)
+            nodes = [n.strip() for n in re.split(r"\s*→\s*", m.group(1).strip())]
+            # Find back-edges: edge X → Y where Y is an entry point
+            fixed = False
+            for i in range(len(nodes) - 1):
+                src, dst = nodes[i], nodes[i + 1]
+                if dst in entry_ids:
+                    src_obj = object_map.get(src)
+                    if src_obj:
+                        before = len(src_obj.peers)
+                        src_obj.peers = [p for p in src_obj.peers if p.object_id != dst]
+                        if len(src_obj.peers) != before:
+                            changed = True
+                            fixed = True
+            if not fixed:
+                unfixed_cycles.append(issue)
+        if unfixed_cycles:
+            remaining["find_peer_graph_cycles"] = unfixed_cycles
+        else:
+            remaining.pop("find_peer_graph_cycles")
+
     # --- Patch: invalid_peer_declarations (remove dangling refs) ---
     if "find_invalid_peer_declarations" in remaining:
         existing_ids = {o.object_id for o in sample.objects}
@@ -391,7 +426,7 @@ def _validate_and_repair_samples(
     # ── Warning auto-patch (sequential_confirmation_chains) ───────────────────
     # Reclassified as WARNING but still needs a deterministic fix: add mock tool
     # triggers so the confirmation callback is actually delivered at eval time.
-    PATCHABLE_WARNINGS = {"find_sequential_confirmation_chains"}
+    PATCHABLE_WARNINGS = {"find_sequential_confirmation_chains", "find_peer_graph_cycles"}
     warning_patchable = {
         sid: {k: v for k, v in vd.items() if k in PATCHABLE_WARNINGS}
         for sid, vd in warnings.items()
@@ -815,6 +850,11 @@ Examples:
         action="store_true",
         help="Skip all validation (useful when iterating on known-bad samples)",
     )
+    shared.add_argument(
+        "--no-patch-gaps",
+        action="store_true",
+        help="Skip Stage 3.5 entity-gap patching (useful for debugging or when patching separately)",
+    )
 
     args = parser.parse_args()
 
@@ -949,6 +989,26 @@ Examples:
         workers=args.workers,
     )
     output_path = generate_seed.run(stage3_args)
+
+    # --- Stage 3.5 ---
+    print()
+    print("=" * 60)
+    print("STAGE 3.5: Patch Event-Entity Mock Gaps")
+    print("=" * 60)
+    if not args.no_patch_gaps:
+        from src.data.patch_event_entities import patch_entity_gaps
+        from src.data.schema import TestCase
+        from src.data.utils import load_jsonl
+        from src.data.llm import create_llm as _create_llm
+        _patch_llm = _create_llm(args.provider or "anthropic", args.model)
+        _tcs = load_jsonl(output_path, TestCase)
+        _patched = patch_entity_gaps(_patch_llm, _tcs, workers=args.workers)
+        with open(output_path, "w") as _f:
+            for _tc in _patched:
+                _f.write(_tc.model_dump_json() + "\n")
+        print(f"  Entity gap patching complete → {output_path}")
+    else:
+        print("  Skipped (--no-patch-gaps)")
 
     if not args.no_validate:
         _validate_test_cases_final(output_path)

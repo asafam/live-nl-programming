@@ -1,0 +1,113 @@
+# LNL OpenClaw Worker Pool
+#
+# Spin up N isolated evaluation containers, each with its own OpenClaw gateway
+# and mock server. No agent/label collisions between containers.
+#
+# Host ports are offset by +10000 from the default OpenClaw ports (18789/18888)
+# so Docker workers don't collide with a locally-running OpenClaw instance:
+#   worker-1: gateway 19789, mock server 19888
+#   worker-2: gateway 19790, mock server 19889
+#   worker-3: gateway 19791, mock server 19890
+#   worker-4: gateway 19792, mock server 19891
+#
+# Pool usage (recommended):
+#   docker compose up -d
+#   python -m src.data.evaluate_baseline \
+#     -i outputs/.../test_cases.jsonl \
+#     --pool docker/worker-pool.yaml
+#
+# Single-worker usage:
+#   docker compose up worker-1
+#   python -m src.data.evaluate_baseline \
+#     -i outputs/.../test_cases.jsonl \
+#     --gateway-url ws://localhost:19789 \
+#     --mock-server-url http://localhost:19888
+#
+# Bind mounts: each worker bind-mounts a host directory into /home/node/.openclaw
+# so evaluate_baseline.py can write agent workspace files that the gateway reads.
+# The host directories (LNL_POOL_DATA_DIR/worker-N) are created automatically.
+# Set LNL_POOL_DATA_DIR in .env or export it; defaults to /tmp/lnl-pool.
+
+name: lnl-openclaw-pool
+
+x-worker-base: &worker-base
+  image: lnl-openclaw-worker
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  restart: "no"
+  env_file:
+    - ../.env                      # OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.
+  environment:
+    LNL_MOCK_SERVER_URL: "http://localhost:18888"
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://localhost:18888/health"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 15s
+
+services:
+  worker-1:
+    <<: *worker-base
+    container_name: lnl-oc-worker-1
+    environment:
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN_1:-changeme-worker-1}"
+      LNL_MOCK_SERVER_URL: "http://localhost:18888"
+    ports:
+      - "19789:18789"   # OpenClaw gateway  (--gateway-url ws://localhost:19789)
+      - "19888:18888"   # Mock server HTTP   (--mock-server-url http://localhost:19888)
+    volumes:
+      - type: bind
+        source: "${LNL_POOL_DATA_DIR:-/tmp/lnl-pool}/worker-1"
+        target: /home/node/.openclaw
+        bind:
+          create_host_path: true
+
+  worker-2:
+    <<: *worker-base
+    container_name: lnl-oc-worker-2
+    environment:
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN_2:-changeme-worker-2}"
+      LNL_MOCK_SERVER_URL: "http://localhost:18888"
+    ports:
+      - "19790:18789"
+      - "19889:18888"
+    volumes:
+      - type: bind
+        source: "${LNL_POOL_DATA_DIR:-/tmp/lnl-pool}/worker-2"
+        target: /home/node/.openclaw
+        bind:
+          create_host_path: true
+
+  worker-3:
+    <<: *worker-base
+    container_name: lnl-oc-worker-3
+    environment:
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN_3:-changeme-worker-3}"
+      LNL_MOCK_SERVER_URL: "http://localhost:18888"
+    ports:
+      - "19791:18789"
+      - "19890:18888"
+    volumes:
+      - type: bind
+        source: "${LNL_POOL_DATA_DIR:-/tmp/lnl-pool}/worker-3"
+        target: /home/node/.openclaw
+        bind:
+          create_host_path: true
+
+  worker-4:
+    <<: *worker-base
+    container_name: lnl-oc-worker-4
+    environment:
+      OPENCLAW_GATEWAY_TOKEN: "${OPENCLAW_GATEWAY_TOKEN_4:-changeme-worker-4}"
+      LNL_MOCK_SERVER_URL: "http://localhost:18888"
+    ports:
+      - "19792:18789"
+      - "19891:18888"
+    volumes:
+      - type: bind
+        source: "${LNL_POOL_DATA_DIR:-/tmp/lnl-pool}/worker-4"
+        target: /home/node/.openclaw
+        bind:
+          create_host_path: true

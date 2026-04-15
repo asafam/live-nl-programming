@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 import time
+
+logger = logging.getLogger(__name__)
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +24,7 @@ from .types import (
     OutgoingMessage,
     ReactFinish,
     ReactStep,
+    StateDelta,
     ToolCall,
     ToolResult,
 )
@@ -120,15 +124,26 @@ LLM_REACT_SCHEMA: dict[str, Any] = {
             "required": ["id", "tool", "arguments"],
             "additionalProperties": False,
         },
+        "state_update": {
+            "type": "object",
+            "description": "Optional. Emit ONLY when a value genuinely changed. Omit entirely if nothing changed — do not invent updates.",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["set", "delete", "append"],
+                    "description": "set: add/update a key. delete: remove a key. append: add to a list.",
+                },
+                "key": {"type": "string", "description": "The state key to modify."},
+                "value": {"description": "New value (set/append). Omit for delete."},
+            },
+            "required": ["op", "key"],
+            "additionalProperties": False,
+        },
         "finish": {
             "type": "object",
             "description": "Present only when action=finish.",
             "properties": {
                 "reply": {"type": "string", "description": "Reply to the message sender."},
-                "updated_state": {
-                    "type": "string",
-                    "description": "Your complete updated state serialized as a JSON string, e.g. '{\"key\": \"value\"}'. Use '{}' if no state to store.",
-                },
                 "outgoing_messages": {
                     "type": "array",
                     "items": {
@@ -136,6 +151,14 @@ LLM_REACT_SCHEMA: dict[str, Any] = {
                         "properties": {
                             "recipient": {"type": "string"},
                             "content": {"type": "string"},
+                            "expects_reply": {
+                                "type": "boolean",
+                                "description": "Set true for Ask messages — when you need information back before you can continue. Leave false (default) for Tell messages: notifications, writes, and one-way forwards.",
+                            },
+                            "reference": {
+                                "type": "string",
+                                "description": "Optional short tag for correlating a reply to this Ask message. Include when expects_reply is true so you can match the reply via [in-reply-to: <reference>].",
+                            },
                         },
                         "required": ["recipient", "content"],
                         "additionalProperties": False,
@@ -163,7 +186,7 @@ LLM_REACT_SCHEMA: dict[str, Any] = {
                     "additionalProperties": False,
                 },
             },
-            "required": ["reply", "updated_state"],
+            "required": ["reply"],
             "additionalProperties": False,
         },
     },
@@ -198,26 +221,34 @@ def _message_label(msg: Message) -> str:
         return "Admin"
     if msg.sender == "__user__":
         return "User instruction"
-    return f"Message from peer: {msg.sender}"
+    if msg.expects_reply:
+        return f"Ask from peer: {msg.sender}"   # sender expects a reply
+    return f"Tell from peer: {msg.sender}"       # fire-and-forget, no reply expected
 
 
 def _peer_interaction_loop(pending_timeout_seconds: float, heartbeat_interval_seconds: float) -> str:
     return f"""
-  ## Peer Sends: Two Modes
+  ## Peer Sends: Ask vs. Tell
 
-  **Fire-and-forget (NOTIFY / WRITE / FORWARD):** You are informing, storing, or
-  passing an event along — no reply expected. Send the outgoing_message and
-  immediately proceed to your next action or finish. Do NOT set a PENDING flag.
-  This is the DEFAULT. Examples:
+  Every outgoing message is either an **Ask** or a **Tell**. Set `expects_reply`
+  accordingly on each entry in `outgoing_messages`.
+
+  **Tell (NOTIFY / WRITE / FORWARD) — `expects_reply: false` (the DEFAULT):**
+  You are informing, storing, or passing an event along — no reply expected.
+  The recipient is told this is a Tell so it knows not to reply. Send the message
+  and immediately proceed to your next action or finish. Do NOT set a PENDING flag.
+  Examples:
   - Forwarding an event to the next object in the chain
   - Writing a record to a store
   - Posting a Slack notification
   - Triggering a downstream action
 
-  **Request-reply (QUERY):** You need information back from the peer before you can
-  continue. Send your question via outgoing_messages, set a `_pending` block in
-  state, and STOP. When their REPLY arrives, read your state to recall your intent,
-  complete the goal, then clear `_pending`.
+  **Ask (QUERY) — `expects_reply: true`:**
+  You need information back from the peer before you can continue. The recipient
+  is told this is an Ask so it knows to reply. Send your question with
+  `expects_reply: true`, set a `_pending` block in state, and STOP. When their
+  REPLY arrives, read your state to recall your intent, complete the goal, then
+  clear `_pending`.
   Use this ONLY when you cannot proceed without the peer's answer. Examples:
   - Looking up a manager's name/email before addressing a notification
   - Checking policy rules before routing a ticket
@@ -225,10 +256,14 @@ def _peer_interaction_loop(pending_timeout_seconds: float, heartbeat_interval_se
 
   **Saving a continuation when going PENDING:** Your `_pending` block must contain
   everything needed to resume without re-reading the original trigger.
-  Every message you receive is prefixed with "[system time: <timestamp>]" — use
-  that timestamp as `started_at` so you know exactly when you went pending:
+  Every message is prefixed with "[system time: <timestamp>] [msg-id: <id>]" — use
+  the timestamp as `started_at` so you know when you went pending.
+  When an Ask reply arrives, it carries "[in-reply-to: <id>]" where <id> matches
+  the `reference` you set on the outgoing message — use it to match multiple
+  concurrent pending requests:
     _pending: {{
       waiting_for: "<peer-id>",
+      reference: "<short tag you set on the outgoing message>",
       question: "<exact question sent>",
       intent: "<what you will do once you have the answer>",
       started_at: "<timestamp from the [system time: ...] prefix of the current message>",
@@ -236,8 +271,8 @@ def _peer_interaction_loop(pending_timeout_seconds: float, heartbeat_interval_se
     }}
 
   **Rule:** If you already have all the data you need to complete your action, send
-  fire-and-forget messages to all relevant peers and finish in one step. Never set
-  PENDING after a fire-and-forget send.
+  Tell messages to all relevant peers and finish in one step. Never set PENDING
+  after a Tell send.
 
   **Heartbeat recovery:** A Heartbeat arrives every {heartbeat_interval_seconds:.0f}s.
   Like all messages, it is prefixed with "[system time: <timestamp>]" — this is the
@@ -246,7 +281,8 @@ def _peer_interaction_loop(pending_timeout_seconds: float, heartbeat_interval_se
   - Read the current time from the "[system time: ...]" prefix of the Heartbeat.
   - Compute elapsed seconds = current_time - `_pending.started_at`.
   - If elapsed < {pending_timeout_seconds:.0f}s: re-send the original question to
-    `_pending.waiting_for` and remain PENDING (do not update `started_at`).
+    `_pending.waiting_for` (with `expects_reply: true`) and remain PENDING (do not
+    update `started_at`).
   - If elapsed >= {pending_timeout_seconds:.0f}s: the peer is unresponsive. Use
     `_pending.intent` and `_pending.context` to take the best available fallback
     action (proceed with a default, escalate, or log a failure), then clear
@@ -310,7 +346,9 @@ def _build_chat_messages(
         msgs.append({"role": "user", "content": "[Past messages — already reflected in your state]\n" + "\n".join(history_lines)})
         msgs.append({"role": "assistant", "content": "Understood. What is the new message?"})
     ts = message.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
-    msgs.append({"role": "user", "content": f"[system time: {ts}] [{_message_label(message)}]: {message.content}"})
+    id_tag = f" [msg-id: {message.id}]" if message.id else ""
+    reply_tag = f" [in-reply-to: {message.in_reply_to}]" if message.in_reply_to else ""
+    msgs.append({"role": "user", "content": f"[system time: {ts}]{id_tag}{reply_tag} [{_message_label(message)}]: {message.content}"})
     return msgs
 
 
@@ -400,7 +438,13 @@ class OpenAIBrain(LLMBrain):
             model=self.model,
         )
 
-        raw = _safe_json_loads(resp.choices[0].message.content or "{}")
+        choice = resp.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError(
+                f"OpenAI response truncated (finish_reason=length) for object {object_id}. "
+                "The output exceeded the model's max_tokens limit."
+            )
+        raw = _safe_json_loads(choice.message.content or "{}")
         return _parse_llm_result(raw), metrics
 
     def react_call(
@@ -431,7 +475,13 @@ class OpenAIBrain(LLMBrain):
             latency_ms=latency_ms,
             model=self.model,
         )
-        raw = _safe_json_loads(resp.choices[0].message.content or "{}")
+        choice = resp.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError(
+                f"OpenAI response truncated (finish_reason=length) for object {object_id}. "
+                "The output exceeded the model's max_tokens limit."
+            )
+        raw = _safe_json_loads(choice.message.content or "{}")
         return _parse_react_step(raw), metrics
 
 
@@ -451,7 +501,10 @@ class AnthropicBrain(LLMBrain):
 
         self.model = model
         self._temperature = temperature
-        self._client = _anthropic.Anthropic(api_key=api_key or os.environ["ANTHROPIC_API_KEY"])
+        self._client = _anthropic.Anthropic(
+            api_key=api_key or os.environ["ANTHROPIC_API_KEY"],
+            timeout=600.0,  # 10 min HTTP timeout — prevents httpx.ReadTimeout on slow responses
+        )
 
     @staticmethod
     def _enforce_strict_schema(schema: dict) -> None:
@@ -490,7 +543,7 @@ class AnthropicBrain(LLMBrain):
         t0 = time.time()
         resp = self._client.messages.create(
             model=self.model,
-            max_tokens=8192,
+            max_tokens=16000,
             temperature=self._temperature,
             system=sys_prompt,
             messages=user_messages,
@@ -510,6 +563,11 @@ class AnthropicBrain(LLMBrain):
             model=self.model,
         )
 
+        if resp.stop_reason == "max_tokens":
+            raise RuntimeError(
+                f"Anthropic response truncated (stop_reason=max_tokens) for object {object_id}. "
+                "The output exceeded the max_tokens limit."
+            )
         content_str = ""
         for block in resp.content:
             if hasattr(block, "text"):
@@ -529,16 +587,49 @@ class AnthropicBrain(LLMBrain):
 
         strict_schema = json.loads(json.dumps(LLM_REACT_SCHEMA))
         self._enforce_strict_schema(strict_schema)
+        # Patch AFTER enforce_strict: give `state_update.value` an explicit wildcard schema
+        # (empty schema = any value in JSON Schema) so Anthropic's validator accepts it.
+        # Done after enforce_strict so the wildcard isn't overridden.
+        try:
+            strict_schema["properties"]["state_update"]["properties"]["value"] = {
+                "description": "New value (set/append). Omit for delete.",
+            }
+        except (KeyError, TypeError):
+            pass
 
         t0 = time.time()
-        resp = self._client.messages.create(
-            model=self.model,
-            max_tokens=8192,
-            temperature=self._temperature,
-            system=sys_prompt,
-            messages=user_messages,
-            output_config={"format": {"type": "json_schema", "schema": strict_schema}},
-        )
+        try:
+            resp = self._client.messages.create(
+                model=self.model,
+                max_tokens=16000,
+                temperature=self._temperature,
+                system=sys_prompt,
+                messages=user_messages,
+                output_config={
+                    "format": {
+                        "type": "json_schema",
+                        "schema": strict_schema,
+                    },
+                },
+            )
+        except Exception as e:
+            # output_config may be unsupported for this model/version — fall back to
+            # unstructured output and rely on _safe_json_loads to parse the response.
+            if "output_config" in str(e) or "json_schema" in str(e) or "400" in str(e):
+                logger.debug(
+                    "AnthropicBrain: output_config rejected (%s), falling back to unstructured call.",
+                    e,
+                )
+                resp = self._client.messages.create(
+                    model=self.model,
+                    max_tokens=16000,
+                    temperature=self._temperature,
+                    system=sys_prompt,
+                    messages=user_messages,
+                )
+            else:
+                raise
+
         latency_ms = (time.time() - t0) * 1000
 
         metrics = InferenceMetrics(
@@ -547,8 +638,22 @@ class AnthropicBrain(LLMBrain):
             latency_ms=latency_ms,
             model=self.model,
         )
+        if resp.stop_reason == "max_tokens":
+            raise RuntimeError(
+                f"Anthropic response truncated (stop_reason=max_tokens) for object {object_id}. "
+                "The output exceeded the max_tokens limit."
+            )
         content_str = "".join(block.text for block in resp.content if hasattr(block, "text"))
-        raw = _safe_json_loads(content_str or "{}")
+        try:
+            raw = _safe_json_loads(content_str or "{}")
+        except json.JSONDecodeError:
+            logger.warning(
+                "AnthropicBrain: JSON parse failed for object %s. "
+                "Response preview: %r",
+                object_id,
+                (content_str or "")[:200],
+            )
+            raw = {}
         return _parse_react_step(raw), metrics
 
 
@@ -683,6 +788,18 @@ class MockBrain(LLMBrain):
         """Set a default response for any unscripted calls."""
         self._default_response = response
 
+    def script_react(
+        self,
+        step: ReactStep,
+        metrics: Optional[InferenceMetrics] = None,
+    ) -> None:
+        """Enqueue a pre-built ReactStep directly (bypasses LLMResponse conversion).
+
+        Useful for testing state_update deltas and other ReAct-specific fields
+        without polluting LLMResponse.
+        """
+        self._react_queue.append((step, metrics or InferenceMetrics(model="mock")))
+
     def call(
         self,
         messages: list[dict],
@@ -753,19 +870,86 @@ class MockBrain(LLMBrain):
         return self._react_queue.pop(0)
 
 
+def _sanitize_json_control_chars(text: str) -> str:
+    """Escape literal control characters (newlines, tabs, carriage returns) inside JSON
+    string values.  The LLM sometimes emits unescaped newlines in long 'thought' or
+    'reply' fields, which are valid in prose but illegal in JSON strings.
+
+    Uses a simple character-level state machine that tracks whether we are inside a
+    JSON string so we can escape only the characters that need it.
+    """
+    out: list[str] = []
+    in_string = False
+    skip_next = False
+    for ch in text:
+        if skip_next:
+            skip_next = False
+            out.append(ch)
+            continue
+        if ch == "\\" and in_string:
+            skip_next = True   # next char is an escape sequence — pass through as-is
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string:
+            if ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            else:
+                out.append(ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _safe_json_loads(text: str) -> dict:
-    """Parse JSON from LLM output, tolerating trailing extra data."""
+    """Parse JSON from LLM output, tolerating markdown fences, preamble text,
+    and literal control characters inside string values."""
     text = text.strip()
     if not text:
         return {}
+    # Strip optional markdown code fences (```json ... ``` or ``` ... ```)
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[: text.rfind("```")]
+        text = text.strip()
+    if not text:
+        return {}
+
+    def _try_parse(s: str) -> dict:
+        """Try json.loads, then Extra-data fallback, then brace-search fallback."""
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError as e:
+            if "Extra data" in str(e):
+                decoder = json.JSONDecoder()
+                result, _ = decoder.raw_decode(s)
+                return result
+            # Fallback: find first '{' and try to parse from there
+            # (handles preamble text like "Here is the response:\n{...}")
+            brace = s.find("{")
+            if brace > 0:
+                try:
+                    decoder = json.JSONDecoder()
+                    result, _ = decoder.raw_decode(s, brace)
+                    return result
+                except json.JSONDecodeError:
+                    pass
+            raise
+
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        if "Extra data" in str(e):
-            decoder = json.JSONDecoder()
-            result, _ = decoder.raw_decode(text)
-            return result
-        raise
+        return _try_parse(text)
+    except json.JSONDecodeError:
+        # Last resort: escape literal control characters inside strings and retry
+        sanitized = _sanitize_json_control_chars(text)
+        return _try_parse(sanitized)
 
 
 def _ensure_str(value: Any) -> str:
@@ -787,10 +971,24 @@ def _parse_state(raw_state: Any) -> str:
     return ""
 
 
+def _parse_state_delta(raw: dict) -> Optional[StateDelta]:
+    """Parse an optional state_update dict into a StateDelta, or None if absent/invalid."""
+    if not isinstance(raw, dict):
+        return None
+    op = raw.get("op")
+    key = raw.get("key")
+    if not op or not key:
+        return None
+    return StateDelta(op=op, key=key, value=raw.get("value"))
+
+
 def _parse_react_step(raw: dict) -> ReactStep:
     """Parse a raw LLM dict into a ReactStep."""
     thought = raw.get("thought", "")
     action = raw.get("action", "finish")
+
+    # state_update is optional at any step
+    state_update = _parse_state_delta(raw.get("state_update") or {})
 
     if action == "tool_call":
         tc_data = raw.get("tool_call") or {}
@@ -799,7 +997,7 @@ def _parse_react_step(raw: dict) -> ReactStep:
             tool=tc_data.get("tool", ""),
             arguments=tc_data.get("arguments", {}),
         )
-        return ReactStep(thought=thought, action="tool_call", tool_call=tc)
+        return ReactStep(thought=thought, action="tool_call", state_update=state_update, tool_call=tc)
 
     # action == "finish"
     f_data = raw.get("finish") or {}
@@ -807,7 +1005,12 @@ def _parse_react_step(raw: dict) -> ReactStep:
 
     raw_msgs = f_data.get("outgoing_messages", []) or []
     outgoing = [
-        OutgoingMessage(recipient=m["recipient"], content=m["content"])
+        OutgoingMessage(
+            recipient=m["recipient"],
+            content=m["content"],
+            reference=m.get("reference"),
+            expects_reply=bool(m.get("expects_reply", False)),
+        )
         for m in raw_msgs
         if isinstance(m, dict)
     ]
@@ -820,7 +1023,7 @@ def _parse_react_step(raw: dict) -> ReactStep:
         outgoing_messages=outgoing,
         updated_definition=updated_def,
     )
-    return ReactStep(thought=thought, action="finish", finish=finish)
+    return ReactStep(thought=thought, action="finish", state_update=state_update, finish=finish)
 
 
 def _parse_llm_result(result: Any) -> LLMResponse:
@@ -838,7 +1041,7 @@ def _parse_llm_result(result: Any) -> LLMResponse:
     outgoing = []
     for m in data.get("outgoing_messages", []):
         if isinstance(m, dict):
-            outgoing.append(OutgoingMessage(recipient=m["recipient"], content=m["content"]))
+            outgoing.append(OutgoingMessage(recipient=m["recipient"], content=m["content"], reference=m.get("reference")))
         elif isinstance(m, OutgoingMessage):
             outgoing.append(m)
 

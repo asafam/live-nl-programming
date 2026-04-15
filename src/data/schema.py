@@ -34,6 +34,10 @@ class Event(BaseModel):
     triggered_by: Optional[str] = None  # ID of sibling event that causes this one to fire
     trigger_delay_minutes: float = 0.0  # simulated delay after triggering event fires
     trigger_delay_seconds: float = 0.0
+    role: Optional[Literal["pre_mod", "post_mod", "irrelevant"]] = None
+    # pre_mod:    fires before the modification; tests that baseline behavior is unaffected
+    # post_mod:   fires after the modification; tests that the system correctly reflects the change
+    # irrelevant: fires at any time; tests functionality unrelated to the modification
 
 
 class GeneratedEvent(BaseModel):
@@ -47,6 +51,7 @@ class GeneratedEvent(BaseModel):
     triggered_by: Optional[str] = None
     trigger_delay_minutes: float = 0.0
     trigger_delay_seconds: float = 0.0
+    role: Optional[Literal["pre_mod", "post_mod", "irrelevant"]] = None
 
 
 class EventExpectationItem(BaseModel):
@@ -232,10 +237,10 @@ class RunConfig(BaseModel):
     this record because it lacks ``tc_id`` / ``run_index`` fields.
     """
     record_type: str = "run_config"
+    version: str = "unknown"
     timestamp: str
     input_path: str
     output_path: str
-    runs_path: str = ""   # path to sibling _runs.jsonl artifact file (empty for legacy runs)
     model: str
     provider: str
     judge_model: str
@@ -264,20 +269,17 @@ class EventResult(BaseModel):
     passed: bool
     reasoning: str
     expected: str = ""
-    evidence: str = Field(
-        default="",
-        description=(
-            "Deprecated: no longer populated by evaluate.py. "
-            "Full evidence is stored in the sibling _runs.jsonl artifact file. "
-            "Field kept for backward-compatible deserialization of older result files."
-        ),
-    )
+    evidence: str = ""      # gather_evidence() output — what the judge saw
+    prior_context: str = "" # _format_prior_state() snapshot before this event
+    role: Optional[Literal["pre_mod", "post_mod", "irrelevant"]] = None  # propagated from Event.role
     input_tokens: int = 0
     output_tokens: int = 0
     latency_ms: float = 0.0
+    judge_input_tokens: int = 0
+    judge_output_tokens: int = 0
     judge_votes: list[dict] = Field(
         default_factory=list,
-        description="Per-judge votes when a panel judge is used. Each entry: {judge, passed, reasoning}.",
+        description="Per-judge votes (always populated). Each entry: {judge, passed, reasoning, input_tokens, output_tokens}.",
     )
 
 class ModificationResult(BaseModel):
@@ -287,38 +289,6 @@ class ModificationResult(BaseModel):
     output_tokens: int = 0
     latency_ms: float = 0.0
 
-
-class RawEventData(BaseModel):
-    """Raw execution data for one evaluable event — judge inputs captured before any verdict.
-
-    Written to the _runs.jsonl artifact file alongside each evaluation run.
-    Used by re_evaluate.py to re-judge with a different model or updated expectations.
-    """
-    event_id: str
-    expected: str          # event.expect.action (condition passed to judge)
-    evidence: str          # gather_evidence() output
-    prior_context: str     # _format_prior_state() snapshot before this event
-    input_tokens: int = 0
-    output_tokens: int = 0
-    latency_ms: float = 0.0
-
-
-class RawTestCaseResult(BaseModel):
-    """Execution snapshot for one TestCase run — no judge verdicts included.
-
-    Written as one line per (tc, run) to the _runs.jsonl artifact file.
-    Contains everything needed to re-judge without re-running the LNL runtime.
-    """
-    record_type: Literal["raw_run"] = "raw_run"
-    tc_id: str
-    sample_id: str = ""
-    tc_index: int = -1
-    seed: Optional[int] = None
-    name: str
-    domain: str
-    run_index: int
-    events: list[RawEventData]               # only events/steps that have expect
-    modifications: list[ModificationResult]
 
 
 class TestCaseResult(BaseModel):
@@ -341,6 +311,27 @@ class EvalSummary(BaseModel):
     total_events: int
     mean_pass_rate: float
     pass_rate_std: float      # behavioral consistency (std dev across runs)
+    # ── Per-role pass rates ──────────────────────────────────────────���─────────
+    steps_pass_rate: Optional[float] = None        # S\d+ events (baseline setup)
+    steps_pass_rate_std: Optional[float] = None
+    mod_pass_rate: Optional[float] = None          # all modification events (pre+post+irrelevant combined, conclusive TCs only)
+    mod_pass_rate_std: Optional[float] = None
+    mod_pass_rate_all: Optional[float] = None      # same but including inconclusive TCs
+    mod_pass_rate_all_std: Optional[float] = None
+    pre_mod_pass_rate: Optional[float] = None      # events before modification fires (conclusive TCs only)
+    pre_mod_pass_rate_std: Optional[float] = None
+    pre_mod_pass_rate_all: Optional[float] = None  # same but including inconclusive TCs
+    pre_mod_pass_rate_all_std: Optional[float] = None
+    post_mod_pass_rate: Optional[float] = None     # events after modification fires (key signal, conclusive TCs only)
+    post_mod_pass_rate_std: Optional[float] = None
+    post_mod_pass_rate_all: Optional[float] = None # same but including inconclusive TCs
+    post_mod_pass_rate_all_std: Optional[float] = None
+    irrelevant_pass_rate: Optional[float] = None   # events unrelated to the modification (conclusive TCs only)
+    irrelevant_pass_rate_std: Optional[float] = None
+    irrelevant_pass_rate_all: Optional[float] = None  # same but including inconclusive TCs
+    irrelevant_pass_rate_all_std: Optional[float] = None
+    inconclusive_tcs: int = 0                      # TCs where steps failed → mod result uninterpretable
+    # ── Token / latency means ──────────────────────────────────────────────────
     mean_event_input_tokens: float
     mean_event_output_tokens: float
     mean_event_latency_ms: float

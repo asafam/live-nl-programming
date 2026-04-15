@@ -45,28 +45,31 @@ class LLMJudge(ABC):
     """Evaluate whether evidence satisfies a condition."""
 
     @abstractmethod
-    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
-        """Return (passed, reasoning)."""
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str, int, int]:
+        """Return (passed, reasoning, input_tokens, output_tokens)."""
         ...
 
     def evaluate_with_votes(
         self, condition: str, evidence: str, context: str = ""
-    ) -> tuple[bool, str, list[dict]]:
-        """Return (passed, reasoning, votes).
+    ) -> tuple[bool, str, list[dict], int, int]:
+        """Return (passed, reasoning, votes, input_tokens, output_tokens).
 
         Default implementation wraps the single judge result in a one-item vote list.
         Override in panel judges to return per-judge breakdowns.
         """
-        passed, reasoning = self.evaluate(condition, evidence, context)
-        return passed, reasoning, [{"passed": passed, "reasoning": reasoning}]
+        passed, reasoning, in_tok, out_tok = self.evaluate(condition, evidence, context)
+        model = getattr(self, "model", "unknown")
+        vote = {"judge": model, "passed": passed, "reasoning": reasoning,
+                "input_tokens": in_tok, "output_tokens": out_tok}
+        return passed, reasoning, [vote], in_tok, out_tok
 
 
 class SubstringJudge(LLMJudge):
     """Fallback judge using substring matching — no API call needed."""
 
-    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str, int, int]:
         passed = condition.lower() in evidence.lower()
-        return passed, f"Substring match: '{condition[:60]}' in evidence"
+        return passed, f"Substring match: '{condition[:60]}' in evidence", 0, 0
 
 
 class OpenAIJudge(LLMJudge):
@@ -83,7 +86,7 @@ class OpenAIJudge(LLMJudge):
         self.model = model
         self._client = OpenAI(api_key=api_key or os.environ["OPENAI_API_KEY"])
 
-    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str, int, int]:
         messages = [
             {"role": "system", "content": _judge_system_prompt()},
             {"role": "user", "content": _user_msg(condition, evidence, context)},
@@ -95,7 +98,9 @@ class OpenAIJudge(LLMJudge):
             response_format={"type": "json_object"},
         )
         raw = _safe_json_loads(resp.choices[0].message.content or "{}")
-        return bool(raw.get("passed", False)), str(raw.get("reasoning", ""))
+        in_tok = resp.usage.prompt_tokens if resp.usage else 0
+        out_tok = resp.usage.completion_tokens if resp.usage else 0
+        return bool(raw.get("passed", False)), str(raw.get("reasoning", "")), in_tok, out_tok
 
 
 class AnthropicJudge(LLMJudge):
@@ -110,9 +115,12 @@ class AnthropicJudge(LLMJudge):
             raise ImportError("anthropic package required. Install with: pip install anthropic")
 
         self.model = model
-        self._client = _anthropic.Anthropic(api_key=api_key or os.environ["ANTHROPIC_API_KEY"])
+        self._client = _anthropic.Anthropic(
+            api_key=api_key or os.environ["ANTHROPIC_API_KEY"],
+            timeout=120.0,  # 2 min HTTP timeout for judge (short prompts, shouldn't need more)
+        )
 
-    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str, int, int]:
         resp = self._client.messages.create(
             model=self.model,
             max_tokens=512,
@@ -123,7 +131,9 @@ class AnthropicJudge(LLMJudge):
         )
         content_str = "".join(block.text for block in resp.content if hasattr(block, "text"))
         raw = _safe_json_loads(content_str or "{}")
-        return bool(raw.get("passed", False)), str(raw.get("reasoning", ""))
+        in_tok = resp.usage.input_tokens if resp.usage else 0
+        out_tok = resp.usage.output_tokens if resp.usage else 0
+        return bool(raw.get("passed", False)), str(raw.get("reasoning", "")), in_tok, out_tok
 
 
 class GeminiJudge(LLMJudge):
@@ -148,7 +158,7 @@ class GeminiJudge(LLMJudge):
         self._client = genai.Client(api_key=resolved_key)
         self._types = genai_types
 
-    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str, int, int]:
         config = self._types.GenerateContentConfig(
             temperature=0.0,
             max_output_tokens=512,
@@ -166,7 +176,10 @@ class GeminiJudge(LLMJudge):
             config=config,
         )
         raw = _safe_json_loads(resp.text or "{}")
-        return bool(raw.get("passed", False)), str(raw.get("reasoning", ""))
+        usage = getattr(resp, "usage_metadata", None)
+        in_tok = getattr(usage, "prompt_token_count", 0) or 0
+        out_tok = getattr(usage, "candidates_token_count", 0) or 0
+        return bool(raw.get("passed", False)), str(raw.get("reasoning", "")), in_tok, out_tok
 
 
 class PanelJudge(LLMJudge):
@@ -184,10 +197,12 @@ class PanelJudge(LLMJudge):
 
     def evaluate_with_votes(
         self, condition: str, evidence: str, context: str = ""
-    ) -> tuple[bool, str, list[dict]]:
+    ) -> tuple[bool, str, list[dict], int, int]:
         raw = [j.evaluate(condition, evidence, context) for j in self._judges]
         votes_bool = [r[0] for r in raw]
         reasonings = [r[1] for r in raw]
+        total_in = sum(r[2] for r in raw)
+        total_out = sum(r[3] for r in raw)
 
         pass_count = sum(votes_bool)
         total = len(votes_bool)
@@ -205,14 +220,14 @@ class PanelJudge(LLMJudge):
             reasoning = f"{verdict} ({pass_count}/{total} judges agree) — {summaries}"
 
         votes = [
-            {"judge": label, "passed": v, "reasoning": r}
-            for label, v, r in zip(self._labels, votes_bool, reasonings)
+            {"judge": label, "passed": v, "reasoning": r, "input_tokens": ri, "output_tokens": ro}
+            for label, v, r, ri, ro in zip(self._labels, votes_bool, reasonings, [x[2] for x in raw], [x[3] for x in raw])
         ]
-        return majority_passed, reasoning, votes
+        return majority_passed, reasoning, votes, total_in, total_out
 
-    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str]:
-        passed, reasoning, _ = self.evaluate_with_votes(condition, evidence, context)
-        return passed, reasoning
+    def evaluate(self, condition: str, evidence: str, context: str = "") -> tuple[bool, str, int, int]:
+        passed, reasoning, _, in_tok, out_tok = self.evaluate_with_votes(condition, evidence, context)
+        return passed, reasoning, in_tok, out_tok
 
 
 def _safe_json_loads(text: str) -> dict:

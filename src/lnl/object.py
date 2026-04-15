@@ -20,6 +20,8 @@ from .types import (
     PeerDeclaration,
     ProcessingResult,
     ReactFinish,
+    StateDelta,
+    ToolResult,
 )
 
 
@@ -146,10 +148,14 @@ class LLMObject:
         total_metrics = InferenceMetrics(model="")
         finish: ReactFinish | None = None
         tool_rounds = 0
+        pending_deltas: list[StateDelta] = []
 
         while True:
             step, metrics = self._brain.react_call(messages, object_id=self.object_id)
             total_metrics = _accumulate_metrics(total_metrics, metrics)
+
+            if step.state_update:
+                pending_deltas.append(step.state_update)
 
             if step.action == "finish":
                 finish = step.finish
@@ -174,7 +180,10 @@ class LLMObject:
 
             tool_rounds += 1
             ctx = self._tool_context_factory(self) if self._tool_context_factory else {}
-            result = self._tool_registry.execute(tc, ctx)
+            try:
+                result = self._tool_registry.execute(tc, ctx)
+            except Exception as exc:
+                result = ToolResult(id=tc.id, output="", error=f"Tool execution raised an exception: {exc}")
 
             messages.append({"role": "assistant", "content": json.dumps({
                 "thought": step.thought,
@@ -184,9 +193,20 @@ class LLMObject:
             messages.append({"role": "user", "content": f"[Tool result for {tc.id}]: {result.output}" + (f"\nError: {result.error}" if result.error else "")})
 
         if finish is None:
-            finish = ReactFinish(reply="", updated_state=self._state)
+            finish = ReactFinish(reply="")
 
-        self._state = finish.updated_state
+        if pending_deltas:
+            current = _coerce_state(self._state)
+            if not isinstance(current, dict):
+                current = {}
+            for delta in pending_deltas:
+                current = _apply_delta(current, delta)
+            self._state = json.dumps(current)
+        elif finish.updated_state:
+            # Backward compat: MockBrain / test scripts that set updated_state directly
+            self._state = finish.updated_state
+        # else: no deltas, no updated_state → state unchanged
+
         if finish.updated_definition:
             self._apply_definition_update(finish.updated_definition)
         self._history.append(message)
@@ -203,6 +223,7 @@ class LLMObject:
             in_reply_to=message.sender,
             source_message_type=message.type,
             depth_remaining=message.depth_remaining,
+            source_message_id=message.id,
         )
 
     # --- Live Modification ---
@@ -261,6 +282,21 @@ def _coerce_state(s):
     except (json.JSONDecodeError, ValueError):
         pass
     return s
+
+
+def _apply_delta(state: dict, delta: StateDelta) -> dict:
+    """Apply a single state delta to a state dict in-place and return it."""
+    if delta.op == "set":
+        state[delta.key] = delta.value
+    elif delta.op == "delete":
+        state.pop(delta.key, None)
+    elif delta.op == "append":
+        lst = state.get(delta.key, [])
+        if not isinstance(lst, list):
+            lst = [lst]
+        lst.append(delta.value)
+        state[delta.key] = lst
+    return state
 
 
 def _accumulate_metrics(base: InferenceMetrics, add: InferenceMetrics) -> InferenceMetrics:

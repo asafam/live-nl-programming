@@ -106,13 +106,32 @@ def _classify_event_source(descriptor: str) -> EventSourceBinding:
 # File content builders
 # ---------------------------------------------------------------------------
 
-def _agents_md(obj: ObjectDefinition) -> str:
+def _agents_md(obj: ObjectDefinition, session_name: str = "main") -> str:
     name = _slug_to_name(obj.object_id)
     behavior = obj.behavior or "(No specific behavior defined.)"
     if obj.peers:
         peers_block = "\n".join(f"- **{p.object_id}**: {p.relationship}" for p in obj.peers)
+        peer_ids = [p.object_id for p in obj.peers]
+        peer_examples = "\n".join(
+            f'  - To message `{pid}`: `sessions_send(sessionKey="agent:{pid}:{session_name}", message="<your message>", timeoutSeconds=120)`'
+            for pid in peer_ids
+        )
+        comm_section = (
+            f"## Communication\n\n"
+            f"To send a message to a peer agent, use the `sessions_send` tool with the exact sessionKey below.\n"
+            f"**Do NOT use the `message` tool** — that is for external channels (Slack, email, etc.).\n"
+            f"Always include `timeoutSeconds=120` so the peer has enough time to complete tool calls.\n\n"
+            f"Exact calls for each peer:\n\n"
+            f"{peer_examples}\n\n"
+            f"Use external tools (e.g. `slack_send_message`, `zapier_tables_create_record`) "
+            f"for actions on external systems.\n"
+        )
     else:
         peers_block = "(No peers defined.)"
+        comm_section = (
+            f"## Communication\n\n"
+            f"This agent has no peers. Use the available external tools for all actions.\n"
+        )
 
     return (
         f"# Agent: {name}\n\n"
@@ -123,9 +142,7 @@ def _agents_md(obj: ObjectDefinition) -> str:
         f"Your current operational state is tracked in `state.md` in this workspace.\n"
         f"Read it at the start of each interaction to restore context.\n"
         f"After each interaction, write your updated state back to `state.md`.\n\n"
-        f"## Communication\n\n"
-        f"You may send messages to peers using the agentToAgent tool.\n"
-        f"Send messages only to declared peers above.\n"
+        + comm_section
     )
 
 
@@ -152,68 +169,160 @@ def _skill_stub_md(skill: str, object_id: str) -> str:
     return f"# {name}\n\n_Skill definition for {object_id}. Fill in the implementation details._\n"
 
 
+def _combined_agents_md(objects: list[ObjectDefinition]) -> str:
+    """Build a single AGENTS.md covering all objects for single-agent mode."""
+    lines = [
+        "# Multi-Object Workflow Agent\n\n"
+        "You handle a multi-object workflow where each component has a defined role and behavior. "
+        "Each message identifies the target object. Respond as that object — execute its "
+        "responsibilities using the available tools, and update its section of `state.md`.\n\n"
+        "**CRITICAL:** Do NOT use agentToAgent or attempt to message other agents. "
+        "You are the only agent. When an object's behavior says to 'forward', 'send', or "
+        "'notify' another component, use the available tools to take that action directly "
+        "(e.g. call `slack_send_message`, `zapier_tables_create_record`, etc.).\n\n"
+        "## Objects\n",
+    ]
+    for obj in objects:
+        name = _slug_to_name(obj.object_id)
+        behavior = obj.behavior or "(No specific behavior defined.)"
+        lines.append(f"\n### {name} (`{obj.object_id}`)\n\n")
+        lines.append(f"**Role:** {obj.role}\n\n")
+        lines.append(f"**Behavior:** {behavior}\n\n")
+        if obj.skills:
+            lines.append(f"**Skills:** {', '.join(obj.skills)}\n\n")
+        lines.append("---\n")
+
+    lines.append(
+        "\n## Available Tools\n\n"
+        "Use these tools for any external system action:\n"
+        "- `slack_send_message(channel, message)` — post a message to a Slack channel\n"
+        "- `slack_list_channels()` — list Slack channels\n"
+        "- `slack_add_reaction(message_id, emoji)` — add a reaction to a Slack message\n"
+        "- `slack_get_user(user)` — get Slack user info\n"
+        "- `zapier_tables_create_record(table, data)` — write a record to a Zapier Table\n"
+        "- `zapier_tables_list_records(table, filter)` — read records from a Zapier Table\n"
+        "- `email_send(to, subject, body)` — send an email\n"
+        "- `email_list_inbox(folder)` — list emails in inbox\n"
+        "- `email_read(message_id)` — read an email\n"
+        "- `jira_create_issue(project, summary, description)` — create a Jira issue\n"
+        "- `jira_update_issue(issue_id, status)` — update a Jira issue\n"
+        "- `jira_get_issue(issue_id)` — get a Jira issue\n"
+        "- `jira_list_issues(project, status)` — list Jira issues\n"
+        "- `webhook_post(url, payload)` — call an external webhook\n"
+        "- `calendar_create_event(title, start, end, attendees, description)` — create a calendar event\n"
+        "- `calendar_update_event(event_id, title, start, end)` — update a calendar event\n"
+        "- `calendar_get_event(event_id)` — get a calendar event\n"
+        "- `calendar_list_events(calendar_id, time_min, time_max)` — list calendar events\n"
+        "- `stripe_create_charge(amount, currency, customer, description)` — create a Stripe charge\n"
+        "- `stripe_get_charge(charge_id)` — get a Stripe charge\n"
+        "- `stripe_list_charges(customer, limit)` — list Stripe charges\n"
+        "- `stripe_refund_charge(charge_id, amount)` — refund a Stripe charge\n"
+        "- `monday_create_item(board_id, item_name, column_values)` — create a Monday.com item\n"
+        "- `monday_update_item(item_id, column_values)` — update a Monday.com item\n"
+        "- `monday_get_item(item_id)` — get a Monday.com item\n"
+        "- `monday_list_items(board_id)` — list Monday.com items\n"
+        "- `salesforce_create_record(object_type, fields)` — create a Salesforce record\n"
+        "- `salesforce_update_record(object_type, record_id, fields)` — update a Salesforce record\n"
+        "- `salesforce_get_record(object_type, record_id)` — get a Salesforce record\n"
+        "- `salesforce_list_records(object_type, filter)` — list Salesforce records\n"
+        "- `airtable_create_record(base_id, table, fields)` — create an Airtable record\n"
+        "- `airtable_update_record(base_id, table, record_id, fields)` — update an Airtable record\n"
+        "- `airtable_get_record(base_id, table, record_id)` — get an Airtable record\n"
+        "- `airtable_list_records(base_id, table, filter)` — list Airtable records\n"
+        "- `hubspot_create_contact(email, first_name, last_name, properties)` — create a HubSpot contact\n"
+        "- `hubspot_update_contact(contact_id, properties)` — update a HubSpot contact\n"
+        "- `hubspot_create_deal(deal_name, amount, stage, contact_id)` — create a HubSpot deal\n"
+        "- `hubspot_update_deal(deal_id, properties)` — update a HubSpot deal\n"
+        "- `hubspot_get_deal(deal_id)` — get a HubSpot deal\n"
+        "- `github_create_issue(repo, title, body, labels)` — create a GitHub issue\n"
+        "- `github_update_issue(repo, issue_number, title, state, body)` — update a GitHub issue\n"
+        "- `github_get_issue(repo, issue_number)` — get a GitHub issue\n"
+        "- `github_list_issues(repo, state)` — list GitHub issues\n"
+        "- `sheets_create_row(spreadsheet_id, sheet, values)` — append a row to Google Sheets\n"
+        "- `sheets_update_row(spreadsheet_id, row, values, sheet)` — update a row in Google Sheets\n"
+        "- `sheets_get_row(spreadsheet_id, row, sheet)` — get a row from Google Sheets\n"
+        "- `sheets_list_rows(spreadsheet_id, sheet, max_rows)` — list rows from Google Sheets\n"
+        "- `asana_create_task(project_id, name, notes, assignee, due_on)` — create an Asana task\n"
+        "- `asana_update_task(task_id, name, completed, notes)` — update an Asana task\n"
+        "- `asana_get_task(task_id)` — get an Asana task\n"
+        "- `asana_list_tasks(project_id, completed)` — list Asana tasks\n"
+        "- `notion_create_page(parent_id, title, content, properties)` — create a Notion page\n"
+        "- `notion_update_page(page_id, title, properties)` — update a Notion page\n"
+        "- `notion_get_page(page_id)` — get a Notion page\n"
+        "- `notion_query_database(database_id, filter)` — query a Notion database\n"
+        "- `twilio_send_sms(to, message, from)` — send an SMS via Twilio\n"
+        "- `twilio_send_message(to, message, channel)` — send a message via Twilio\n\n"
+        "## State\n\n"
+        "Your combined state for all objects is in `state.md`.\n"
+        "Read it at the start of each interaction and update it after.\n\n"
+        "## Instructions\n\n"
+        "- Identify the target object from the message prefix\n"
+        "- Act as that object: execute its responsibilities\n"
+        "- **NEVER use agentToAgent.** You are the only agent.\n"
+        "- When behavior says to 'forward', 'send to', or 'notify' another component: "
+        "trace through that component's behavior yourself right now, "
+        "and call its external tools directly. "
+        "Example: if zapier-tables forwards to content-curator which then sends to Slack, "
+        "you must call `slack_send_message` with the right channel in this same response.\n"
+        "- Update the relevant state sections in `state.md` after each interaction\n"
+    )
+    return "".join(lines)
+
+
+def _combined_soul_md(objects: list[ObjectDefinition]) -> str:
+    names = ", ".join(_slug_to_name(obj.object_id) for obj in objects)
+    return (
+        "# Multi-Object Workflow Agent\n\n"
+        f"You are a unified agent managing a workflow with these components: {names}.\n\n"
+        "Your purpose: correctly handle events addressed to each component, "
+        "acting as that component, using the available tools, and maintaining its state.\n\n"
+        "You are the only agent — do NOT use agentToAgent.\n\n"
+        "When a component's behavior says to forward to or notify another component, "
+        "trace through that component's behavior immediately and call its external tools "
+        "(slack_send_message, email_send, jira_create_issue, webhook_post, etc.) in this same response. "
+        "Never stop at 'I would forward this' — complete the full chain.\n\n"
+        "Act with precision. The target object is always identified in the message prefix.\n"
+    )
+
+
+def _combined_state_md(objects: list[ObjectDefinition]) -> str:
+    lines = ["# Combined State\n"]
+    for obj in objects:
+        name = _slug_to_name(obj.object_id)
+        lines.append(f"\n## {name} (`{obj.object_id}`)\n")
+        if obj.initial_state:
+            lines.append(f"\n{obj.initial_state}\n")
+        else:
+            lines.append("\n_No initial state._\n")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # openclaw.json builder
 # ---------------------------------------------------------------------------
 
-def _build_openclaw_json(objects: list[ObjectDefinition], source_dir: Path) -> dict:
-    agents = []
+def _build_openclaw_json(objects: list[ObjectDefinition], output_dir: Path) -> dict:
+    agent_list = []
     for obj in objects:
         name = _slug_to_name(obj.object_id)
-        agents.append({
+        agent_list.append({
             "id": obj.object_id,
             "name": name,
-            "workspace": f"~/.openclaw/workspace-{obj.object_id}",
-            "agentDir": f"~/.openclaw/agents/{obj.object_id}/agent",
+            "workspace": str(output_dir / f"workspace-{obj.object_id}"),
+            "agentDir": str(output_dir / "agents" / obj.object_id / "agent"),
         })
 
     all_ids = [obj.object_id for obj in objects]
 
-    event_bindings = []
-    for obj in objects:
-        for descriptor in obj.event_sources:
-            binding = _classify_event_source(descriptor)
-            entry: dict = {"agentId": obj.object_id, "type": binding.kind}
-            if binding.kind == "webhook":
-                entry["name"] = binding.webhook_name
-                entry["channel"] = f"webhook-{slugify(binding.webhook_name)}"
-            elif binding.kind == "cron":
-                entry["schedule"] = binding.cron_expr
-                entry["descriptor"] = descriptor
-            else:
-                entry["descriptor"] = descriptor
-            if binding.warning:
-                entry["_warning"] = binding.warning
-            event_bindings.append(entry)
-
-    # Collect unhandled subscriptions for meta warning
-    unhandled_subs = []
-    for obj in objects:
-        for sub in obj.subscriptions:
-            unhandled_subs.append(f"{obj.object_id}:{sub}")
-
-    meta: dict = {
-        "generated_by": "lnl-openclaw-export",
-        "source_dir": str(source_dir),
-        "object_count": len(objects),
-    }
-    if unhandled_subs:
-        meta["unhandled_subscriptions"] = unhandled_subs
-
-    config: dict = {
-        "agents": agents,
+    return {
+        "agents": {"list": agent_list},
         "tools": {
             "agentToAgent": {
                 "enabled": True,
                 "allow": all_ids,
             }
         },
-        "_meta": meta,
     }
-    if event_bindings:
-        config["eventBindings"] = event_bindings
-
-    return config
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +387,7 @@ def export_workflow_from_objects(
     *,
     force: bool = False,
     dry_run: bool = False,
+    write_config: bool = True,
 ) -> list[str]:
     """Export from in-memory objects (list[ObjectDef] from schema.py or ObjectDefinition).
 
@@ -298,7 +408,7 @@ def export_workflow_from_objects(
         to_lnl_definition(o) if isinstance(o, ObjectDef) else o
         for o in objects
     ]
-    return _export_objects_to_dir(obj_defs, Path(output_dir), "in-memory", force=force, dry_run=dry_run)
+    return _export_objects_to_dir(obj_defs, Path(output_dir), "in-memory", force=force, dry_run=dry_run, write_config=write_config)
 
 
 def reset_agent_state(object_id: str, initial_state: str, output_dir: str | Path) -> None:
@@ -323,6 +433,52 @@ def reset_agent_state(object_id: str, initial_state: str, output_dir: str | Path
         state_file.write_text("# State\n\n_Empty. This file is updated at runtime by the agent._\n")
 
 
+def rewrite_agents_md(
+    objects: list,
+    output_dir: "str | Path",
+    session_name: str,
+    *,
+    slot_suffix: str = "",
+) -> None:
+    """Rewrite only AGENTS.md for each object workspace with the given session_name.
+
+    Called before each multi-agent TC run so peer sessionKey refs in AGENTS.md match
+    the actual session name opened by the evaluator. Does NOT touch state.md or SOUL.md.
+
+    Args:
+        objects: list[ObjectDef] (Pydantic) or list[ObjectDefinition] (dataclass).
+        output_dir: Root OpenClaw home directory (e.g. ~/.openclaw).
+        session_name: Unique session name for this run (e.g. "eval-ma-42").
+        slot_suffix: Appended to workspace dir name and peer agent IDs for concurrent
+                     slots (e.g. "-c1"). Empty string for slot 0 (default workspaces).
+    """
+    from dataclasses import replace
+    from pathlib import Path as _Path
+    output_dir = _Path(output_dir)
+
+    try:
+        from src.data.schema import ObjectDef, to_lnl_definition
+        obj_defs = [to_lnl_definition(o) if isinstance(o, ObjectDef) else o for o in objects]
+    except ImportError:
+        obj_defs = list(objects)
+
+    for obj in obj_defs:
+        ws = output_dir / f"workspace-{obj.object_id}{slot_suffix}"
+        target = ws / "AGENTS.md"
+        if not ws.exists():
+            continue
+        if slot_suffix:
+            # Rewrite peer IDs with slot suffix so sessionKey refs are slot-correct
+            slotted_peers = [
+                replace(p, object_id=f"{p.object_id}{slot_suffix}")
+                for p in obj.peers
+            ]
+            slotted_obj = replace(obj, peers=slotted_peers)
+        else:
+            slotted_obj = obj
+        target.write_text(_agents_md(slotted_obj, session_name=session_name))
+
+
 def _export_objects_to_dir(
     objects: list[ObjectDefinition],
     output_dir: Path,
@@ -330,18 +486,20 @@ def _export_objects_to_dir(
     *,
     force: bool,
     dry_run: bool,
+    write_config: bool = True,
 ) -> list[str]:
     """Internal: write all OpenClaw workspace files for a list of ObjectDefinitions."""
     written: list[str] = []
 
-    config = _build_openclaw_json(objects, Path(source_label))
-    _write_file(
-        output_dir / "openclaw.json",
-        json.dumps(config, indent=2) + "\n",
-        written,
-        force=force,
-        dry_run=dry_run,
-    )
+    if write_config:
+        config = _build_openclaw_json(objects, output_dir)
+        _write_file(
+            output_dir / "openclaw.json",
+            json.dumps(config, indent=2) + "\n",
+            written,
+            force=force,
+            dry_run=dry_run,
+        )
 
     for obj in objects:
         ws = _workspace_dir(output_dir, obj.object_id)
@@ -366,6 +524,68 @@ def _export_objects_to_dir(
         written.append(str(ad) + "/")
 
     return written
+
+
+def export_single_agent_workspace(
+    objects: list,
+    output_dir: str | Path,
+    agent_id: str = "lnl-eval",
+    *,
+    force: bool = False,
+) -> str:
+    """Export all objects as a single combined agent workspace.
+
+    Writes AGENTS.md, SOUL.md, and state.md to a shared workspace directory
+    so one OpenClaw agent can handle messages for any object.
+
+    Args:
+        objects: List of ObjectDef or ObjectDefinition instances.
+        output_dir: Root OpenClaw directory (e.g. ~/.openclaw/).
+        agent_id: ID for the combined agent (default: "lnl-eval").
+        force: Overwrite existing workspace files.
+
+    Returns:
+        Workspace directory path.
+    """
+    from src.data.schema import ObjectDef, to_lnl_definition
+    obj_defs = [
+        to_lnl_definition(o) if isinstance(o, ObjectDef) else o
+        for o in objects
+    ]
+    output_dir = Path(output_dir)
+    ws = output_dir / f"workspace-{agent_id}"
+    ws.mkdir(parents=True, exist_ok=True)
+
+    def _write(path: Path, content: str) -> None:
+        if path.exists() and not force:
+            pass  # skip — caller uses force=True for eval runs
+        path.write_text(content)
+
+    _write(ws / "AGENTS.md", _combined_agents_md(obj_defs))
+    _write(ws / "SOUL.md", _combined_soul_md(obj_defs))
+    _write(ws / "state.md", _combined_state_md(obj_defs))
+
+    # Ensure the agentDir exists (OpenClaw needs it for auth profiles etc.)
+    ad = output_dir / "agents" / agent_id / "agent"
+    ad.mkdir(parents=True, exist_ok=True)
+
+    return str(ws)
+
+
+def reset_single_agent_state(
+    objects: list,
+    output_dir: str | Path,
+    agent_id: str = "lnl-eval",
+) -> None:
+    """Reset state.md for the combined single agent to all objects' initial states."""
+    from src.data.schema import ObjectDef, to_lnl_definition
+    obj_defs = [
+        to_lnl_definition(o) if isinstance(o, ObjectDef) else o
+        for o in objects
+    ]
+    ws = Path(output_dir) / f"workspace-{agent_id}"
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "state.md").write_text(_combined_state_md(obj_defs))
 
 
 def apply_modification(

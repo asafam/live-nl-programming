@@ -53,6 +53,20 @@ _SYSTEM_KEYWORDS: dict[str, str] = {
     "gmail": "email.yaml",
     "jira": "jira.yaml",
     "webhook": "generic_webhook.yaml",
+    "zapier": "zapier.yaml",
+    "google calendar": "google_calendar.yaml",
+    "calendar": "google_calendar.yaml",
+    "stripe": "stripe.yaml",
+    "monday": "monday.yaml",
+    "salesforce": "salesforce.yaml",
+    "airtable": "airtable.yaml",
+    "hubspot": "hubspot.yaml",
+    "github": "github.yaml",
+    "google sheets": "google_sheets.yaml",
+    "spreadsheet": "google_sheets.yaml",
+    "asana": "asana.yaml",
+    "notion": "notion.yaml",
+    "twilio": "twilio.yaml",
 }
 
 _MOCKS_DIR = Path(__file__).parent.parent.parent / "config" / "mocks"
@@ -179,37 +193,42 @@ def _make_app(state: "_ServerState") -> FastAPI:
     @app.post("/configure")
     async def configure(request: Request):
         body = await request.json()
-        state.session_key = body.get("session_key", "default")
+        slot_id = body.get("slot_id", "default")
+        slot = state.get_slot(slot_id)
+        slot.session_key = body.get("session_key", "default")
         if "mock_script" in body:
-            state.mock_script = MockScript(**body["mock_script"])
+            slot.mock_script = MockScript(**body["mock_script"])
         if "orchestration_script" in body:
-            state.orchestration_script = OrchestratorScript(**body["orchestration_script"])
-        state.call_log.clear()
-        state.fired_triggers.clear()
-        return {"status": "configured", "session_key": state.session_key}
+            slot.orchestration_script = OrchestratorScript(**body["orchestration_script"])
+        slot.call_log.clear()
+        slot.fired_triggers.clear()
+        return {"status": "configured", "session_key": slot.session_key, "slot_id": slot_id}
 
     @app.get("/log")
-    def get_log():
-        return {"calls": state.call_log}
+    def get_log(slot_id: str = "default"):
+        slot = state.get_slot(slot_id)
+        return {"calls": slot.call_log}
 
     @app.post("/tool/{method}")
     async def handle_tool(method: str, request: Request):
         body = await request.json()
-        session_key = body.pop("__session_key__", state.session_key)
+        slot_id = body.pop("__slot_id__", "default")
+        slot = state.get_slot(slot_id)
+        session_key = body.pop("__session_key__", slot.session_key)
         tool_call_id = uuid.uuid4().hex[:8]
 
         method_def: Optional[MockMethodDef] = None
-        if state.mock_script:
-            method_def = state.mock_script.get_method(method)
+        if slot.mock_script:
+            method_def = slot.mock_script.get_method(method)
 
         # Build immediate response
-        if method_def and method_def.llm_persona and state.llm_mode:
+        if method_def and method_def.llm_persona and slot.llm_mode:
             system_prompt = (
                 f"You are an external system API with this persona:\n{method_def.llm_persona}\n\n"
                 f"Respond ONLY with a realistic API response string (no JSON wrapper). Be brief."
             )
             user_msg = f"Tool call: {method}({json.dumps(body)})"
-            result = _llm_chat(system_prompt, user_msg, model=state.llm_model)
+            result = _llm_chat(system_prompt, user_msg, model=slot.llm_model)
         elif method_def:
             result = _interpolate(method_def.immediate.template, body, tool_call_id)
         else:
@@ -223,7 +242,7 @@ def _make_app(state: "_ServerState") -> FastAPI:
             "tool_call_id": tool_call_id,
             "session_key": session_key,
         }
-        state.call_log.append(record)
+        slot.call_log.append(record)
         logger.debug("MockServer: %s(%s) → %s", method, body, result)
 
         # Schedule per-tool callback (non-blocking)
@@ -234,21 +253,21 @@ def _make_app(state: "_ServerState") -> FastAPI:
                     body,
                     tool_call_id,
                     session_key,
-                    state,
+                    slot,
                 )
             )
 
         # Schedule orchestration reactions (non-blocking)
-        if state.orchestration_script:
+        if slot.orchestration_script:
             asyncio.create_task(
                 _fire_reactions(
-                    state.orchestration_script.triggers,
-                    state.orchestration_script.time_scale,
+                    slot.orchestration_script.triggers,
+                    slot.orchestration_script.time_scale,
                     method,
                     body,
                     tool_call_id,
                     session_key,
-                    state,
+                    slot,
                 )
             )
 
@@ -294,9 +313,9 @@ async def _inject_callback(
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(wake_url, json=payload, headers=headers)
             if resp.status_code != 200:
-                logger.warning("MockServer callback to %s returned %d", wake_url, resp.status_code)
+                logger.debug("MockServer callback to %s returned %d (hook endpoint unavailable)", wake_url, resp.status_code)
     except Exception as e:
-        logger.warning("MockServer callback failed: %s", e)
+        logger.debug("MockServer callback failed: %s", e)
 
 
 # ── Orchestration ────────────────────────────────────────────────────────────
@@ -375,9 +394,9 @@ async def _inject_reaction(
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(wake_url, json=payload, headers=headers)
             if resp.status_code != 200:
-                logger.warning("Orchestration injection to %s returned %d", wake_url, resp.status_code)
+                logger.debug("Orchestration injection to %s returned %d (hook endpoint unavailable)", wake_url, resp.status_code)
     except Exception as e:
-        logger.warning("Orchestration injection failed: %s", e)
+        logger.debug("Orchestration injection failed: %s", e)
 
 
 def load_orchestration_file(path: Path) -> OrchestratorScript:
@@ -400,6 +419,34 @@ class _ServerState:
         self.openclaw_hook_token: Optional[str] = None
         self.llm_mode: bool = False
         self.llm_model: str = "gpt-4o-mini"
+        # Per-slot sub-states for concurrent TC isolation
+        self._slot_states: dict[str, "_ServerState"] = {}
+        self._slot_lock = threading.Lock()
+
+    def get_slot(self, slot_id: str) -> "_ServerState":
+        """Return per-slot state for concurrent TC isolation.
+
+        Slot "default" returns self (no isolation, backward compatible).
+        Other slots inherit the current global settings on first creation.
+        """
+        if slot_id == "default":
+            return self
+        with self._slot_lock:
+            if slot_id not in self._slot_states:
+                s = _ServerState.__new__(_ServerState)
+                s.session_key = self.session_key
+                s.mock_script = self.mock_script
+                s.orchestration_script = self.orchestration_script
+                s.call_log = []
+                s.fired_triggers = set()
+                s.openclaw_url = self.openclaw_url
+                s.openclaw_hook_token = self.openclaw_hook_token
+                s.llm_mode = self.llm_mode
+                s.llm_model = self.llm_model
+                s._slot_states = {}
+                s._slot_lock = threading.Lock()
+                self._slot_states[slot_id] = s
+            return self._slot_states[slot_id]
 
 
 # ── MockServer lifecycle class ────────────────────────────────────────────────
@@ -431,7 +478,7 @@ class MockServer:
         app = _make_app(self._state)
         config = uvicorn.Config(
             app,
-            host="127.0.0.1",
+            host="0.0.0.0",
             port=self._port,
             log_level="warning",
             loop="asyncio",
@@ -447,7 +494,7 @@ class MockServer:
     def wait_ready(self, timeout: float = 10.0) -> None:
         """Poll /health until the server is up or timeout is reached."""
         deadline = time.time() + timeout
-        url = f"http://127.0.0.1:{self._port}/health"
+        url = f"http://localhost:{self._port}/health"
         while time.time() < deadline:
             try:
                 resp = httpx.get(url, timeout=1.0)
@@ -466,20 +513,31 @@ class MockServer:
         """Set an OrchestratorScript programmatically."""
         self._state.orchestration_script = script
 
-    def configure(self, session_key: str) -> None:
-        """Reset call log and set the active session key for the next run."""
+    def configure(self, session_key: str, slot_id: str = "default") -> None:
+        """Reset call log and set the active session key for the next run.
+
+        Args:
+            session_key: OpenClaw session key to associate with this slot.
+            slot_id: Concurrent slot identifier. "default" is the global slot
+                     (backward compatible). Use "-c1", "-c2", etc. for concurrent slots.
+        """
         url = f"http://127.0.0.1:{self._port}/configure"
-        payload: dict[str, Any] = {"session_key": session_key}
-        if self._state.mock_script:
-            payload["mock_script"] = self._state.mock_script.model_dump()
-        if self._state.orchestration_script:
-            payload["orchestration_script"] = self._state.orchestration_script.model_dump()
+        slot = self._state.get_slot(slot_id)
+        payload: dict[str, Any] = {"session_key": session_key, "slot_id": slot_id}
+        if slot.mock_script:
+            payload["mock_script"] = slot.mock_script.model_dump()
+        if slot.orchestration_script:
+            payload["orchestration_script"] = slot.orchestration_script.model_dump()
         httpx.post(url, json=payload, timeout=5.0)
 
-    def get_log(self) -> list[dict]:
-        """Retrieve the recorded tool call log for the current session."""
+    def get_log(self, slot_id: str = "default") -> list[dict]:
+        """Retrieve the recorded tool call log for the given slot.
+
+        Args:
+            slot_id: Concurrent slot identifier. "default" is the global slot.
+        """
         url = f"http://127.0.0.1:{self._port}/log"
-        resp = httpx.get(url, timeout=5.0)
+        resp = httpx.get(url, params={"slot_id": slot_id}, timeout=5.0)
         return resp.json().get("calls", [])
 
     def stop(self) -> None:
@@ -488,3 +546,21 @@ class MockServer:
             self._server.should_exit = True
         if self._thread:
             self._thread.join(timeout=3.0)
+
+
+if __name__ == "__main__":
+    import argparse
+    import signal
+
+    p = argparse.ArgumentParser(description="Start the LNL mock server as a standalone process.")
+    p.add_argument("--port", type=int, default=18888, help="Port to listen on (default: 18888)")
+    p.add_argument("--openclaw-url", default="http://localhost:18789",
+                   help="OpenClaw gateway HTTP URL for wake callbacks (default: http://localhost:18789)")
+    cli_args = p.parse_args()
+
+    server = MockServer(openclaw_url=cli_args.openclaw_url, port=cli_args.port)
+    server.start()
+    server.wait_ready()
+    print(f"MockServer ready on port {cli_args.port}", flush=True)
+
+    signal.pause()

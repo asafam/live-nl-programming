@@ -154,7 +154,7 @@ parser.add_argument("--max-chain-depth", type=int, default=10)
             status = "OK" if entry.delivered else f"FAIL: {entry.error}"
             print(
                 f"{entry.message.sender} -> {entry.message.recipient}: "
-                f"{entry.message.content[:80]} [{status}]"
+                f"{str(entry.message.content)[:80]} [{status}]"
             )
 
     elif args.command == "save":

@@ -12,7 +12,7 @@ from src.lnl import (
     PeerDeclaration,
 )
 from src.lnl.tools import MockToolExecutor, ToolRegistry
-from src.lnl.types import ToolCall
+from src.lnl.types import ReactFinish, ReactStep, StateDelta, ToolCall
 
 
 def _make_definition(**overrides):
@@ -299,3 +299,111 @@ class TestToolLoop:
 
         assert result.metrics.input_tokens == 30
         assert result.metrics.output_tokens == 15
+
+
+class TestStateDelta:
+    """State delta (state_update) tests — incremental, deliberate state changes."""
+
+    def test_delta_set_on_finish(self):
+        """A set delta on the finish step writes the key to state."""
+        brain = MockBrain()
+        brain.script_react(ReactStep(
+            thought="Guest count updated.",
+            action="finish",
+            state_update=StateDelta(op="set", key="guest_count", value=47),
+            finish=ReactFinish(reply="Done."),
+        ))
+        obj = LLMObject(_make_definition(), brain)
+        result = obj.process_message(_user_msg("update count"))
+
+        assert obj.state == {"guest_count": 47}
+        assert result.state_after == {"guest_count": 47}
+        assert result.reply == "Done."
+
+    def test_delta_mid_loop(self):
+        """Deltas on tool_call steps and finish steps are both accumulated in order."""
+        brain = MockBrain()
+        # Step 1: tool_call with a delta
+        brain.script_react(ReactStep(
+            thought="Recording partial result.",
+            action="tool_call",
+            state_update=StateDelta(op="set", key="step", value="tool_called"),
+            tool_call=None,  # no registry — will loop back
+        ))
+        # Step 2: finish with another delta
+        brain.script_react(ReactStep(
+            thought="Done.",
+            action="finish",
+            state_update=StateDelta(op="set", key="done", value=True),
+            finish=ReactFinish(reply="ok"),
+        ))
+        obj = LLMObject(_make_definition(), brain)
+        obj.process_message(_user_msg("go"))
+
+        assert obj.state == {"step": "tool_called", "done": True}
+
+    def test_delta_delete(self):
+        """A delete delta removes a key from existing state."""
+        brain = MockBrain()
+        brain.script_react(ReactStep(
+            thought="Clearing pending.",
+            action="finish",
+            state_update=StateDelta(op="delete", key="_pending"),
+            finish=ReactFinish(reply="cleared"),
+        ))
+        obj = LLMObject(_make_definition(), brain)
+        obj.set_state({"_pending": {"waiting_for": "x"}, "other": 1})
+        obj.process_message(_user_msg("clear"))
+
+        assert obj.state == {"other": 1}
+        assert "_pending" not in obj.state
+
+    def test_delta_append(self):
+        """Append deltas add to a list; repeated appends grow the list."""
+        brain = MockBrain()
+        brain.script_react(ReactStep(
+            thought="First log entry.",
+            action="finish",
+            state_update=StateDelta(op="append", key="log", value="Alice checked in"),
+            finish=ReactFinish(reply="logged"),
+        ))
+        obj = LLMObject(_make_definition(), brain)
+        obj.process_message(_user_msg("log alice"))
+        assert obj.state == {"log": ["Alice checked in"]}
+
+        brain.script_react(ReactStep(
+            thought="Second log entry.",
+            action="finish",
+            state_update=StateDelta(op="append", key="log", value="Bob checked in"),
+            finish=ReactFinish(reply="logged"),
+        ))
+        obj.process_message(_user_msg("log bob"))
+        assert obj.state == {"log": ["Alice checked in", "Bob checked in"]}
+
+    def test_no_delta_state_unchanged(self):
+        """When no delta is emitted and no updated_state is set, state is unchanged."""
+        brain = MockBrain()
+        brain.script_react(ReactStep(
+            thought="Read-only lookup.",
+            action="finish",
+            finish=ReactFinish(reply="The value is 42."),
+        ))
+        obj = LLMObject(_make_definition(), brain)
+        obj.set_state({"existing": "data"})
+        result = obj.process_message(_user_msg("what is the value?"))
+
+        assert obj.state == {"existing": "data"}
+        assert result.state_after == {"existing": "data"}
+        assert result.reply == "The value is 42."
+
+    def test_updated_state_fallback(self):
+        """MockBrain scripts using updated_state still work via the fallback path."""
+        brain = MockBrain()
+        brain.script("test-obj", LLMResponse(
+            updated_state={"legacy": True},
+            reply="compat",
+        ))
+        obj = LLMObject(_make_definition(), brain)
+        obj.process_message(_user_msg("go"))
+
+        assert obj.state == {"legacy": True}

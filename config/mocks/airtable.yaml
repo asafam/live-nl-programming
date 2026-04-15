@@ -1,0 +1,17 @@
+system: airtable
+tools:
+  - method: airtable_create_record
+    immediate:
+      template: "id: rec_{tool_call_id}, table: '{table}', created: true"
+
+  - method: airtable_update_record
+    immediate:
+      template: "id: {record_id}, table: '{table}', updated: true"
+
+  - method: airtable_get_record
+    immediate:
+      template: "id: {record_id}, table: '{table}', fields: {{}}"
+
+  - method: airtable_list_records
+    immediate:
+      template: "[]"

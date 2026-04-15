@@ -2,10 +2,10 @@ system: slack
 tools:
   - method: slack_send_message
     immediate:
-      template: "message_id: {tool_call_id}, delivered to #{channel}"
+      template: "message_id: {tool_call_id}, delivered to {channel}"
     callback:
       delay_seconds: 0.3
-      message_template: "[Slack] Message delivered to #{channel}: {message}"
+      message_template: "[Slack] Message delivered to {channel}: {message}"
       source: slack
 
   - method: slack_list_channels

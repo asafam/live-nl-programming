@@ -184,6 +184,8 @@ Step `EventResult`s and raw event data are reused verbatim for all variants — 
 
 The baseline uses a single OpenClaw agent that receives all object definitions as context and processes steps, modifications, and events as sequential messages in one conversation.
 
+> **Running parallel evaluations?** Use the Docker worker pool instead of managing OpenClaw locally — each container is a fully isolated daemon. See [`docker/README.md`](docker/README.md).
+
 ### One-time setup
 
 **1. Install OpenClaw** (if not already installed):
@@ -235,8 +237,8 @@ openclaw gateway restart
 
 ```bash
 python -m src.data.evaluate_baseline \
-    -i outputs/data/zapier/20260322_010211/test_cases.jsonl \
-    --model gpt-4o \
+    -i outputs/data/zapier/20260411_zapier_clean/test_cases.jsonl \
+    --model gpt-4o-mini \
     --mock-server \
     --runs 3
 ```
@@ -262,6 +264,9 @@ python -m src.data.evaluate_baseline -i test_cases.jsonl --model gpt-4o
 
 # LLM-generated mock responses instead of scripted templates
 python -m src.data.evaluate_baseline -i test_cases.jsonl --model gpt-4o --mock-server --mock-llm-mode
+
+# Multi-agent mode: one OpenClaw agent per LNL-object (vs. default single combined agent)
+python -m src.data.evaluate_baseline -i test_cases.jsonl --model gpt-4o --multi-agent
 ```
 
 ### How `--mock-server` works
@@ -283,6 +288,41 @@ To rebuild the plugin after making changes to `plugins/openclaw-mock-external/sr
 cd plugins/openclaw-mock-external && npm run build
 ```
 (The build script copies the output to `~/.openclaw/extensions/` automatically.)
+
+### Parallel evaluation with Docker
+
+Run multiple evaluations simultaneously without OpenClaw label collisions by using the Docker worker pool. Each container bundles an isolated OpenClaw gateway and mock server. Workers use host ports `19789`/`19888` (and up) so they don't collide with a locally-running OpenClaw instance on the default `18789`/`18888` ports — both can run at the same time.
+
+**1. Build the image** (one time, from repo root):
+```bash
+docker build -f docker/Dockerfile -t lnl-openclaw-worker .
+```
+
+**2. Start the pool** using the provided script (reads your local OpenClaw operator token automatically):
+```bash
+./docker/start-pool.sh
+```
+
+**3. Run the evaluation with `--pool`** — dispatches all TCs across the worker pool automatically:
+```bash
+python -m src.data.evaluate_baseline \
+  -i outputs/.../test_cases.jsonl \
+  --pool docker/worker-pool.yaml \
+  --model gpt-4o \
+  --runs 3
+```
+
+`--pool` reads `docker/worker-pool.yaml`, distributes test cases dynamically across all workers (work-queue style), and writes a single merged output file. No `--mock-server-url` or `--gateway-url` flags needed — the pool YAML supplies them.
+
+The pool can run alongside a local evaluation without port conflicts:
+```bash
+# Both can run simultaneously
+python -m src.data.evaluate_baseline -i test_cases.jsonl --model gpt-4o --runs 1 &
+python -m src.data.evaluate_baseline -i test_cases.jsonl --pool docker/worker-pool.yaml --model gpt-4o --runs 1 &
+wait
+```
+
+See [`docker/README.md`](docker/README.md) for full setup details: bind-mount mechanics, plugin placement, session isolation, port assignments, and instructions for enabling more workers.
 
 ## CLI Flags
 
@@ -306,10 +346,13 @@ cd plugins/openclaw-mock-external && npm run build
 | `--reuse-steps` / `--no-reuse-steps` | Run steps once per sample; reuse state across variants (saves ~6× step cost). **Default: on.** | N/A |
 | `--debug-messages` | Print messages exchanged between LLM-objects | N/A |
 | `--mock-config` | YAML file(s) with shared mock tool definitions (repeatable) | N/A |
-| `--mock-server` | N/A | Enable MockServer + plugin tool integration |
+| `--mock-server` | N/A | Enable MockServer + plugin tool integration (local) |
+| `--mock-server-url` | N/A | URL of a remote mock server (e.g. Docker container). Skips starting a local one. |
+| `--pool` | N/A | Path to worker-pool YAML. Distributes TCs across Docker workers automatically. Overrides `--gateway-url`, `--mock-server-url`, and `--concurrency`. |
 | `--mock-llm-mode` | N/A | Use LLM to generate mock responses instead of templates |
 | `--mock-server-port` | N/A | MockServer port (default: 18888) |
-| `--openclaw-http-url` | N/A | OpenClaw gateway URL (default: http://localhost:18789) |
+| `--openclaw-http-url` | N/A | OpenClaw gateway HTTP URL for callbacks (default: http://localhost:18789) |
+| `--multi-agent` | N/A | Use one agent per LNL-object (default: single combined agent) |
 
 ## Comparing Results
 

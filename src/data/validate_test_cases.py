@@ -497,6 +497,95 @@ def find_missing_mock_tools(tc: "TestCase") -> list[str]:
     return issues
 
 
+# ── Validator: _data tool references in behavior text ────────────────────────
+
+_DATA_TOOL_RE = re.compile(r"\b([\w][\w-]*_data)\b")
+
+
+def find_behavior_data_tool_references(tc: "TestCase") -> list[str]:
+    """
+    Return errors where an object's behavior text references a *_data tool
+    that has no corresponding MockToolDef.
+
+    Unlike find_missing_mock_tools (which checks declared skills), this
+    validator parses free-text behavior descriptions for tool name patterns
+    ending in '_data'.  Objects often call read-service tools inline
+    (e.g. 'call the gmail_drafts_data tool') without listing them as skills.
+    Without a mock, the PassthroughExecutor returns '{}', causing the object
+    to stall or proceed with empty data — silently breaking the chain.
+
+    Limitation: regex-based, so it may catch tool-like substrings that are
+    not actual tool calls.  False positives are rare because '_data' suffixes
+    are a strong signal in this codebase.
+    """
+    mocked = {t.tool_name for t in tc.mock_tools}
+    issues = []
+    for obj in tc.objects:
+        for match in _DATA_TOOL_RE.finditer(obj.behavior):
+            tool_name = match.group(1)
+            if tool_name not in mocked:
+                issues.append(
+                    f"Object '{obj.object_id}' behavior references tool '{tool_name}' "
+                    f"but no MockToolDef with that name exists — the call will return '{{}}' "
+                    f"and the object will stall or proceed with empty data"
+                )
+    return issues
+
+
+# ── Validator: peer graph cycles ──────────────────────────────────────────────
+
+def find_peer_graph_cycles(tc: "TestCase") -> list[str]:
+    """
+    Return warnings for cycles in the peer graph that could cause infinite
+    message loops at runtime.
+
+    Uses DFS with a recursion stack to detect back edges.  A cycle does not
+    guarantee an infinite loop (the LLM may choose not to send back to the
+    caller), but it is a strong signal that the behavior description needs
+    to specify a termination condition explicitly.
+
+    Single-object test cases are exempt.
+    """
+    if len(tc.objects) <= 1:
+        return []
+
+    peer_map: dict[str, list[str]] = {
+        o.object_id: [p.object_id for p in o.peers]
+        for o in tc.objects
+    }
+    object_ids = set(peer_map)
+
+    visited: set[str] = set()
+    rec_stack: set[str] = set()
+    cycles: list[list[str]] = []
+
+    def _dfs(node: str, path: list[str]) -> None:
+        visited.add(node)
+        rec_stack.add(node)
+        path.append(node)
+        for neighbor in peer_map.get(node, []):
+            if neighbor not in object_ids:
+                continue
+            if neighbor not in visited:
+                _dfs(neighbor, path)
+            elif neighbor in rec_stack:
+                # Found cycle — extract the loop portion
+                cycle_start = path.index(neighbor)
+                cycles.append(path[cycle_start:] + [neighbor])
+        path.pop()
+        rec_stack.discard(node)
+
+    for oid in object_ids:
+        if oid not in visited:
+            _dfs(oid, [])
+
+    return [
+        f"Peer graph cycle detected: {' → '.join(cycle)} — "
+        f"without an explicit termination condition this can loop indefinitely"
+        for cycle in cycles
+    ]
+
+
 # ── Validator: modification integrity ────────────────────────────────────────
 
 def _parse_timestamp(when: str) -> "tuple[int, int, int, int] | None":
@@ -660,6 +749,103 @@ def find_unnatural_identifiers(tc: "TestCase") -> list[str]:
     return issues
 
 
+# ── Validator: event entity IDs missing from mock tool coverage ───────────────
+
+_ENTITY_ID_RE = re.compile(r'\b[A-Z]{2,10}-\d{3,}\b')
+_EMAIL_RE = re.compile(r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b')
+# Company names: one or more title-case words followed by a business-entity suffix.
+# The suffix anchor prevents matching generic phrases like "Status Change".
+_COMPANY_NAME_RE = re.compile(
+    r'\b(?:[A-Z][a-z]+ ){1,4}(?:Inc|LLC|Ltd|Corp|Group|Systems|Services|Solutions|Technologies|Logistics|Financial|Publishing|BioTech|Analytics|Consulting|Holdings|Ventures|Partners)\b'
+)
+
+
+def find_event_entity_mock_gaps(tc: "TestCase") -> list[str]:
+    """
+    Return warnings where an event input or expectation references a structured
+    entity ID (e.g. EMP-3317, ACC-10284) or email address that does not appear
+    anywhere in mock tool response data.
+
+    Root cause: mock tools are stateless — response_template is hardcoded for
+    the S001 entity.  When a later event introduces a different entity, the
+    mock tool returns stale data for the wrong entity, causing the LLM to spin
+    until timeout.
+
+    Coverage sources checked (all must be absent to flag):
+      - response_template of every mock tool
+      - scripted_responses entries of every mock tool
+      - scripted_match_responses match values AND response strings
+
+    Design: deliberately errs toward flagging (no false negatives).  It cannot
+    distinguish read vs. write operations, so some flagged entities may be new
+    records being created rather than looked up.  Those false positives are
+    acceptable; missing a real gap is not.  Suppress by adding the entity to
+    the mock tool's scripted_match_responses, not by weakening this check.
+
+    Skipped if the test case has no mock tools (nothing to be inconsistent with).
+    """
+    if not tc.mock_tools:
+        return []
+
+    # Build full mock tool text corpus — every string the mock could return
+    mock_parts: list[str] = []
+    for tool in tc.mock_tools:
+        mock_parts.append(tool.response_template)
+        mock_parts.extend(tool.scripted_responses)
+        for smr in tool.scripted_match_responses:
+            mock_parts.extend(smr.match.values())
+            mock_parts.append(smr.response)
+    mock_text = " ".join(mock_parts)
+
+    tool_names_str = ", ".join(f"'{t.tool_name}'" for t in tc.mock_tools)
+
+    # Collect entity IDs and emails from ALL event inputs + expectations.
+    # Deduplicate by entity so each gap is reported once regardless of how
+    # many events reference it.
+    reported: set[str] = set()
+    issues: list[str] = []
+
+    for evt in tc.events:
+        search_text = (evt.input or "")
+        if evt.expect:
+            search_text += " " + evt.expect.action
+
+        for m in _ENTITY_ID_RE.finditer(search_text):
+            entity = m.group()
+            if entity not in reported and entity not in mock_text:
+                reported.add(entity)
+                issues.append(
+                    f"Event '{evt.id}' references entity '{entity}' which does not "
+                    f"appear in any mock tool response data — if any object queries a "
+                    f"mock tool for this entity it will receive mismatched data and may "
+                    f"timeout (mock tools: {tool_names_str})"
+                )
+
+        for m in _EMAIL_RE.finditer(search_text):
+            email = m.group()
+            if email not in reported and email not in mock_text:
+                reported.add(email)
+                issues.append(
+                    f"Event '{evt.id}' references email '{email}' which does not "
+                    f"appear in any mock tool response data — if any object queries a "
+                    f"mock tool for this recipient it will receive no matching data "
+                    f"(mock tools: {tool_names_str})"
+                )
+
+        for m in _COMPANY_NAME_RE.finditer(search_text):
+            name = m.group()
+            if name not in reported and name not in mock_text:
+                reported.add(name)
+                issues.append(
+                    f"Event '{evt.id}' references company/account '{name}' which does not "
+                    f"appear in any mock tool response data — if any object queries a mock "
+                    f"tool for this account it will receive data for the wrong entity and "
+                    f"may timeout (mock tools: {tool_names_str})"
+                )
+
+    return issues
+
+
 # ── Severity classification ───────────────────────────────────────────────────
 #
 # BLOCKING: chain is guaranteed broken — regenerate the sample.
@@ -669,24 +855,27 @@ def find_unnatural_identifiers(tc: "TestCase") -> list[str]:
 # WARNING: chain may degrade but might still partially pass — print and continue.
 
 BLOCKING_VALIDATORS = frozenset({
-    "find_peer_graph_dead_ends",        # entry-point with no peers → chain dead immediately
-    "find_unreachable_objects",         # orphan objects → never receive a message
-    "find_invalid_peer_declarations",   # dangling peer → sends silently dropped
-    "find_missing_mock_tools",          # _data skill with no mock → stalls silently
-    "find_read_write_misclassifications",  # PENDING forever stall
-    "find_modification_target_errors",  # modification targets ghost → never applied
+    "find_peer_graph_dead_ends",             # entry-point with no peers → chain dead immediately
+    "find_unreachable_objects",              # orphan objects → never receive a message
+    "find_invalid_peer_declarations",        # dangling peer → sends silently dropped
+    "find_missing_mock_tools",               # _data skill with no mock → stalls silently
+    "find_behavior_data_tool_references",    # behavior references _data tool with no mock → stalls silently
+    "find_read_write_misclassifications",    # PENDING forever stall
+    "find_modification_target_errors",       # modification targets ghost → never applied
 })
 
 WARNING_VALIDATORS = frozenset({
-    "find_mock_field_mismatches",           # wrong field values → downstream mismatch
-    "find_missing_step_data",               # objects hallucinate missing data
-    "find_threshold_evaluation_errors",     # false expectation failure
-    "find_unnatural_identifiers",           # judge false-failure risk
-    "find_trigger_reference_errors",        # bad trigger config → runtime KeyError
-    "find_sequential_confirmation_chains",  # fixable via mock tool triggers
-    "find_modification_timeline_errors",    # modification after all events → unobservable
-    "find_event_timeline_errors",           # child event before parent → causal violation
-    "find_undeclared_peer_references",      # fan-out omission → sends silently dropped
+    "find_mock_field_mismatches",            # wrong field values → downstream mismatch
+    "find_missing_step_data",                # objects hallucinate missing data
+    "find_threshold_evaluation_errors",      # false expectation failure
+    "find_unnatural_identifiers",            # judge false-failure risk
+    "find_trigger_reference_errors",         # bad trigger config → runtime KeyError
+    "find_sequential_confirmation_chains",   # fixable via mock tool triggers
+    "find_modification_timeline_errors",     # modification after all events → unobservable
+    "find_event_timeline_errors",            # child event before parent → causal violation
+    "find_undeclared_peer_references",       # fan-out omission → sends silently dropped
+    "find_peer_graph_cycles",               # potential infinite loop
+    "find_event_entity_mock_gaps",           # entity in event not in mock data → timeout risk
 })
 
 # ── Composite runners ─────────────────────────────────────────────────────────
@@ -698,8 +887,10 @@ _SAMPLE_VALIDATORS = [
     find_invalid_peer_declarations,
     find_undeclared_peer_references,
     find_peer_graph_dead_ends,
+    find_peer_graph_cycles,
     find_unreachable_objects,
     find_missing_mock_tools,
+    find_behavior_data_tool_references,
 ]
 
 _TEST_CASE_VALIDATORS = [
@@ -712,13 +903,16 @@ _TEST_CASE_VALIDATORS = [
     find_trigger_reference_errors,
     find_invalid_peer_declarations,
     find_peer_graph_dead_ends,
+    find_peer_graph_cycles,
     find_unreachable_objects,
     find_missing_mock_tools,
+    find_behavior_data_tool_references,
     find_unnatural_identifiers,
     find_modification_target_errors,
     find_modification_timeline_errors,
     find_event_timeline_errors,
     find_undeclared_peer_references,
+    find_event_entity_mock_gaps,
 ]
 
 

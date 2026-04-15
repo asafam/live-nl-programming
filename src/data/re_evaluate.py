@@ -1,8 +1,9 @@
 """
-Re-evaluation runner — re-judge existing run artifacts with a different judge.
+Re-evaluation runner — re-judge existing eval artifacts with a different judge.
 
-Reads raw execution artifacts from a _runs.jsonl file (produced by evaluate.py)
-and re-runs only the LLM-as-judge step, without re-executing the LNL runtime.
+Reads TestCaseResult records from a _eval.jsonl file (produced by evaluate.py),
+extracts the evidence and prior_context stored in each EventResult, and re-runs
+only the LLM-as-judge step without re-executing the LNL runtime.
 
 Use cases:
   - Re-judge with a different model or judge panel
@@ -10,21 +11,21 @@ Use cases:
   - Add a second opinion judge to an existing evaluation run
 
 Usage:
-    # Re-judge runs file with a different judge model
+    # Re-judge with a different judge model
     python -m src.data.re_evaluate \\
-        --from-runs outputs/.../test_cases_runs_20260408_120000.jsonl \\
+        --from-eval outputs/.../test_cases_eval_20260410_113327.jsonl \\
         --judge-model gpt-4o
-
-    # Re-judge via eval file (auto-locates runs file via runs_path in RunConfig)
-    python -m src.data.re_evaluate \\
-        --from-eval outputs/.../test_cases_eval_20260408_120000.jsonl \\
-        --judge-model claude-opus-4-6
 
     # Re-judge with updated expectations
     python -m src.data.re_evaluate \\
-        --from-runs outputs/.../test_cases_runs_20260408_120000.jsonl \\
+        --from-eval outputs/.../test_cases_eval_20260410_113327.jsonl \\
         --test-cases outputs/.../test_cases.jsonl \\
-        --judge-model gpt-4o
+        --judge-model claude-opus-4-6
+
+    # Panel judge (multiple judges, majority vote)
+    python -m src.data.re_evaluate \\
+        --from-eval outputs/.../test_cases_eval_20260410_113327.jsonl \\
+        --llm-judge gpt-4o --llm-judge claude-sonnet-4-6
 """
 from __future__ import annotations
 
@@ -47,8 +48,6 @@ from src.data.schema import (
     EvalSummary,
     EventResult,
     ModificationResult,
-    RawEventData,
-    RawTestCaseResult,
     RunConfig,
     TestCase,
     TestCaseResult,
@@ -56,7 +55,7 @@ from src.data.schema import (
 from src.data.utils import infer_provider, load_jsonl
 
 
-# ── Judge factory (mirrors evaluate.py) ──────────────────────────────────────
+# ── Judge factory ─────────────────────────────────────────────────────────────
 
 def _make_judge(provider: str, model: str):
     if provider == "openai":
@@ -98,72 +97,26 @@ def _build_judge(args: argparse.Namespace):
     return PanelJudge(single_judges, judge_labels=labels), parsed
 
 
-# ── Runs file loading ─────────────────────────────────────────────────────────
+# ── Eval file loading ─────────────────────────────────────────────────────────
 
-def _load_runs(runs_path: Path) -> list[RawTestCaseResult]:
-    runs: list[RawTestCaseResult] = []
-    for line in runs_path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-            if data.get("record_type") == "raw_run":
-                runs.append(RawTestCaseResult.model_validate(data))
-        except Exception:
-            pass
-    return runs
-
-
-def _locate_runs_path(args: argparse.Namespace) -> Path:
-    """Resolve the runs file path from CLI args.
-
-    Accepts either --from-runs (direct) or --from-eval (reads runs_path from RunConfig).
-    """
-    if getattr(args, "from_runs", None):
-        p = args.from_runs
-        if not p.exists():
-            print(f"Error: runs file not found: {p}", file=sys.stderr)
-            sys.exit(1)
-        return p
-
-    eval_path: Path = args.from_eval
-    if not eval_path.exists():
-        print(f"Error: eval file not found: {eval_path}", file=sys.stderr)
-        sys.exit(1)
-
-    # Look for runs_path in the RunConfig record (first line)
+def _load_eval(eval_path: Path) -> list[TestCaseResult]:
+    """Load TestCaseResult records from an _eval.jsonl file."""
+    results: list[TestCaseResult] = []
     for line in eval_path.read_text().splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             data = json.loads(line)
-            if data.get("record_type") == "run_config" and data.get("runs_path"):
-                runs_path = Path(data["runs_path"])
-                if runs_path.exists():
-                    return runs_path
-                print(
-                    f"Error: runs_path in eval file points to a missing file: {runs_path}\n"
-                    f"Run the original evaluate.py to regenerate, or pass --from-runs directly.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+            rt = data.get("record_type", "")
+            if rt in ("run_config", "eval_summary"):
+                continue
+            # TestCaseResult records have tc_id + run_index but no record_type
+            if "tc_id" in data and "run_index" in data and "events" in data:
+                results.append(TestCaseResult.model_validate(data))
         except Exception:
             pass
-
-    # Fall back to sibling _runs_ file derived from eval filename
-    from src.data.evaluate import runs_path_from_eval_path
-    candidate = runs_path_from_eval_path(eval_path)
-    if candidate.exists():
-        return candidate
-
-    print(
-        f"Error: could not locate runs file for {eval_path}.\n"
-        f"Pass --from-runs <path> explicitly, or re-run evaluate.py to generate one.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+    return results
 
 
 # ── Expectation override ──────────────────────────────────────────────────────
@@ -184,7 +137,7 @@ def _build_expectation_map(tc_path: Path) -> "dict[str, dict[str, str]]":
     return result
 
 
-# ── Summary (duplicated from evaluate.py to avoid coupling) ──────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 
 def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     import re
@@ -193,14 +146,13 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     def mean(vals):
         return sum(vals) / len(vals) if vals else 0.0
 
-    all_events = [e for r in results for e in r.events]
     all_mods = [m for r in results for m in r.modifications]
     total_runs = len(results)
     total_test_cases = len({r.tc_id for r in results})
 
-    # Step events (S\d+): deduplicate by sample_id (first TC per sample only)
     _step_re = re.compile(r"^S\d+$")
     seen_samples: set[str] = set()
+    all_events: list = []
     pass_rates: list[float] = []
     for r in results:
         effective = [e for e in r.events if not _step_re.match(e.event_id)]
@@ -209,6 +161,7 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
             seen_samples.add(sample_key)
             step_evts = [e for e in r.events if _step_re.match(e.event_id)]
             effective = step_evts + effective
+        all_events.extend(effective)
         if effective:
             pass_rates.append(sum(1 for e in effective if e.passed) / len(effective))
 
@@ -222,12 +175,41 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     ]
     pass_rate_std = mean(per_tc_stds)
 
+    step_events = [e for e in all_events if _step_re.match(e.event_id)]
+    steps_pass_rate = (
+        sum(1 for e in step_events if e.passed) / len(step_events) if step_events else None
+    )
+
+    inconclusive_tc_ids: set[str] = set()
+    for r in results:
+        step_evts = [e for e in r.events if _step_re.match(e.event_id)]
+        if step_evts and any(not e.passed for e in step_evts):
+            inconclusive_tc_ids.add(r.tc_id)
+
+    conclusive_events = [
+        e for r in results if r.tc_id not in inconclusive_tc_ids
+        for e in r.events
+    ]
+
+    def _role_pass_rate(role_val):
+        evts = [e for e in conclusive_events if e.role == role_val]
+        return (sum(1 for e in evts if e.passed) / len(evts)) if evts else None
+
+    mod_events = [e for e in conclusive_events if e.role in ("pre_mod", "post_mod", "irrelevant")]
+    mod_pass_rate = (sum(1 for e in mod_events if e.passed) / len(mod_events)) if mod_events else None
+
     return EvalSummary(
         total_test_cases=total_test_cases,
         total_runs=total_runs,
         total_events=len(all_events),
         mean_pass_rate=mean_pass_rate,
         pass_rate_std=pass_rate_std,
+        steps_pass_rate=steps_pass_rate,
+        mod_pass_rate=mod_pass_rate,
+        pre_mod_pass_rate=_role_pass_rate("pre_mod"),
+        post_mod_pass_rate=_role_pass_rate("post_mod"),
+        irrelevant_pass_rate=_role_pass_rate("irrelevant"),
+        inconclusive_tcs=len(inconclusive_tc_ids),
         mean_event_input_tokens=mean([e.input_tokens for e in all_events]),
         mean_event_output_tokens=mean([e.output_tokens for e in all_events]),
         mean_event_latency_ms=mean([e.latency_ms for e in all_events]),
@@ -240,13 +222,27 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
 # ── Main runner ───────────────────────────────────────────────────────────────
 
 def run(args: argparse.Namespace) -> Path:
-    runs_path = _locate_runs_path(args)
-    raw_runs = _load_runs(runs_path)
-    if not raw_runs:
-        print(f"Error: no raw_run records found in {runs_path}", file=sys.stderr)
+    eval_path: Path = args.from_eval
+    if not eval_path.exists():
+        print(f"Error: eval file not found: {eval_path}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loaded {len(raw_runs)} run records from {runs_path}")
+    tc_results = _load_eval(eval_path)
+    if not tc_results:
+        print(f"Error: no TestCaseResult records found in {eval_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Check that evidence is present (old eval files pre-refactor won't have it)
+    missing_evidence = sum(1 for r in tc_results for e in r.events if not e.evidence)
+    if missing_evidence:
+        print(
+            f"Warning: {missing_evidence} events have no evidence stored. "
+            f"These were produced before the eval storage refactor and cannot be re-judged. "
+            f"Re-run evaluate.py to regenerate.",
+            file=sys.stderr,
+        )
+
+    print(f"Loaded {len(tc_results)} run records from {eval_path}")
 
     judge, parsed_judges = _build_judge(args)
     from src.lnl.benchmark import BenchmarkHarness
@@ -266,9 +262,10 @@ def run(args: argparse.Namespace) -> Path:
     # Output path
     if args.output is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output = runs_path.parent / runs_path.name.replace("_runs_", f"_rejudged_{ts}_", 1)
-        if "_runs_" not in runs_path.name:
-            args.output = runs_path.parent / f"{runs_path.stem}_rejudged_{ts}.jsonl"
+        stem = eval_path.stem.replace("_eval_", "_rejudged_", 1)
+        if "_eval_" not in eval_path.stem:
+            stem = f"{eval_path.stem}_rejudged"
+        args.output = eval_path.parent / f"{stem}_{ts}.jsonl"
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     print(f"Output: {args.output}")
@@ -280,9 +277,8 @@ def run(args: argparse.Namespace) -> Path:
 
     run_config = RunConfig(
         timestamp=datetime.now().isoformat(),
-        input_path=str(runs_path),
+        input_path=str(eval_path),
         output_path=str(args.output),
-        runs_path=str(runs_path),
         model="",
         provider="",
         judge_model=parsed_judges[0][1],
@@ -297,24 +293,33 @@ def run(args: argparse.Namespace) -> Path:
         is_continuation=False,
     )
 
-    def _rejudge_one(raw: RawTestCaseResult) -> TestCaseResult:
-        tc_expect = expect_map.get(raw.tc_id, {})
+    def _rejudge_one(orig: TestCaseResult) -> TestCaseResult:
+        tc_expect = expect_map.get(orig.tc_id, {})
         event_results: list[EventResult] = []
 
-        for raw_evt in raw.events:
-            condition = tc_expect.get(raw_evt.event_id, raw_evt.expected)
-            passed, reasoning, votes = harness.evaluate_assertion(
-                condition, raw_evt.evidence, raw_evt.prior_context
+        for evt in orig.events:
+            if not evt.evidence:
+                # No evidence stored — keep original verdict unchanged
+                event_results.append(evt)
+                continue
+
+            condition = tc_expect.get(evt.event_id, evt.expected)
+            passed, reasoning, votes, j_in_tok, j_out_tok = harness.evaluate_assertion(
+                condition, evt.evidence, evt.prior_context
             )
             event_results.append(EventResult(
-                event_id=raw_evt.event_id,
+                event_id=evt.event_id,
                 passed=passed,
                 reasoning=reasoning,
                 expected=condition,
-                input_tokens=raw_evt.input_tokens,
-                output_tokens=raw_evt.output_tokens,
-                latency_ms=raw_evt.latency_ms,
-                judge_votes=votes if len(votes) > 1 else [],
+                evidence=evt.evidence,
+                prior_context=evt.prior_context,
+                input_tokens=evt.input_tokens,
+                output_tokens=evt.output_tokens,
+                latency_ms=evt.latency_ms,
+                judge_input_tokens=j_in_tok,
+                judge_output_tokens=j_out_tok,
+                judge_votes=votes,  # always stored — enables per-judge audit
             ))
 
         pass_rate = (
@@ -322,26 +327,26 @@ def run(args: argparse.Namespace) -> Path:
             if event_results else None
         )
         return TestCaseResult(
-            tc_id=raw.tc_id,
-            sample_id=raw.sample_id,
-            tc_index=raw.tc_index,
-            seed=raw.seed,
-            name=raw.name,
-            domain=raw.domain,
-            run_index=raw.run_index,
+            tc_id=orig.tc_id,
+            sample_id=orig.sample_id,
+            tc_index=orig.tc_index,
+            seed=orig.seed,
+            name=orig.name,
+            domain=orig.domain,
+            run_index=orig.run_index,
             events=event_results,
-            modifications=raw.modifications,
+            modifications=orig.modifications,
             pass_rate=pass_rate,
         )
 
     with open(args.output, "w") as f:
         f.write(run_config.model_dump_json() + "\n")
         f.flush()
-        with tqdm(total=len(raw_runs), unit="run", desc="Re-judging") as pbar:
+        with tqdm(total=len(tc_results), unit="run", desc="Re-judging") as pbar:
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(_rejudge_one, raw): raw for raw in raw_runs}
+                futures = {executor.submit(_rejudge_one, orig): orig for orig in tc_results}
                 for future in as_completed(futures):
-                    raw = futures[future]
+                    orig = futures[future]
                     try:
                         tc_result = future.result()
                         passed_n = sum(1 for e in tc_result.events if e.passed)
@@ -351,22 +356,30 @@ def run(args: argparse.Namespace) -> Path:
                             if tc_result.pass_rate is not None
                             else "N/A"
                         )
-                        tqdm.write(f"  {raw.tc_id} run={raw.run_index} → pass={passed_n}/{total_n} ({rate_str})")
+                        tqdm.write(f"  {orig.tc_id} run={orig.run_index} → pass={passed_n}/{total_n} ({rate_str})")
                         with write_lock:
                             f.write(tc_result.model_dump_json() + "\n")
                             f.flush()
                             all_tc_results.append(tc_result)
                     except Exception as e:
-                        tqdm.write(f"FAILED {raw.tc_id} run={raw.run_index}: {e}", file=sys.stderr)
+                        tqdm.write(f"FAILED {orig.tc_id} run={orig.run_index}: {e}", file=sys.stderr)
                     pbar.update(1)
 
     summary = _compute_summary(all_tc_results)
     with open(args.output, "a") as f:
         f.write(summary.model_dump_json() + "\n")
 
+    def _fmt(v) -> str:
+        return f"{v:.3f}" if v is not None else "N/A"
+
     print()
     print(f"Complete. Output: {args.output}")
-    print(f"Mean pass rate: {summary.mean_pass_rate:.3f}  std: {summary.pass_rate_std:.3f}")
+    print(f"Mean pass rate:      {_fmt(summary.mean_pass_rate)}  std: {_fmt(summary.pass_rate_std)}")
+    print(f"Steps pass rate:     {_fmt(summary.steps_pass_rate)}")
+    print(f"Pre-mod pass rate:   {_fmt(summary.pre_mod_pass_rate)}")
+    print(f"Post-mod pass rate:  {_fmt(summary.post_mod_pass_rate)}")
+    print(f"Irrelevant pass rate:{_fmt(summary.irrelevant_pass_rate)}")
+    print(f"Inconclusive TCs:    {summary.inconclusive_tcs}")
     return args.output
 
 
@@ -374,52 +387,46 @@ def run(args: argparse.Namespace) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Re-judge existing run artifacts with a different LLM judge",
+        description="Re-judge existing eval artifacts with a different LLM judge",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Re-judge with a different model
-  python -m src.data.re_evaluate --from-runs outputs/.../test_cases_runs_20260408_120000.jsonl --judge-model gpt-4o
-
-  # Locate runs via eval file
-  python -m src.data.re_evaluate --from-eval outputs/.../test_cases_eval_20260408_120000.jsonl --judge-model claude-opus-4-6
+  python -m src.data.re_evaluate \\
+      --from-eval outputs/.../test_cases_eval_20260410_113327.jsonl \\
+      --judge-model gpt-4o
 
   # Re-judge with updated expectations
-  python -m src.data.re_evaluate --from-runs outputs/.../test_cases_runs_20260408_120000.jsonl \\
-      --test-cases outputs/.../test_cases.jsonl --judge-model gpt-4o
+  python -m src.data.re_evaluate \\
+      --from-eval outputs/.../test_cases_eval_20260410_113327.jsonl \\
+      --test-cases outputs/.../test_cases.jsonl --judge-model claude-opus-4-6
 
-  # Panel judge
-  python -m src.data.re_evaluate --from-runs outputs/.../runs.jsonl \\
+  # Panel judge (majority vote across multiple models)
+  python -m src.data.re_evaluate \\
+      --from-eval outputs/.../test_cases_eval_20260410_113327.jsonl \\
       --llm-judge gpt-4o --llm-judge claude-sonnet-4-6
 """,
     )
 
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument(
-        "--from-runs",
-        type=Path,
-        metavar="JSONL",
-        help="Path to a _runs.jsonl artifact file produced by evaluate.py",
-    )
-    source.add_argument(
+    parser.add_argument(
         "--from-eval",
         type=Path,
+        required=True,
         metavar="JSONL",
-        help="Path to an _eval.jsonl file; the linked _runs.jsonl is located automatically via RunConfig.runs_path",
+        help="Path to a _eval.jsonl file produced by evaluate.py",
     )
-
     parser.add_argument(
         "--test-cases",
         type=Path,
         default=None,
         metavar="JSONL",
-        help="Optional updated test_cases.jsonl — event expectations are re-read from here, overriding the values embedded in the runs file",
+        help="Optional updated test_cases.jsonl — event expectations override the stored values",
     )
     parser.add_argument(
         "--output", "-o",
         type=Path,
         default=None,
-        help="Output JSONL path (default: derived from runs file name)",
+        help="Output JSONL path (default: derived from eval file name)",
     )
     parser.add_argument(
         "--judge-model",

@@ -30,6 +30,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -157,41 +158,40 @@ def run(args: argparse.Namespace) -> None:
     # Generate mock tools per sample group
     new_tools_by_sample: dict[str, list[MockToolDef]] = {}
 
-    with tqdm(total=len(needs_work), unit="sample", desc="Identifying") as pbar:
-        for sid, idxs in needs_work.items():
-            representative = test_cases[idxs[0]]
-            pbar.set_postfix_str(representative.id[:50], refresh=True)
-
-            step_texts = [s.text for s in representative.steps if s.text]
-
-            # Step 1: identify what tools are needed
-            identified = _identify_missing_tools(llm, representative)
-
-            if args.dry_run:
-                if identified:
-                    tqdm.write(f"\n  {representative.id}")
-                    for t in identified:
-                        tqdm.write(f"    → {t['tool_name']}: {t.get('description', '')[:80]}")
-                pbar.update(1)
+    def _process_sample(sid: str, idxs: list[int]) -> tuple[str, list[MockToolDef] | None]:
+        representative = test_cases[idxs[0]]
+        identified = _identify_missing_tools(llm, representative)
+        if args.dry_run:
+            if identified:
+                tqdm.write(f"\n  {representative.id}")
+                for t in identified:
+                    tqdm.write(f"    → {t['tool_name']}: {t.get('description', '')[:80]}")
+            return sid, None
+        step_texts = [s.text for s in representative.steps if s.text]
+        tools: list[MockToolDef] = list(representative.mock_tools)
+        for entry in identified:
+            tool_name = entry.get("tool_name", "").strip()
+            description = entry.get("description", "").strip() or entry.get("used_by", "")
+            if not tool_name or any(t.tool_name == tool_name for t in tools):
                 continue
+            tool = _generate_mock_tool_data(llm, tool_name, description, step_texts)
+            if tool:
+                tools.append(tool)
+                tqdm.write(f"  + {tool_name} ({representative.id[:40]})")
+        return sid, tools
 
-            # Step 2: generate mock data for each identified tool
-            tools: list[MockToolDef] = list(representative.mock_tools)  # keep existing
-            for entry in identified:
-                tool_name = entry.get("tool_name", "").strip()
-                description = entry.get("description", "").strip() or entry.get("used_by", "")
-                if not tool_name:
-                    continue
-                # Skip if already present
-                if any(t.tool_name == tool_name for t in tools):
-                    continue
-                tool = _generate_mock_tool_data(llm, tool_name, description, step_texts)
-                if tool:
-                    tools.append(tool)
-                    tqdm.write(f"  + {tool_name} ({representative.id[:40]})")
-
-            new_tools_by_sample[sid] = tools
-            pbar.update(1)
+    workers = getattr(args, "workers", 1)
+    with tqdm(total=len(needs_work), unit="sample", desc="Identifying") as pbar:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_process_sample, sid, idxs): sid for sid, idxs in needs_work.items()}
+            for fut in as_completed(futures):
+                try:
+                    sid, tools = fut.result()
+                    if tools is not None:
+                        new_tools_by_sample[sid] = tools
+                except Exception as e:
+                    tqdm.write(f"  WARN: failed for {futures[fut]}: {e}", file=sys.stderr)
+                pbar.update(1)
 
     if args.dry_run:
         print("\nDry run complete — no files written.")
@@ -261,6 +261,8 @@ Examples:
                         help="Output path for patched samples (default: overwrites --samples)")
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="Identify tools only; do not generate data or write files")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Number of parallel workers for sample processing (default: 4)")
     add_common_args(parser)
     return parser
 
