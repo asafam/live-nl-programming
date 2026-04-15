@@ -113,34 +113,19 @@ def _agents_md(obj: ObjectDefinition, session_name: str = "main") -> str:
         peers_block = "\n".join(f"- **{p.object_id}**: {p.relationship}" for p in obj.peers)
         peer_ids = [p.object_id for p in obj.peers]
         peer_examples = "\n".join(
-            f'  - `sessions_send(sessionKey="agent:{pid}:{session_name}", message="<your message>", timeoutSeconds=240)`'
+            f'  - To message `{pid}`: `sessions_send(sessionKey="agent:{pid}:{session_name}", message="<your message>", timeoutSeconds=240)`'
             for pid in peer_ids
         )
-        peer_checklist = "\n".join(f"  - [ ] Called sessions_send to `{pid}`" for pid in peer_ids)
         comm_section = (
-            f"## How to Call Peers\n\n"
-            f"Use the `sessions_send` tool — **this is a tool call, not text**.\n"
-            f"Do NOT use the `message` tool (that is for external channels like Slack or email).\n"
-            f"Always include `timeoutSeconds=240`.\n\n"
-            f"Exact sessions_send calls:\n\n"
+            f"## Communication\n\n"
+            f"To send a message to a peer agent, use the `sessions_send` tool with the exact sessionKey below.\n"
+            f"**Do NOT use the `message` tool** — that is for external channels (Slack, email, etc.).\n"
+            f"**ALWAYS include `timeoutSeconds=240`** — peers may need to make multiple tool calls and\n"
+            f"send messages to their own downstream peers before responding. Never omit this parameter.\n\n"
+            f"Exact calls for each peer:\n\n"
             f"{peer_examples}\n\n"
             f"Use external tools (e.g. `slack_send_message`, `zapier_tables_create_record`) "
-            f"for actions on external systems (not peer agents).\n\n"
-            f"**Before finishing, confirm you have made ALL of these tool calls:**\n\n"
-            f"{peer_checklist}\n\n"
-            f"Returning only text without making these tool calls means you have NOT completed your task.\n"
-        )
-        execution_rule = (
-            f"## Execution Rule\n\n"
-            f"**There is no human in this conversation.** You are receiving automated system events.\n"
-            f"No one will reply to questions. Confirmation requests will never be answered.\n\n"
-            f"**When you receive a message, immediately call `sessions_send` for every peer listed below.**\n"
-            f"Writing analysis text as a response is NOT completing the task — the analysis must be\n"
-            f"delivered to peers via `sessions_send` tool calls.\n\n"
-            f"Required peer calls for this agent:\n\n"
-            + "\n".join(f"- `sessions_send` → `{pid}`" for pid in peer_ids) + "\n\n"
-            f"**NEVER write phrases like** 'let me know', 'would you like', 'shall I', 'please confirm',\n"
-            f"or 'I will now'. If you are about to write any of these — stop and make the tool call instead.\n"
+            f"for actions on external systems.\n"
         )
     else:
         peers_block = "(No peers defined.)"
@@ -148,15 +133,9 @@ def _agents_md(obj: ObjectDefinition, session_name: str = "main") -> str:
             f"## Communication\n\n"
             f"This agent has no peers. Use the available external tools for all actions.\n"
         )
-        execution_rule = (
-            f"## Execution Rule\n\n"
-            f"When you receive a message, execute all required actions immediately using the available tools.\n"
-            f"Do NOT ask for confirmation. Do NOT describe what you plan to do. Make the tool calls.\n"
-        )
 
     return (
         f"# Agent: {name}\n\n"
-        + execution_rule + "\n"
         f"## Role\n\n{obj.role}\n\n"
         f"## Behavior\n\n{behavior}\n\n"
         f"## Peers\n\n{peers_block}\n\n"
@@ -171,24 +150,12 @@ def _agents_md(obj: ObjectDefinition, session_name: str = "main") -> str:
 def _soul_md(obj: ObjectDefinition) -> str:
     name = _slug_to_name(obj.object_id)
     first_sentence = re.split(r"[.!?]", obj.role)[0].strip()
-    has_peers = bool(obj.peers)
-    peer_reminder = (
-        f"\nYou have peer agents. Routing or sending information to them means calling\n"
-        f"`sessions_send` as a tool call — not writing text. Text without tool calls = incomplete.\n"
-    ) if has_peers else ""
     return (
         f"# {name}\n\n"
-        f"You are {name}, a fully automated agent. There is NO human in this conversation.\n"
-        f"Messages you receive are system-generated triggers, not human queries.\n"
-        f"No one will ever reply to a question you ask.\n\n"
+        f"You are {name}, a specialized AI agent in a multi-agent workflow.\n\n"
         f"Your core purpose: {first_sentence}\n\n"
-        f"You are an **executor**. When you receive a trigger:\n"
-        f"1. Make the required tool calls immediately (sessions_send for peers, external tools for APIs)\n"
-        f"2. NEVER ask 'would you like me to', 'shall I', 'let me know', or 'please confirm'\n"
-        f"3. NEVER describe what you plan to do — do it\n"
-        f"4. Your text response summarizes what you DID (past tense), not what you will do\n"
-        + peer_reminder +
-        f"\nAct with precision, stay within your defined responsibilities.\n"
+        f"Act with precision, stay within your defined responsibilities, and collaborate\n"
+        f"with your peers as declared in AGENTS.md.\n"
     )
 
 
