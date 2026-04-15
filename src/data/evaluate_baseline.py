@@ -525,12 +525,6 @@ async def _configure_openclaw_agents(
         tools_cfg["agentToAgent"] = {
             "enabled": True,
             "allow": list(object_ids),
-            # maxPingPongTurns=0: disable automatic reply-back turns after an
-            # agentToAgent response.  Without this, OpenClaw auto-generates
-            # extra turns (e.g. "Great! Let me know if you need anything")
-            # which lock the requester session until all turns complete —
-            # causing the next message to fail with an immediate error.
-            "maxPingPongTurns": 0,
         }
         tools_cfg.setdefault("sessions", {})["visibility"] = "all"
         await client.config_mgr.patch(json.dumps(config, indent=2), base_hash=base_hash)
@@ -881,9 +875,9 @@ async def _execute_tc_async(
             #
             # Intermediate agents (those with peers, e.g. sales-call-coach) are
             # intentionally NOT pre-warmed: an init ping creates conversational
-            # context ("Let me know if you'd like to proceed") that triggers
-            # OpenClaw's maxPingPongTurns reply loop, locking the requester
-            # session for subsequent messages.  They register on first real message.
+            # context ("Let me know if you'd like to proceed") that causes
+            # confirmation-seeking behavior on subsequent real messages, leaving
+            # the session busy.  They register on first real message.
             obj_peer_ids: dict[str, set[str]] = {
                 obj.object_id: {p.object_id for p in obj.peers}
                 for obj in tc.objects
