@@ -106,21 +106,43 @@ def exported_agents(tc, worker):
 
 @pytest.fixture(scope="session")
 def configured_gateway(tc, worker, exported_agents):
-    """Configure the gateway with TC agents (once per session, handles restart)."""
+    """Configure the gateway with TC agents (once per session).
+
+    Mirrors the evaluator's startup sequence:
+      1. docker restart → clean state (no stale sessions or config)
+      2. Wait for mock server + gateway to be ready
+      3. configure_openclaw_agents (patches config, waits for hot-reload restart)
+    """
+    import subprocess
     openclaw_home = exported_agents
     container_home = Path(worker.container_home)
 
+    # Step 1: restart the container for a clean slate
+    if worker.container_name:
+        print(f"\nRestarting container {worker.container_name} …")
+        subprocess.run(["docker", "restart", worker.container_name],
+                       check=True, capture_output=True, timeout=60)
+
+    # Step 2: wait for mock server and gateway to be ready
+    mock = RemoteMockServer(worker.mock_server_url)
+    mock.wait_ready(timeout=60.0)
+
+    async def _wait_gw():
+        from src.data.evaluate_baseline import _wait_for_gateway
+        await _wait_for_gateway(worker.gateway_url, openclaw_home, timeout_s=30.0)
+
+    asyncio.run(_wait_gw())
+
+    # Step 3: configure agents (triggers another gateway hot-reload + restart wait)
     async def _configure():
-        try:
-            await _configure_openclaw_agents(
-                tc.objects, AGENT_PROVIDER, AGENT_MODEL, openclaw_home,
-                gateway_url=worker.gateway_url,
-                path_prefix=container_home,
-            )
-        except Exception:
-            await _wait_for_gateway_restart(worker.gateway_url, openclaw_home)
+        await _configure_openclaw_agents(
+            tc.objects, AGENT_PROVIDER, AGENT_MODEL, openclaw_home,
+            gateway_url=worker.gateway_url,
+            path_prefix=container_home,
+        )
 
     asyncio.run(_configure())
+    print("Gateway configured.")
     return openclaw_home
 
 
