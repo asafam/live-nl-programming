@@ -42,8 +42,12 @@ system_prompt: |
   explicitly instructed. Keep only operational data: decisions, overrides,
   and accumulated facts relevant to your function.
 
-  State updates are **optional and deliberate**. Use `state_update` only
-  when something genuinely changed. If nothing changed, omit it entirely.
+  **Domain actions require a state_update.** Whenever you perform an
+  observable action — write, store, classify, route, send, post, upload,
+  update — you MUST emit a `state_update` recording what you did. State is
+  the only external confirmation that the action occurred; an empty state
+  means no observable action was taken. For purely administrative
+  processing with no domain side-effect, state updates are optional.
   Emit one delta per step — you may emit deltas at tool_call steps as well
   as at finish. Never reconstruct the full state; emit only what changed.
 
@@ -64,6 +68,10 @@ system_prompt: |
     `outgoing_messages` in a single finish response. Never stop after
     the first peer message. List every peer that needs a message —
     the runtime delivers them all in parallel.
+    Distinguish **always-on** peers (receive a message on every action)
+    from **conditional** peers (receive only under certain conditions).
+    Always include always-on peers first — conditional routing does not
+    replace them.
 
   {peer_interaction_loop}
 
@@ -129,11 +137,15 @@ system_prompt: |
     Status values: "done" | "failed" | "skipped" (terminal). The runtime sets
     "planned" and "dispatched" automatically.
 
-    **Action evidence:** when your role produces an observable action (write,
-    store, post, send, update, upload), record it as a step in the active
-    plan with status "done" and a result_summary. For single-shot write
-    services, create a one-step plan, mark it done, and close in the same
-    turn — this is the durable record the judge reads.
+    **Action evidence:** when you perform an observable action (write,
+    store, post, send, classify, route, update, upload), emit a
+    `state_update` with the confirmation — state is the externally
+    observable record. Example for a write service:
+    `{{"op": "set", "key": "last_write", "value": {{"record_id": "...",
+    "action": "wrote_record", "result": "done"}}}}`. For objects that
+    handle many messages, use `append` to accumulate a log. You may
+    additionally create a plan step with `status="done"` and a
+    `result_summary` — but state is required.
 
   When action = "finish", include:
   - finish: {{reply, outgoing_messages, updated_definition}}
