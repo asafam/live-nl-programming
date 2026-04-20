@@ -40,6 +40,68 @@ export OPENCLAW_GATEWAY_TOKEN_2="${OPERATOR_TOKEN}"
 export OPENCLAW_GATEWAY_TOKEN_3="${OPERATOR_TOKEN}"
 export OPENCLAW_GATEWAY_TOKEN_4="${OPERATOR_TOKEN}"
 
+# ── Pre-seed worker identity dirs so gateways accept token connections ────────
+# Each worker gateway needs:
+#   identity/device-auth.json  — operator token credential
+#   devices/paired.json        — host device pre-approved as operator
+# Without these the gateway falls back to interactive "pairing required" mode.
+POOL_DATA_DIR="${LNL_POOL_DATA_DIR:-/tmp/lnl-pool}"
+HOST_DEVICE_JSON="${HOME}/.openclaw/identity/device.json"
+
+python3 - "${POOL_DATA_DIR}" "${DEVICE_AUTH}" "${HOST_DEVICE_JSON}" <<'PYEOF'
+import json, sys, base64, time, os
+from pathlib import Path
+
+pool_dir = Path(sys.argv[1])
+device_auth = json.loads(Path(sys.argv[2]).read_text())
+host_device = json.loads(Path(sys.argv[3]).read_text())
+
+# Extract base64url public key from PEM (last 32 bytes of the SubjectPublicKeyInfo DER)
+import base64 as _b64
+pem = host_device["publicKeyPem"].strip()
+der_b64 = "".join(pem.split("\n")[1:-1])
+der = _b64.b64decode(der_b64)
+raw_pub_key = _b64.urlsafe_b64encode(der[-32:]).rstrip(b"=").decode()
+
+device_id = host_device["deviceId"]
+op = device_auth["tokens"]["operator"]
+now_ms = int(time.time() * 1000)
+
+paired_entry = {
+    "deviceId": device_id,
+    "publicKey": raw_pub_key,
+    "platform": "darwin",
+    "clientId": "cli",
+    "clientMode": "cli",
+    "role": "operator",
+    "roles": ["operator"],
+    "scopes": op["scopes"],
+    "approvedScopes": op["scopes"],
+    "tokens": {
+        "operator": {
+            "token": op["token"],
+            "role": "operator",
+            "scopes": op["scopes"],
+            "createdAtMs": now_ms,
+            "lastUsedAtMs": now_ms,
+        }
+    },
+    "createdAtMs": now_ms,
+    "approvedAtMs": now_ms,
+    "remoteIp": "192.168.65.1",
+}
+paired_json = json.dumps({device_id: paired_entry}, indent=2)
+
+for n in range(1, 5):
+    worker_dir = pool_dir / f"worker-{n}"
+    (worker_dir / "identity").mkdir(parents=True, exist_ok=True)
+    (worker_dir / "devices").mkdir(parents=True, exist_ok=True)
+    (worker_dir / "identity" / "device-auth.json").write_text(json.dumps(device_auth, indent=2))
+    (worker_dir / "devices" / "paired.json").write_text(paired_json)
+
+print(f"Seeded identity/device-auth.json and devices/paired.json for workers 1-4")
+PYEOF
+
 # ── Dispatch subcommand ───────────────────────────────────────────────────────
 CMD="${1:-up}"
 
