@@ -705,8 +705,43 @@ def _print_verbose(tc_result: TestCaseResult, show_evidence: bool = False) -> No
 
 # ── Main runner ────────────────────────────────────────────────────────────────
 
+def _print_summary(summary, output_path=None, elapsed_s=None) -> None:
+    """Print a human-readable summary of evaluation results."""
+    def _fmt(v) -> str:
+        return f"{v:.3f}" if v is not None else "N/A"
+
+    def _fmts(v, s) -> str:
+        return f"{_fmt(v)}  std: {_fmt(s)}"
+
+    has_inconclusive = summary.inconclusive_tcs > 0
+
+    def _fmt_mod(conclusive, conclusive_std, all_val, all_std) -> str:
+        if not has_inconclusive:
+            return _fmts(conclusive, conclusive_std)
+        return f"{_fmts(conclusive, conclusive_std)}  ({summary.inconclusive_tcs} inconclusive TCs excluded; all: {_fmts(all_val, all_std)})"
+
+    if output_path:
+        print(f"Complete. Output: {output_path}")
+    if elapsed_s is not None:
+        h = int(elapsed_s) // 3600
+        m = (int(elapsed_s) % 3600) // 60
+        s = int(elapsed_s) % 60
+        ms = int((elapsed_s % 1) * 1000)
+        elapsed_str = f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}" if h else f"{m:02d}:{s:02d}.{ms:03d}"
+        print(f"Elapsed:             {elapsed_str}")
+    print(f"Mean pass rate:      {_fmts(summary.mean_pass_rate, summary.pass_rate_std)}")
+    print(f"Steps pass rate:     {_fmts(summary.steps_pass_rate, summary.steps_pass_rate_std)}")
+    print(f"Samples completion:  {_fmts(summary.samples_completion, summary.samples_completion_std)}")
+    print(f"Mod pass rate:       {_fmt_mod(summary.mod_pass_rate, summary.mod_pass_rate_std, summary.mod_pass_rate_all, summary.mod_pass_rate_all_std)}  (pre+post+irrelevant)")
+    print(f"  Pre-mod:           {_fmt_mod(summary.pre_mod_pass_rate, summary.pre_mod_pass_rate_std, summary.pre_mod_pass_rate_all, summary.pre_mod_pass_rate_all_std)}")
+    print(f"  Post-mod:          {_fmt_mod(summary.post_mod_pass_rate, summary.post_mod_pass_rate_std, summary.post_mod_pass_rate_all, summary.post_mod_pass_rate_all_std)}")
+    print(f"  Irrelevant:        {_fmt_mod(summary.irrelevant_pass_rate, summary.irrelevant_pass_rate_std, summary.irrelevant_pass_rate_all, summary.irrelevant_pass_rate_all_std)}")
+    print(f"Inconclusive TCs:    {summary.inconclusive_tcs}")
+
+
 def run(args: argparse.Namespace) -> Path:
     """Run evaluation. Returns the output path."""
+    eval_start = time.monotonic()
     logging.basicConfig(level=logging.WARNING)
 
     if args.output is None:
@@ -961,14 +996,9 @@ def run(args: argparse.Namespace) -> Path:
                 f"  ── [{mod.mod_type.value}/{mod.ambiguity.value}] {mod.id}: "
                 f"{mod.intent[:70]}"
             )
-            pbar.set_description(f"Eval [{_tc.id}] {mod.mod_type.value}")
 
         def _on_message(_msg, _label=label, _count=msg_count, _start=tc_start):
             _count[0] += 1
-            elapsed = time.monotonic() - _start
-            pbar.set_postfix_str(
-                f"{_label}  msgs={_count[0]}  {elapsed:.0f}s", refresh=True
-            )
 
         try:
             event_results, mod_results = execute_test_case(
@@ -1022,7 +1052,8 @@ def run(args: argparse.Namespace) -> Path:
         if detail:
             parts.append(f"     {detail}")
         tc_log.extend(parts)
-        tqdm.write("\n".join([f"\n{tc.id}[{tc.modifications[0].mod_type.value if tc.modifications else ''}]"] + tc_log))
+        mod_label = tc.modifications[0].mod_type.value if tc.modifications else ""
+        tqdm.write("\n".join([f"\n{tc.id}[{mod_label}]  msgs={msg_count[0]}  elapsed={elapsed_str}"] + tc_log))
         return result
 
     # Build list of pending (tc_idx, tc, run_idx) tuples
@@ -1081,6 +1112,8 @@ def run(args: argparse.Namespace) -> Path:
         f.write(run_config.model_dump_json() + "\n")
         f.flush()
         with tqdm(total=total_runs, initial=n_skipped, unit="run", desc="Evaluating") as pbar:
+            if all_tc_results:  # continuation — show running metrics immediately
+                _pbar_postfix(pbar, all_tc_results)
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 for phase_label, phase_runs in run_phases:
                     if not phase_runs:
@@ -1100,6 +1133,7 @@ def run(args: argparse.Namespace) -> Path:
                                 f.write(tc_result.model_dump_json() + "\n")
                                 f.flush()
                                 all_tc_results.append(tc_result)
+                                _pbar_postfix(pbar, all_tc_results)
                         except Exception as e:
                             tqdm.write(f"FAILED {label} run={run_idx}: {e}", file=sys.stderr)
                         pbar.update(1)
@@ -1109,32 +1143,54 @@ def run(args: argparse.Namespace) -> Path:
     with open(args.output, "a") as f:
         f.write(summary.model_dump_json() + "\n")
 
-    def _fmt(v) -> str:
-        return f"{v:.3f}" if v is not None else "N/A"
-
     print()
-    print(f"Complete. Output: {args.output}")
-    def _fmts(v, s) -> str:
-        return f"{_fmt(v)}  std: {_fmt(s)}"
-
-    has_inconclusive = summary.inconclusive_tcs > 0
-
-    def _fmt_mod(conclusive, conclusive_std, all_val, all_std) -> str:
-        if not has_inconclusive:
-            return _fmts(conclusive, conclusive_std)
-        return f"Inconclusive  ({_fmts(all_val, all_std)})"
-
-    print(f"Mean pass rate:      {_fmts(summary.mean_pass_rate, summary.pass_rate_std)}")
-    print(f"Steps pass rate:     {_fmts(summary.steps_pass_rate, summary.steps_pass_rate_std)}")
-    print(f"Mod pass rate:       {_fmt_mod(summary.mod_pass_rate, summary.mod_pass_rate_std, summary.mod_pass_rate_all, summary.mod_pass_rate_all_std)}  (pre+post+irrelevant)")
-    print(f"  Pre-mod:           {_fmt_mod(summary.pre_mod_pass_rate, summary.pre_mod_pass_rate_std, summary.pre_mod_pass_rate_all, summary.pre_mod_pass_rate_all_std)}")
-    print(f"  Post-mod:          {_fmt_mod(summary.post_mod_pass_rate, summary.post_mod_pass_rate_std, summary.post_mod_pass_rate_all, summary.post_mod_pass_rate_all_std)}")
-    print(f"  Irrelevant:        {_fmt_mod(summary.irrelevant_pass_rate, summary.irrelevant_pass_rate_std, summary.irrelevant_pass_rate_all, summary.irrelevant_pass_rate_all_std)}")
-    print(f"Inconclusive TCs:    {summary.inconclusive_tcs}")
+    _print_summary(summary, output_path=args.output, elapsed_s=time.monotonic() - eval_start)
     return args.output
 
 
 _STEP_EVENT_ID = re.compile(r"^S\d+$")
+
+
+def _running_metrics(results: "list[TestCaseResult]") -> tuple[Optional[float], Optional[float]]:
+    """Return (mean_pass_rate, sample_pass_rate) across accumulated results.
+
+    sample_pass_rate: among base-TC runs (first tc_id per sample_id) that have
+    step events, the fraction where ALL step events passed.
+    """
+    valid = [r.pass_rate for r in results if r.pass_rate is not None]
+    mean_pr = sum(valid) / len(valid) if valid else None
+
+    first_tc_per_sample: dict[str, str] = {}
+    for r in results:
+        sid = r.sample_id or r.tc_id
+        if sid not in first_tc_per_sample:
+            first_tc_per_sample[sid] = r.tc_id
+    base_tc_ids = set(first_tc_per_sample.values())
+
+    attempts = passes = 0
+    for r in results:
+        if r.tc_id not in base_tc_ids:
+            continue
+        step_evts = [e for e in r.events if _STEP_EVENT_ID.match(e.event_id)]
+        if not step_evts:
+            continue
+        attempts += 1
+        if all(e.passed for e in step_evts):
+            passes += 1
+    sample_pr = passes / attempts if attempts else None
+    return mean_pr, sample_pr
+
+
+def _pbar_postfix(pbar, results) -> None:
+    """Update pbar postfix with running mean + sample pass rates."""
+    mean_pr, sample_pr = _running_metrics(results)
+    fields: dict[str, str] = {}
+    if mean_pr is not None:
+        fields["mean"] = f"{mean_pr:.1%}"
+    if sample_pr is not None:
+        fields["sample"] = f"{sample_pr:.1%}"
+    if fields:
+        pbar.set_postfix(**fields)
 
 
 def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
@@ -1187,18 +1243,28 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     per_tc_stds = [
         statistics.stdev(rates) for rates in by_tc.values() if len(rates) > 1
     ]
-    pass_rate_std = mean(per_tc_stds)
+    pass_rate_std = mean(per_tc_stds) if per_tc_stds else None
 
-    # Steps pass rate + std (base TCs only, per-TC rates)
-    per_tc_step_rates: list[float] = []
+    def _per_tc_std(by_tc_rates: dict) -> Optional[float]:
+        """Mean of per-TC stdevs across runs — same pattern as pass_rate_std."""
+        stdevs = [statistics.stdev(v) for v in by_tc_rates.values() if len(v) > 1]
+        return mean(stdevs) if stdevs else None
+
+    # Steps pass rate + std (base TCs only, mean fraction of steps passed per TC)
+    by_tc_step: dict[str, list[float]] = defaultdict(list)
+    # Samples completion + std (fraction of TCs where ALL step events passed)
+    by_tc_completion: dict[str, list[float]] = defaultdict(list)
     for r in results:
         if r.tc_id not in base_tc_ids:
             continue
         step_evts = [e for e in r.events if _STEP_EVENT_ID.match(e.event_id)]
         if step_evts:
-            per_tc_step_rates.append(sum(1 for e in step_evts if e.passed) / len(step_evts))
-    steps_pass_rate = mean(per_tc_step_rates) if per_tc_step_rates else None
-    steps_pass_rate_std = statistics.stdev(per_tc_step_rates) if len(per_tc_step_rates) > 1 else (0.0 if per_tc_step_rates else None)
+            by_tc_step[r.tc_id].append(sum(1 for e in step_evts if e.passed) / len(step_evts))
+            by_tc_completion[r.tc_id].append(1.0 if all(e.passed for e in step_evts) else 0.0)
+    steps_pass_rate = mean([mean(v) for v in by_tc_step.values()]) if by_tc_step else None
+    steps_pass_rate_std = _per_tc_std(by_tc_step)
+    samples_completion = mean([mean(v) for v in by_tc_completion.values()]) if by_tc_completion else None
+    samples_completion_std = _per_tc_std(by_tc_completion)
 
     # Inconclusive TCs: TCs where any run had at least one step failure
     inconclusive_tc_ids: set[str] = set()
@@ -1207,18 +1273,17 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
         if step_evts and any(not e.passed for e in step_evts):
             inconclusive_tc_ids.add(r.tc_id)
 
-    # Role-based pass rates + std: exclude events from inconclusive TCs, per-TC rates
-    def _role_pass_rate_and_std(role_val) -> tuple[Optional[float], Optional[float]]:
-        per_tc: list[float] = []
+    # Role-based pass rates + std: exclude inconclusive TCs, grouped by TC across runs
+    def _role_pass_rate_and_std(role_val, exclude_inconclusive=True) -> tuple[Optional[float], Optional[float]]:
+        by_tc: dict[str, list[float]] = defaultdict(list)
         for r in results:
-            if r.tc_id in inconclusive_tc_ids:
+            if exclude_inconclusive and r.tc_id in inconclusive_tc_ids:
                 continue
             evts = [e for e in r.events if e.role == role_val]
             if evts:
-                per_tc.append(sum(1 for e in evts if e.passed) / len(evts))
-        rate = mean(per_tc) if per_tc else None
-        std = statistics.stdev(per_tc) if len(per_tc) > 1 else (0.0 if per_tc else None)
-        return rate, std
+                by_tc[r.tc_id].append(sum(1 for e in evts if e.passed) / len(evts))
+        rate = mean([mean(v) for v in by_tc.values()]) if by_tc else None
+        return rate, _per_tc_std(by_tc)
 
     conclusive_events = [
         e for r in results if r.tc_id not in inconclusive_tc_ids
@@ -1227,46 +1292,36 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     mod_events = [e for e in conclusive_events if e.role in ("pre_mod", "post_mod", "irrelevant")]
     mod_pass_rate = (sum(1 for e in mod_events if e.passed) / len(mod_events)) if mod_events else None
 
-    # mod std: per-TC rate across all mod events combined
-    per_tc_mod_rates: list[float] = []
+    by_tc_mod: dict[str, list[float]] = defaultdict(list)
     for r in results:
         if r.tc_id in inconclusive_tc_ids:
             continue
         evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant")]
         if evts:
-            per_tc_mod_rates.append(sum(1 for e in evts if e.passed) / len(evts))
-    mod_pass_rate_std = statistics.stdev(per_tc_mod_rates) if len(per_tc_mod_rates) > 1 else (0.0 if per_tc_mod_rates else None)
+            by_tc_mod[r.tc_id].append(sum(1 for e in evts if e.passed) / len(evts))
+    mod_pass_rate_std = _per_tc_std(by_tc_mod)
 
     pre_mod_pass_rate, pre_mod_pass_rate_std = _role_pass_rate_and_std("pre_mod")
     post_mod_pass_rate, post_mod_pass_rate_std = _role_pass_rate_and_std("post_mod")
     irrelevant_pass_rate, irrelevant_pass_rate_std = _role_pass_rate_and_std("irrelevant")
 
     # Role-based pass rates including inconclusive TCs (indicative)
-    def _role_pass_rate_and_std_all(role_val) -> tuple[Optional[float], Optional[float]]:
-        per_tc: list[float] = []
-        for r in results:
-            evts = [e for e in r.events if e.role == role_val]
-            if evts:
-                per_tc.append(sum(1 for e in evts if e.passed) / len(evts))
-        rate = mean(per_tc) if per_tc else None
-        std = statistics.stdev(per_tc) if len(per_tc) > 1 else (0.0 if per_tc else None)
-        return rate, std
-
     all_mod_events = [
         e for r in results for e in r.events
         if e.role in ("pre_mod", "post_mod", "irrelevant")
     ]
     mod_pass_rate_all = (sum(1 for e in all_mod_events if e.passed) / len(all_mod_events)) if all_mod_events else None
-    per_tc_mod_rates_all: list[float] = []
+
+    by_tc_mod_all: dict[str, list[float]] = defaultdict(list)
     for r in results:
         evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant")]
         if evts:
-            per_tc_mod_rates_all.append(sum(1 for e in evts if e.passed) / len(evts))
-    mod_pass_rate_all_std = statistics.stdev(per_tc_mod_rates_all) if len(per_tc_mod_rates_all) > 1 else (0.0 if per_tc_mod_rates_all else None)
+            by_tc_mod_all[r.tc_id].append(sum(1 for e in evts if e.passed) / len(evts))
+    mod_pass_rate_all_std = _per_tc_std(by_tc_mod_all)
 
-    pre_mod_pass_rate_all, pre_mod_pass_rate_all_std = _role_pass_rate_and_std_all("pre_mod")
-    post_mod_pass_rate_all, post_mod_pass_rate_all_std = _role_pass_rate_and_std_all("post_mod")
-    irrelevant_pass_rate_all, irrelevant_pass_rate_all_std = _role_pass_rate_and_std_all("irrelevant")
+    pre_mod_pass_rate_all, pre_mod_pass_rate_all_std = _role_pass_rate_and_std("pre_mod", exclude_inconclusive=False)
+    post_mod_pass_rate_all, post_mod_pass_rate_all_std = _role_pass_rate_and_std("post_mod", exclude_inconclusive=False)
+    irrelevant_pass_rate_all, irrelevant_pass_rate_all_std = _role_pass_rate_and_std("irrelevant", exclude_inconclusive=False)
 
     return EvalSummary(
         total_test_cases=total_test_cases,
@@ -1276,6 +1331,8 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
         pass_rate_std=pass_rate_std,
         steps_pass_rate=steps_pass_rate,
         steps_pass_rate_std=steps_pass_rate_std,
+        samples_completion=samples_completion,
+        samples_completion_std=samples_completion_std,
         mod_pass_rate=mod_pass_rate,
         mod_pass_rate_std=mod_pass_rate_std,
         mod_pass_rate_all=mod_pass_rate_all,
@@ -1318,7 +1375,7 @@ Examples:
     parser.add_argument(
         "--input", "-i",
         type=Path,
-        required=True,
+        default=None,
         help="Path to test cases JSONL file",
     )
     parser.add_argument(
@@ -1430,11 +1487,40 @@ Examples:
         ),
     )
     add_common_args(parser)
+    parser.add_argument(
+        "--stats",
+        default=None,
+        metavar="FILE",
+        type=Path,
+        help="Recompute and reprint summary stats from an existing results JSONL file without re-running evaluation.",
+    )
     return parser
+
+
+def _load_tc_results(path: Path) -> list[TestCaseResult]:
+    """Load TestCaseResult lines from a results JSONL, skipping EvalSummary lines."""
+    import json as _json
+    results = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = _json.loads(line)
+            if "tc_id" in data:
+                results.append(TestCaseResult(**data))
+    return results
 
 
 def main():
     args = build_parser().parse_args()
+    if args.stats:
+        results = _load_tc_results(args.stats)
+        summary = _compute_summary(results)
+        _print_summary(summary)
+        return
+    if args.input is None:
+        build_parser().error("the following arguments are required: --input/-i")
     run(args)
 
 

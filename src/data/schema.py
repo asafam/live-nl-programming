@@ -311,10 +311,12 @@ class EvalSummary(BaseModel):
     total_runs: int
     total_events: int
     mean_pass_rate: float
-    pass_rate_std: float      # behavioral consistency (std dev across runs)
+    pass_rate_std: Optional[float] = None  # behavioral consistency (std dev across runs); None for single-run evals
     # ── Per-role pass rates ──────────────────────────────────────────���─────────
-    steps_pass_rate: Optional[float] = None        # S\d+ events (baseline setup)
+    steps_pass_rate: Optional[float] = None        # S\d+ events mean fraction (baseline setup)
     steps_pass_rate_std: Optional[float] = None
+    samples_completion: Optional[float] = None     # fraction of TCs where ALL step events passed
+    samples_completion_std: Optional[float] = None
     mod_pass_rate: Optional[float] = None          # all modification events (pre+post+irrelevant combined, conclusive TCs only)
     mod_pass_rate_std: Optional[float] = None
     mod_pass_rate_all: Optional[float] = None      # same but including inconclusive TCs
