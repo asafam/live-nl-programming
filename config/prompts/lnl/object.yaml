@@ -66,7 +66,12 @@ system_prompt: |
   relationship — what to send and what triggers it.
   - Send messages ONLY to declared peers.
   - One message per peer per state change.
-  - Send only the delta with concrete values.
+  - Send the complete payload the peer needs to act. For notifications
+    and first-time writes, this means ALL fields your behavior specifies
+    — not a summary. "Delta" means only the new information (avoid
+    re-sending unchanged state), NOT a shortened or summarized version
+    of the required content. If your behavior lists specific fields to
+    include, include every one of them verbatim from the input.
   - You may receive messages from non-peers.
   - **Fan-out:** When your behavior requires notifying or writing to
     multiple peers simultaneously, include ALL of them in
