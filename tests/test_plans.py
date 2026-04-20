@@ -2,11 +2,11 @@
 
 Contract:
 - One active plan per object at a time.
-- LLM never authors plan or step ids; it references steps by position (index).
+- Plans are runtime-owned: created automatically from outgoing Ask messages,
+  auto-closed when all steps reach terminal status.
+- LLM never authors plan or step ids; the Active Plan is read-only context.
 - Runtime handles all correlation (outgoing stamping, reply tagging,
-  auto-mark on reply, auto-done for Tell dispatches).
-- `plan_update` emits exactly one of three shapes per turn: create/replace
-  (goal+steps), incremental (step_updates/add_steps), or close (status).
+  auto-mark on reply, auto-done for Tell dispatches, auto-close on completion).
 """
 import pytest
 
@@ -38,153 +38,225 @@ def _user_msg(content, recipient="obj"):
 
 
 class TestCreateAndClose:
-    def test_create_sets_active_plan(self):
+    def test_auto_create_from_ask_outgoing(self):
+        """Runtime auto-creates a plan when outgoing messages include an Ask."""
         brain = MockBrain()
         brain.script_react(ReactStep(
-            thought="Need multi-step.",
+            thought="Need multi-step — send Ask to hr.",
             action="finish",
-            plan_update=PlanUpdate(
-                goal="notify the team",
-                steps=[
-                    {"kind": "ask", "description": "look up manager", "target": "hr"},
-                    {"kind": "tell", "description": "notify manager", "target": "notifier"},
-                ],
-            ),
-            finish=ReactFinish(reply="Working on it"),
-        ))
-        obj = LLMObject(_defn(), brain)
-        obj.process_message(_user_msg("go"))
-
-        plan = obj.active_plan
-        assert plan is not None
-        assert plan.goal == "notify the team"
-        assert plan.status == "active"
-        assert len(plan.steps) == 2
-        assert plan.steps[0].kind == "ask"
-        assert plan.steps[0].target == "hr"
-        assert plan.steps[0].status == "planned"
-
-    def test_close_completes_active_plan(self):
-        brain = MockBrain()
-        brain.script_react(ReactStep(
-            thought="Create one-step plan.",
-            action="finish",
-            plan_update=PlanUpdate(
-                goal="log action",
-                steps=[{"kind": "tell", "description": "log it", "target": "log"}],
-            ),
-            finish=ReactFinish(reply=""),
-        ))
-        brain.script_react(ReactStep(
-            thought="Done; close.",
-            action="finish",
-            plan_update=PlanUpdate(status="complete"),
-            finish=ReactFinish(reply=""),
-        ))
-        obj = LLMObject(_defn(), brain)
-        obj.process_message(_user_msg("go"))
-        assert obj.active_plan is not None
-        obj.process_message(_user_msg("close"))
-        assert obj.active_plan is None
-        assert len(obj.completed_plans) == 1
-        assert obj.completed_plans[0].status == "complete"
-
-
-class TestIncrementalUpdate:
-    def test_step_update_by_index(self):
-        brain = MockBrain()
-        brain.script_react(ReactStep(
-            thought="Create.",
-            action="finish",
-            plan_update=PlanUpdate(
-                goal="g",
-                steps=[
-                    {"kind": "ask", "description": "ask peer", "target": "peer"},
-                ],
-            ),
-            finish=ReactFinish(reply=""),
-        ))
-        brain.script_react(ReactStep(
-            thought="Mark step 0 failed.",
-            action="finish",
-            plan_update=PlanUpdate(
-                step_updates=[{"index": 0, "status": "failed", "result_summary": "peer refused"}],
-            ),
-            finish=ReactFinish(reply=""),
-        ))
-        obj = LLMObject(_defn(), brain)
-        obj.process_message(_user_msg("go"))
-        obj.process_message(_user_msg("fail it"))
-
-        plan = obj.active_plan
-        assert plan is not None
-        assert plan.steps[0].status == "failed"
-        assert plan.steps[0].result_summary == "peer refused"
-
-    def test_add_steps_extends_plan(self):
-        brain = MockBrain()
-        brain.script_react(ReactStep(
-            thought="Create.",
-            action="finish",
-            plan_update=PlanUpdate(
-                goal="g",
-                steps=[{"kind": "ask", "description": "first", "target": "p"}],
-            ),
-            finish=ReactFinish(reply=""),
-        ))
-        brain.script_react(ReactStep(
-            thought="Add step.",
-            action="finish",
-            plan_update=PlanUpdate(
-                add_steps=[{"kind": "tell", "description": "second", "target": "p"}],
-            ),
-            finish=ReactFinish(reply=""),
-        ))
-        obj = LLMObject(_defn(), brain)
-        obj.process_message(_user_msg("go"))
-        obj.process_message(_user_msg("extend"))
-
-        plan = obj.active_plan
-        assert len(plan.steps) == 2
-        assert plan.steps[1].kind == "tell"
-
-
-class TestOutgoingAutoCorrelation:
-    def test_tell_auto_marks_done_on_dispatch(self):
-        brain = MockBrain()
-        brain.script_react(ReactStep(
-            thought="Create and dispatch.",
-            action="finish",
-            plan_update=PlanUpdate(
-                goal="notify",
-                steps=[{"kind": "tell", "description": "notify peer", "target": "peer-b"}],
-            ),
             finish=ReactFinish(
-                reply="",
-                outgoing_messages=[OutgoingMessage(recipient="peer-b", content="fyi", expects_reply=False)],
+                reply="Working on it",
+                outgoing_messages=[
+                    OutgoingMessage(recipient="hr", content="look up manager", expects_reply=True),
+                    OutgoingMessage(recipient="notifier", content="notify manager", expects_reply=False),
+                ],
             ),
         ))
         brain.set_default(LLMResponse(updated_state={}, reply=""))
 
         rt = Runtime(brain)
-        a = rt.create_object(_defn("obj-a", peers=[PeerDeclaration("peer-b", "obs")]))
+        obj = rt.create_object(_defn("obj", peers=[
+            PeerDeclaration("hr", "lookup"),
+            PeerDeclaration("notifier", "notify"),
+        ]))
+
+        rt.send("obj", "go")
+
+        plan = obj.active_plan
+        assert plan is not None
+        assert plan.status == "active"
+        # Two steps: ask hr + tell notifier
+        assert len(plan.steps) == 2
+        assert plan.steps[0].kind == "ask"
+        assert plan.steps[0].target == "hr"
+        # Ask step should be dispatched (not done) after dispatch
+        assert plan.steps[0].status == "dispatched"
+        # Tell step should be done immediately
+        assert plan.steps[1].kind == "tell"
+        assert plan.steps[1].status == "done"
+
+    def test_no_plan_created_without_ask_outgoing(self):
+        """No plan is auto-created if outgoing messages are all Tells (or none)."""
+        brain = MockBrain()
+        brain.script_react(ReactStep(
+            thought="Just a Tell — no plan needed.",
+            action="finish",
+            finish=ReactFinish(
+                reply="done",
+                outgoing_messages=[
+                    OutgoingMessage(recipient="notifier", content="fyi", expects_reply=False),
+                ],
+            ),
+        ))
+        brain.set_default(LLMResponse(updated_state={}, reply=""))
+
+        rt = Runtime(brain)
+        obj = rt.create_object(_defn("obj", peers=[PeerDeclaration("notifier", "obs")]))
+        rt.create_object(_defn("notifier"))
+
+        rt.send("obj", "go")
+        # No Ask → no active plan (Tell-only auto-creates plan but immediately auto-closes)
+        assert obj.active_plan is None
+
+    def test_plan_auto_closes_when_all_steps_done(self):
+        """When all steps are terminal (done/failed/skipped), plan auto-closes."""
+        brain = MockBrain()
+        # Turn 1: Ask hr → auto-creates plan with dispatched ask step
+        brain.script_react(ReactStep(
+            thought="Ask hr.",
+            action="finish",
+            finish=ReactFinish(
+                reply="",
+                outgoing_messages=[OutgoingMessage(recipient="hr", content="?", expects_reply=True)],
+            ),
+        ))
+        # Turn 2: hr replies → step auto-marked done → plan auto-closes
+        brain.script_react(ReactStep(
+            thought="Got reply.",
+            action="finish",
+            finish=ReactFinish(reply="ok"),
+        ))
+        brain.set_default(LLMResponse(updated_state={}, reply=""))
+
+        rt = Runtime(brain)
+        a = rt.create_object(_defn("obj-a", peers=[PeerDeclaration("hr", "lookup")]))
+        rt.create_object(_defn("hr"))
+
+        rt.send("obj-a", "go")
+
+        # After hr replies, step is auto-done → plan auto-closes
+        assert a.active_plan is None
+        assert len(a.completed_plans) == 1
+        assert a.completed_plans[0].status == "complete"
+        assert a.completed_plans[0].steps[0].status == "done"
+
+
+class TestIncrementalUpdate:
+    def test_step_auto_marked_done_on_reply(self):
+        """When a correlated reply arrives, the step is auto-marked done by the runtime."""
+        brain = MockBrain()
+        # Turn 1: obj asks peer → auto-creates plan with ask step (dispatched)
+        brain.script_react(ReactStep(
+            thought="Ask peer.",
+            action="finish",
+            finish=ReactFinish(
+                reply="",
+                outgoing_messages=[OutgoingMessage(recipient="peer", content="q?", expects_reply=True)],
+            ),
+        ))
+        # Turn 2 (peer's turn): peer answers
+        brain.script_react(ReactStep(
+            thought="Answer.",
+            action="finish",
+            finish=ReactFinish(reply="42"),
+        ))
+        # Turn 3 (obj's turn, on reply): runtime auto-marks step done; plan auto-closes
+        brain.script_react(ReactStep(
+            thought="Got reply.",
+            action="finish",
+            finish=ReactFinish(reply=""),
+        ))
+
+        rt = Runtime(brain)
+        obj = rt.create_object(_defn("obj-a", peers=[PeerDeclaration("peer", "q")]))
+        rt.create_object(_defn("peer"))
+
+        rt.send("obj-a", "go")
+
+        # Plan auto-closed after step auto-marked done
+        assert obj.active_plan is None
+        assert len(obj.completed_plans) == 1
+        assert obj.completed_plans[0].steps[0].status == "done"
+
+    def test_second_ask_extends_active_plan(self):
+        """A second Ask in a later turn extends the existing active plan."""
+        brain = MockBrain()
+        # Turn 1 (first user message): Ask peer-a → auto-creates plan with 1 step
+        brain.script_react(ReactStep(
+            thought="Ask peer-a.",
+            action="finish",
+            finish=ReactFinish(
+                reply="",
+                outgoing_messages=[OutgoingMessage(recipient="peer-a", content="?", expects_reply=True)],
+            ),
+        ))
+        # Turn 2 (peer-a's response to user-msg-2): Also ask peer-b → extends plan
+        brain.script_react(ReactStep(
+            thought="Also ask peer-b.",
+            action="finish",
+            finish=ReactFinish(
+                reply="",
+                outgoing_messages=[OutgoingMessage(recipient="peer-b", content="?", expects_reply=True)],
+            ),
+        ))
+        brain.set_default(LLMResponse(updated_state={}, reply=""))
+
+        # Use process_message directly for deterministic control
+        obj = LLMObject(_defn("obj-a", peers=[
+            PeerDeclaration("peer-a", "q"),
+            PeerDeclaration("peer-b", "q"),
+        ]), brain)
+
+        # First user message → creates plan with ask peer-a
+        obj.process_message(_user_msg("go", recipient="obj-a"))
+
+        plan_after_1 = obj.active_plan
+        assert plan_after_1 is not None
+        assert len(plan_after_1.steps) == 1
+        assert plan_after_1.steps[0].target == "peer-a"
+
+        # Second user message → extends plan with ask peer-b (new target)
+        obj.process_message(_user_msg("also ask", recipient="obj-a"))
+
+        plan_after_2 = obj.active_plan
+        assert plan_after_2 is not None
+        assert len(plan_after_2.steps) == 2
+        assert plan_after_2.steps[0].target == "peer-a"
+        assert plan_after_2.steps[1].target == "peer-b"
+
+
+class TestOutgoingAutoCorrelation:
+    def test_tell_auto_marks_done_on_dispatch(self):
+        """A Tell outgoing is auto-correlated and its step marked done on dispatch."""
+        brain = MockBrain()
+        brain.script_react(ReactStep(
+            thought="Send Tell and Ask.",
+            action="finish",
+            finish=ReactFinish(
+                reply="",
+                outgoing_messages=[
+                    OutgoingMessage(recipient="peer-b", content="fyi", expects_reply=False),
+                    OutgoingMessage(recipient="peer-c", content="?", expects_reply=True),
+                ],
+            ),
+        ))
+        brain.set_default(LLMResponse(updated_state={}, reply=""))
+
+        rt = Runtime(brain)
+        a = rt.create_object(_defn("obj-a", peers=[
+            PeerDeclaration("peer-b", "obs"),
+            PeerDeclaration("peer-c", "q"),
+        ]))
         rt.create_object(_defn("peer-b"))
+        rt.create_object(_defn("peer-c"))
 
         rt.send("obj-a", "trigger")
 
-        plan = a.active_plan or (a.completed_plans[0] if a.completed_plans else None)
+        # Plan created from the Ask; Tell step auto-marked done
+        plan = a.active_plan
         assert plan is not None
-        assert plan.steps[0].status == "done"
+        # tell step → done; ask step → dispatched
+        tell_step = next(s for s in plan.steps if s.kind == "tell")
+        ask_step = next(s for s in plan.steps if s.kind == "ask")
+        assert tell_step.status == "done"
+        assert ask_step.status == "dispatched"
 
     def test_ask_flips_to_dispatched(self):
+        """An Ask step flips from planned to dispatched after send."""
         brain = MockBrain()
         brain.script_react(ReactStep(
             thought="Ask peer.",
             action="finish",
-            plan_update=PlanUpdate(
-                goal="query",
-                steps=[{"kind": "ask", "description": "q", "target": "peer-b"}],
-            ),
             finish=ReactFinish(
                 reply="",
                 outgoing_messages=[OutgoingMessage(recipient="peer-b", content="?", expects_reply=True)],
@@ -202,10 +274,11 @@ class TestOutgoingAutoCorrelation:
         assert plan is not None
         assert plan.steps[0].status == "dispatched"
 
-    def test_outgoing_without_matching_step_passes_uncorrelated(self):
+    def test_outgoing_without_ask_passes_uncorrelated(self):
+        """Tell-only outgoing (no Ask) creates no durable active plan."""
         brain = MockBrain()
         brain.script_react(ReactStep(
-            thought="Send without plan.",
+            thought="Send without Ask.",
             action="finish",
             finish=ReactFinish(
                 reply="",
@@ -215,28 +288,25 @@ class TestOutgoingAutoCorrelation:
         brain.set_default(LLMResponse(updated_state={}, reply=""))
 
         rt = Runtime(brain)
-        rt.create_object(_defn("obj-a", peers=[PeerDeclaration("peer-b", "x")]))
+        obj_a = rt.create_object(_defn("obj-a", peers=[PeerDeclaration("peer-b", "x")]))
         rt.create_object(_defn("peer-b"))
 
         rt.send("obj-a", "trigger")
 
         delivered = [log.message for log in rt.message_log if log.message.recipient == "peer-b"]
         assert any(m.sender == "obj-a" for m in delivered)
-        for m in delivered:
-            assert m.plan_step_index is None
+        # Tell-only: plan auto-created then auto-closed (Tell step immediately done)
+        assert obj_a.active_plan is None
 
 
 class TestReplyAutoMark:
     def test_reply_auto_marks_step_done(self):
+        """When a correlated reply arrives, the plan step is auto-marked done."""
         brain = MockBrain()
-        # Turn 1: A creates plan + asks B.
+        # Turn 1: A asks B → auto-creates plan with ask step
         brain.script_react(ReactStep(
             thought="Ask B.",
             action="finish",
-            plan_update=PlanUpdate(
-                goal="get X",
-                steps=[{"kind": "ask", "description": "ask B", "target": "b"}],
-            ),
             finish=ReactFinish(
                 reply="",
                 outgoing_messages=[OutgoingMessage(recipient="b", content="What is X?", expects_reply=True)],
@@ -248,11 +318,10 @@ class TestReplyAutoMark:
             action="finish",
             finish=ReactFinish(reply="42"),
         ))
-        # Turn 3: A receives reply — runtime auto-marks step done before A runs.
+        # Turn 3: A receives reply — runtime auto-marks step done and auto-closes plan.
         brain.script_react(ReactStep(
-            thought="Got it. Close.",
+            thought="Got it.",
             action="finish",
-            plan_update=PlanUpdate(status="complete"),
             finish=ReactFinish(reply=""),
         ))
 
@@ -261,7 +330,7 @@ class TestReplyAutoMark:
         rt.create_object(_defn("b"))
         rt.send("obj-a", "go")
 
-        # Plan closed, step was auto-marked done.
+        # Plan auto-closed after step auto-marked done.
         assert a.active_plan is None
         assert len(a.completed_plans) == 1
         plan = a.completed_plans[0]
@@ -275,27 +344,19 @@ class TestNestedPlans:
 
     def test_nested_chain(self):
         brain = MockBrain()
-        # Turn 1: A asks B.
+        # Turn 1: A asks B → auto-creates plan
         brain.script_react(ReactStep(
             thought="Ask B.",
             action="finish",
-            plan_update=PlanUpdate(
-                goal="get data",
-                steps=[{"kind": "ask", "description": "ask b", "target": "b"}],
-            ),
             finish=ReactFinish(
                 reply="",
                 outgoing_messages=[OutgoingMessage(recipient="b", content="data?", expects_reply=True)],
             ),
         ))
-        # Turn 2: B receives A's ask — needs to ask C.
+        # Turn 2: B receives A's ask — needs to ask C → auto-creates B's plan
         brain.script_react(ReactStep(
             thought="Need C.",
             action="finish",
-            plan_update=PlanUpdate(
-                goal="fulfill A ask",
-                steps=[{"kind": "ask", "description": "ask c", "target": "c"}],
-            ),
             finish=ReactFinish(
                 reply="",
                 outgoing_messages=[OutgoingMessage(recipient="c", content="raw?", expects_reply=True)],
@@ -307,22 +368,20 @@ class TestNestedPlans:
             action="finish",
             finish=ReactFinish(reply="XYZ"),
         ))
-        # Turn 4: B receives C's reply; step 0 auto-done; closes its plan
-        # and replies to A via an outgoing Tell (runtime treats as reply).
+        # Turn 4: B receives C's reply; step 0 auto-done; plan auto-closes.
+        # B replies to A via an outgoing Tell (runtime treats as reply).
         brain.script_react(ReactStep(
             thought="Done.",
             action="finish",
-            plan_update=PlanUpdate(status="complete"),
             finish=ReactFinish(
                 reply="",
                 outgoing_messages=[OutgoingMessage(recipient="obj-a", content="XYZ", expects_reply=False)],
             ),
         ))
-        # Turn 5: A receives B's reply; closes plan.
+        # Turn 5: A receives B's reply; step auto-marked done; plan auto-closes.
         brain.script_react(ReactStep(
             thought="Got it.",
             action="finish",
-            plan_update=PlanUpdate(status="complete"),
             finish=ReactFinish(reply=""),
         ))
 
@@ -345,7 +404,7 @@ class TestNestedPlans:
         assert b.active_plan is None
         assert len(b.completed_plans) == 1
         b_plan = b.completed_plans[0]
-        assert b_plan.goal == "fulfill A ask"
+        # Goal is auto-generated from message content
         assert b_plan.steps[0].status == "done"
 
         # The final B→A reply was routed as MessageType.REPLY (not DOMAIN).
@@ -360,32 +419,54 @@ class TestNestedPlans:
 
 class TestPromptRendering:
     def test_active_plan_rendered_without_ids(self):
+        """Active plan is rendered in the system prompt without internal ids."""
         from src.lnl.brain import build_system_prompt
 
         brain = MockBrain()
         brain.script_react(ReactStep(
-            thought="Create.",
+            thought="Ask hr.",
             action="finish",
-            plan_update=PlanUpdate(
-                goal="notify team",
-                steps=[{"kind": "ask", "description": "find email", "target": "hr"}],
+            finish=ReactFinish(
+                reply="",
+                outgoing_messages=[
+                    OutgoingMessage(recipient="hr", content="find email", expects_reply=True),
+                ],
             ),
-            finish=ReactFinish(reply=""),
         ))
-        obj = LLMObject(_defn(), brain)
-        obj.process_message(_user_msg("go"))
+        brain.set_default(LLMResponse(updated_state={}, reply=""))
+
+        rt = Runtime(brain)
+        obj = rt.create_object(_defn("obj", peers=[PeerDeclaration("hr", "lookup")]))
+        rt.create_object(_defn("hr"))
+        rt.send("obj", "go")
 
         sys_prompt = build_system_prompt(
             obj.definition, obj.state, active_plan=obj.active_plan,
         )
-        # The plan's semantic content is visible.
-        assert "notify team" in sys_prompt
-        assert "find email" in sys_prompt
+        # Active plan rendered — goal derived from message content
+        assert "Active Plan" in sys_prompt
         # Steps rendered by index, no runtime ids.
         assert "[0]" in sys_prompt
+        # Ask hr step is visible
+        assert "hr" in sys_prompt
 
     def test_no_active_plan_renders_none(self):
         from src.lnl.brain import build_system_prompt
         sys_prompt = build_system_prompt(_defn(), current_state={}, active_plan=None)
         assert "(none)" in sys_prompt
         assert "Active Plan" in sys_prompt
+
+    def test_llm_plan_update_still_applied_via_apply_plan_update(self):
+        """_apply_plan_update is still callable for backward compat (e.g. tests/scripts)."""
+        brain = MockBrain()
+        obj = LLMObject(_defn(), brain)
+        # Directly call _apply_plan_update (not via process_message)
+        from src.lnl.types import PlanUpdate
+        obj._apply_plan_update(PlanUpdate(
+            goal="test goal",
+            steps=[{"kind": "ask", "description": "test step", "target": "peer"}],
+        ))
+        plan = obj.active_plan
+        assert plan is not None
+        assert plan.goal == "test goal"
+        assert plan.steps[0].kind == "ask"

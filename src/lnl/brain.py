@@ -141,72 +141,6 @@ LLM_REACT_SCHEMA: dict[str, Any] = {
             "required": ["op", "key"],
             "additionalProperties": False,
         },
-        "plan_update": {
-            "type": "object",
-            "description": (
-                "Optional. Update the active plan. You never author plan or step ids — "
-                "refer to steps by their 0-based index. Emit one of three shapes: "
-                "(A) `goal` + `steps` to create a new plan or replace the active one; "
-                "(B) `step_updates` and/or `add_steps` to modify the active plan; "
-                "(C) `status` = 'complete' or 'cancelled' to close the active plan."
-            ),
-            "properties": {
-                "goal": {
-                    "type": "string",
-                    "description": "Plan goal. Required for shape (A).",
-                },
-                "steps": {
-                    "type": "array",
-                    "description": "Plan steps for shape (A). Each: {kind, description, target}.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "kind": {"type": "string", "enum": ["ask", "tell"]},
-                            "description": {"type": "string"},
-                            "target": {"type": "string"},
-                            "status": {"type": "string", "enum": ["planned", "done", "failed", "skipped"]},
-                            "result_summary": {"type": "string"},
-                        },
-                        "required": ["kind", "description"],
-                        "additionalProperties": False,
-                    },
-                },
-                "step_updates": {
-                    "type": "array",
-                    "description": "Incremental updates for shape (B). Each: {index, status?, result_summary?}.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer", "minimum": 0},
-                            "status": {"type": "string", "enum": ["done", "failed", "skipped"]},
-                            "result_summary": {"type": "string"},
-                        },
-                        "required": ["index"],
-                        "additionalProperties": False,
-                    },
-                },
-                "add_steps": {
-                    "type": "array",
-                    "description": "Steps to append to the active plan for shape (B).",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "kind": {"type": "string", "enum": ["ask", "tell"]},
-                            "description": {"type": "string"},
-                            "target": {"type": "string"},
-                        },
-                        "required": ["kind", "description"],
-                        "additionalProperties": False,
-                    },
-                },
-                "status": {
-                    "type": "string",
-                    "enum": ["complete", "cancelled"],
-                    "description": "Terminate the active plan for shape (C).",
-                },
-            },
-            "additionalProperties": False,
-        },
         "finish": {
             "type": "object",
             "description": "Present only when action=finish.",
@@ -308,26 +242,8 @@ def _peer_interaction_loop(pending_timeout_seconds: float, heartbeat_interval_se
   **Rule:** If you already have all the data you need, send Tells to all
   relevant peers and finish in one step. Do not defer action you can do now.
 
-  ## Plan — single active plan
-
-  Use a plan when (a) you will send ≥1 Ask, (b) you act in multiple steps
-  across turns, or (c) you need to record evidence of an action you took.
-
-  - Create/replace: `plan_update: {{goal, steps: [{{kind, description, target}}, ...]}}`.
-    You never write plan or step ids — the runtime owns all correlation.
-  - Incremental update: `plan_update: {{step_updates: [{{index, status, result_summary}}], add_steps: [...]}}`.
-    Reference steps by their 0-based `index` from the rendered plan.
-  - Close: `plan_update: {{status: "complete" | "cancelled"}}`.
-
-  **Action evidence**: when your role produces an observable action
-  (write, store, post, send, update, upload), record it as a plan step
-  with `status="done"` and a `result_summary`. For a single-shot write
-  service, this looks like: create a one-step plan with the action as
-  the step, mark the step done in the same turn, close the plan.
-
   **Heartbeat** (every {heartbeat_interval_seconds:.0f}s, prefix `[system time: <ts>]`):
-  scan the active plan. If any step is `dispatched` for ≥ {pending_timeout_seconds:.0f}s,
-  either re-dispatch (same target/kind) or mark it `failed` and proceed."""
+  Review your state for time-sensitive conditions or emit proactive outgoing_messages if warranted."""
 
 
 def _render_active_plan(plan: Optional[Plan]) -> str:

@@ -194,6 +194,9 @@ class LLMObject:
             with self._pending_inbound_lock:
                 self._pending_inbound_asks[message.sender] = (message.id, message.plan_step_index)
 
+        # Auto-close stale completed plans so LLM sees a fresh view.
+        self._auto_close_plan_if_complete()
+
         tools_desc = self._tool_registry.describe() if self._tool_registry else ""
         sys_prompt = build_system_prompt(
             self._definition, self._state,
@@ -209,7 +212,6 @@ class LLMObject:
         finish: ReactFinish | None = None
         tool_rounds = 0
         pending_deltas: list[StateDelta] = []
-        pending_plan_updates: list[PlanUpdate] = []
 
         while True:
             step, metrics = self._brain.react_call(messages, object_id=self.object_id)
@@ -217,8 +219,6 @@ class LLMObject:
 
             if step.state_update:
                 pending_deltas.append(step.state_update)
-            if step.plan_update:
-                pending_plan_updates.append(step.plan_update)
 
             if step.action == "finish":
                 finish = step.finish
@@ -270,10 +270,9 @@ class LLMObject:
             self._state = finish.updated_state
         # else: no deltas, no updated_state → state unchanged
 
-        for update in pending_plan_updates:
-            self._apply_plan_update(update)
-
+        self._auto_create_plan_from_outgoing(finish.outgoing_messages or [], message)
         outgoing = self._correlate_outgoing(finish.outgoing_messages)
+        self._auto_close_plan_if_complete()
 
         if finish.updated_definition:
             self._apply_definition_update(finish.updated_definition)
@@ -467,6 +466,74 @@ class LLMObject:
             step = plan.steps[step_index]
             if step.status not in STEP_TERMINAL_STATUSES:
                 step.status = "done"
+        self._auto_close_plan_if_complete()
+
+    def _auto_create_plan_from_outgoing(self, outgoing: list, message: "Message") -> None:  # noqa: F821
+        """Runtime-owned plan creation from outgoing messages.
+
+        Creates (or extends) a plan only for new outgoing Ask messages.
+        Skips recipients that are already in _pending_inbound_asks — those
+        are replies and must go through path 2 in _correlate_outgoing, not
+        be intercepted by a plan step.
+        """
+        # Snapshot pending inbound asks BEFORE acquiring plans lock to avoid
+        # lock-ordering issues. The snapshot is a best-effort filter.
+        with self._pending_inbound_lock:
+            reply_recipients = set(self._pending_inbound_asks.keys())
+
+        # Only create plan entries for messages that are genuine new outgoing
+        # actions, not replies to inbound Asks.
+        new_outgoing = [m for m in outgoing if m.recipient not in reply_recipients]
+        ask_msgs = [m for m in new_outgoing if m.expects_reply]
+        if not ask_msgs:
+            return
+
+        with self._plans_lock:
+            if self._active_plan is None:
+                steps = [
+                    PlanStep(
+                        kind="ask" if m.expects_reply else "tell",
+                        description=f"{'Ask' if m.expects_reply else 'Tell'} {m.recipient}",
+                        target=m.recipient,
+                        status="planned",
+                    )
+                    for m in new_outgoing
+                ]
+                self._active_plan = Plan(
+                    goal=f"Handle: {message.content[:60]}",
+                    steps=steps,
+                    status="active",
+                )
+            else:
+                # Extend with steps for genuinely new targets (avoid duplicates).
+                plan = self._active_plan
+                existing = {
+                    ((s.target or "").strip().lower(), s.kind)
+                    for s in plan.steps
+                }
+                for m in new_outgoing:
+                    key = ((m.recipient or "").strip().lower(), "ask" if m.expects_reply else "tell")
+                    if key not in existing:
+                        plan.steps.append(PlanStep(
+                            kind=key[1],
+                            description=f"{'Ask' if m.expects_reply else 'Tell'} {m.recipient}",
+                            target=m.recipient,
+                            status="planned",
+                        ))
+                        existing.add(key)
+
+    def _auto_close_plan_if_complete(self) -> None:
+        """If the active plan has at least one step and ALL steps are terminal,
+        close the plan automatically (status='complete')."""
+        with self._plans_lock:
+            plan = self._active_plan
+            if plan is None or not plan.steps:
+                return
+            all_terminal = all(s.status in STEP_TERMINAL_STATUSES for s in plan.steps)
+            if all_terminal:
+                plan.status = "complete"
+                self._completed_plans.append(plan)
+                self._active_plan = None
 
     def mark_step_dispatched(self, step_index: int) -> None:
         """Runtime hook: after a plan-tagged outgoing goes on the bus, flip
