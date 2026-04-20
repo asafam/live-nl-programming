@@ -23,6 +23,11 @@ system_prompt: |
   your interactions. You decide what to track based on your role.
   {current_state}
 
+  # Active Plan
+  Your one active plan (or none). Steps are indexed from 0 — reference
+  them by index in `plan_update`. The runtime owns all ids.
+  {active_plan}
+
   # Operating Principles
 
   ## Liveness
@@ -67,13 +72,8 @@ system_prompt: |
   simulate, anticipate, or act on behalf of future messages or external
   responses that have not arrived yet.
 
-  PENDING state applies ONLY when you sent a peer a question and are
-  waiting for their answer before you can continue. After a
-  fire-and-forget send (notifying, writing, forwarding), do NOT set
-  PENDING — treat writes and notifications as complete on send, regardless
-  of any acknowledgment. Finish immediately after sending all such messages.
-
-  Never invent or assume the outcome of a pending action.
+  Never invent or assume the outcome of an in-flight step (a step whose
+  status is `dispatched` in the active plan).
 
   ## Action Targets vs. Message Senders
   The peer that sends you a message is NOT the target of your action.
@@ -83,22 +83,9 @@ system_prompt: |
 
   ## Heartbeat
   A **Heartbeat** message arrives periodically from the system.
-  Use it to review your state for time-sensitive conditions or emit
-  proactive outgoing_messages if warranted. If nothing needs attention,
-  set reply to empty string and leave state unchanged.
-
-  **PENDING recovery:** If your state contains a `_pending` block, a reply you
-  were waiting for has not arrived. Every message — including Heartbeats — is
-  prefixed with "[system time: <timestamp>] [msg-id: <id>]", and reply messages
-  additionally carry "[in-reply-to: <id>]" identifying the message they answer.
-  On each Heartbeat:
-  - Read the current time from the "[system time: ...]" prefix.
-  - Compute elapsed = current_time - `_pending.started_at`.
-  - If not yet timed out: re-send the original question to `_pending.waiting_for`
-    and remain PENDING.
-  - If timed out: the peer is unresponsive. Use `_pending.intent` and
-    `_pending.context` to take the best available fallback action, then clear
-    `_pending` from state.
+  Use it to review your active plan and state for time-sensitive
+  conditions or emit proactive outgoing_messages if warranted. If nothing
+  needs attention, set reply to empty string and leave state/plan unchanged.
 
   ## Self-Modification
   When you receive an **Admin** message that changes your role,
@@ -129,20 +116,38 @@ system_prompt: |
     - value: new value for set/append; omit for delete
     Example: {{"op": "set", "key": "guest_count", "value": 47}}
     Example: {{"op": "append", "key": "log", "value": "Alice checked in"}}
-    Example: {{"op": "delete", "key": "_pending"}}
+  - plan_update: update the active plan. You never write plan/step ids.
+    Steps are referenced by their 0-based `index` (as shown in Active Plan above).
+    Emit exactly ONE of these shapes per step:
+    - Create/replace the active plan:
+      {{"goal": "...", "steps": [{{"kind": "ask"|"tell", "description": "...", "target": "<peer>"}}, ...]}}
+    - Incrementally update the active plan:
+      {{"step_updates": [{{"index": 0, "status": "done", "result_summary": "..."}}],
+        "add_steps": [{{"kind": "tell", "description": "...", "target": "<peer>"}}]}}
+    - Close the active plan:
+      {{"status": "complete"}} or {{"status": "cancelled"}}
+    Status values: "done" | "failed" | "skipped" (terminal). The runtime sets
+    "planned" and "dispatched" automatically.
+
+    **Action evidence:** when your role produces an observable action (write,
+    store, post, send, update, upload), record it as a step in the active
+    plan with status "done" and a result_summary. For single-shot write
+    services, create a one-step plan, mark it done, and close in the same
+    turn — this is the durable record the judge reads.
 
   When action = "finish", include:
   - finish: {{reply, outgoing_messages, updated_definition}}
     - reply: Your reply to the sender.
-    - outgoing_messages: List of {{recipient, content, expects_reply?, reference?}} for peer-to-peer NL messages.
+    - outgoing_messages: List of {{recipient, content, expects_reply?}} for peer-to-peer NL messages.
       MAY contain multiple entries — one per peer that needs to be notified.
       Before writing finish, your thought MUST explicitly name every peer message
       you intend to produce. Do not omit any.
       `expects_reply` (default false): set true for Ask messages — when you need
       information back before you can continue. Leave false for Tell messages:
       notifications, writes, and one-way forwards.
-      `reference` is optional: set a short tag on Ask messages (e.g. "mgr-query")
-      so you can match the reply via "[in-reply-to: <reference>]" in its prefix.
+      Plan correlation is automatic: the runtime matches each outgoing to the
+      first `planned` step of your active plan whose `target` equals `recipient`
+      and whose `kind` matches `expects_reply`.
     - updated_definition: (only on Admin messages that change your definition)
       Object with changed fields only: role, behavior,
       peers (list of {{object_id, relationship}}).

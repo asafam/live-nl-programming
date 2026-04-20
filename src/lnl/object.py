@@ -1,7 +1,9 @@
 """LLMObject — the single runtime entity in the LNL system."""
 from __future__ import annotations
 
+import datetime
 import json
+import logging
 import threading
 from collections import deque
 from dataclasses import asdict
@@ -14,15 +16,23 @@ from .brain import (
 )
 from .tools import ToolRegistry
 from .types import (
+    PLAN_TERMINAL_STATUSES,
+    STEP_TERMINAL_STATUSES,
     InferenceMetrics,
     Message,
+    MessageType,
     ObjectDefinition,
     PeerDeclaration,
+    Plan,
+    PlanStep,
+    PlanUpdate,
     ProcessingResult,
     ReactFinish,
     StateDelta,
     ToolResult,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class LLMObject:
@@ -54,6 +64,18 @@ class LLMObject:
         self._react_cross_objects = react_cross_objects
         self._pending_timeout_seconds = pending_timeout_seconds
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        # Plan state — a single active plan per object at a time. The LLM
+        # reasons about steps by position (0-based) — it never authors ids.
+        self._active_plan: Optional[Plan] = None
+        self._completed_plans: list[Plan] = []
+        self._plans_lock = threading.Lock()
+        # Pending inbound Asks: sender → (message_id, plan_step_index).
+        # When the object eventually emits an outgoing to this sender, the
+        # runtime stamps it as a reply and propagates the asker's plan
+        # correlation. Survives across turns so a nested reply chain still
+        # correlates back to the original asker's plan.
+        self._pending_inbound_asks: dict[str, tuple[str, Optional[int]]] = {}
+        self._pending_inbound_lock = threading.Lock()
 
     # --- Properties ---
 
@@ -129,11 +151,48 @@ class LLMObject:
         message = self._mailbox.popleft()
         return self.process_message(message)
 
+    # --- Plan accessors ---
+
+    @property
+    def active_plan(self) -> Optional[Plan]:
+        """Return the object's current active plan (or None)."""
+        with self._plans_lock:
+            return self._active_plan
+
+    @property
+    def completed_plans(self) -> list[Plan]:
+        """Archive of completed/cancelled plans (most recent last)."""
+        with self._plans_lock:
+            return list(self._completed_plans)
+
+    def clear_pending_inbound(self, sender: str) -> None:
+        """Runtime hook: clear a pending-inbound entry when a reply to `sender`
+        has been delivered via the `finish.reply` path."""
+        with self._pending_inbound_lock:
+            self._pending_inbound_asks.pop(sender, None)
+
     # --- Core Processing (ReAct loop) ---
 
     def process_message(self, message: Message) -> ProcessingResult:
         """Process an incoming message via a ReAct loop: think → act → observe → repeat."""
         state_before = self._state  # snapshot — state only committed after successful loop
+
+        # Reply-driven auto-mark: if this message is a correlated reply to
+        # a step in our active plan, mark that step done BEFORE the LLM runs,
+        # so the rendered plan snapshot reflects reality.
+        if message.plan_step_index is not None:
+            self._auto_mark_step_on_reply(message.plan_step_index)
+
+        # Record pending inbound Asks so a later reply-to-asker (possibly in
+        # a different turn, e.g. nested A→B→C→B→A) auto-correlates back with
+        # the original Ask's context.
+        if (
+            message.expects_reply
+            and message.type == MessageType.DOMAIN
+            and message.sender not in ("__user__", "__system__", "__external__", "__code__")
+        ):
+            with self._pending_inbound_lock:
+                self._pending_inbound_asks[message.sender] = (message.id, message.plan_step_index)
 
         tools_desc = self._tool_registry.describe() if self._tool_registry else ""
         sys_prompt = build_system_prompt(
@@ -142,6 +201,7 @@ class LLMObject:
             react_cross_objects=self._react_cross_objects,
             pending_timeout_seconds=self._pending_timeout_seconds,
             heartbeat_interval_seconds=self._heartbeat_interval_seconds,
+            active_plan=self.active_plan,
         )
         messages = _build_chat_messages(sys_prompt, self._history, message)
 
@@ -149,6 +209,7 @@ class LLMObject:
         finish: ReactFinish | None = None
         tool_rounds = 0
         pending_deltas: list[StateDelta] = []
+        pending_plan_updates: list[PlanUpdate] = []
 
         while True:
             step, metrics = self._brain.react_call(messages, object_id=self.object_id)
@@ -156,6 +217,8 @@ class LLMObject:
 
             if step.state_update:
                 pending_deltas.append(step.state_update)
+            if step.plan_update:
+                pending_plan_updates.append(step.plan_update)
 
             if step.action == "finish":
                 finish = step.finish
@@ -207,6 +270,11 @@ class LLMObject:
             self._state = finish.updated_state
         # else: no deltas, no updated_state → state unchanged
 
+        for update in pending_plan_updates:
+            self._apply_plan_update(update)
+
+        outgoing = self._correlate_outgoing(finish.outgoing_messages)
+
         if finish.updated_definition:
             self._apply_definition_update(finish.updated_definition)
         self._history.append(message)
@@ -216,7 +284,7 @@ class LLMObject:
         return ProcessingResult(
             object_id=self.object_id,
             reply=finish.reply,
-            outgoing_messages=finish.outgoing_messages,
+            outgoing_messages=outgoing,
             state_before=_coerce_state(state_before),
             state_after=_coerce_state(self._state),
             metrics=total_metrics,
@@ -224,7 +292,194 @@ class LLMObject:
             source_message_type=message.type,
             depth_remaining=message.depth_remaining,
             source_message_id=message.id,
+            source_plan_step_index=message.plan_step_index,
         )
+
+    # --- Plan application ---
+
+    def _apply_plan_update(self, update: PlanUpdate) -> None:
+        """Apply a plan update. Exactly one of three shapes per update:
+
+        1. Create/replace: `goal` + `steps` — creates a new plan if none
+           active, or replaces the active one. Existing step status from
+           same-position steps is preserved when kind+target match.
+        2. Incremental: `step_updates` / `add_steps` — modify the active plan.
+        3. Close: `status = "complete" | "cancelled"` — terminate active.
+        """
+        # Shape 1: create or replace.
+        if update.goal is not None and update.steps is not None:
+            new_steps = [
+                PlanStep(
+                    kind=s.get("kind", ""),
+                    description=s.get("description", ""),
+                    target=s.get("target"),
+                    status=s.get("status") or "planned",
+                    result_summary=s.get("result_summary"),
+                )
+                for s in update.steps if isinstance(s, dict)
+            ]
+            # Drop invalid kinds.
+            new_steps = [s for s in new_steps if s.kind in ("ask", "tell")]
+            with self._plans_lock:
+                if self._active_plan is not None:
+                    # Replace: preserve status/result on same-position steps
+                    # where kind+target still match (LLM giving a whole plan
+                    # may intend to keep prior outcomes).
+                    prev = self._active_plan
+                    for i, ns in enumerate(new_steps):
+                        if i < len(prev.steps):
+                            ps = prev.steps[i]
+                            if ps.kind == ns.kind and ps.target == ns.target and ns.status == "planned":
+                                ns.status = ps.status
+                                if ns.result_summary is None and ps.result_summary:
+                                    ns.result_summary = ps.result_summary
+                self._active_plan = Plan(goal=update.goal, steps=new_steps, status="active")
+            return
+
+        # Shape 3: close active plan.
+        if update.status in PLAN_TERMINAL_STATUSES:
+            with self._plans_lock:
+                if self._active_plan is None:
+                    logger.warning("Plan close for %s: no active plan — dropped", self.object_id)
+                    return
+                self._active_plan.status = update.status
+                self._completed_plans.append(self._active_plan)
+                self._active_plan = None
+            return
+
+        # Shape 2: incremental updates to active plan.
+        with self._plans_lock:
+            if self._active_plan is None:
+                logger.warning("Plan incremental update for %s: no active plan — dropped", self.object_id)
+                return
+            plan = self._active_plan
+            for su in update.step_updates or []:
+                if not isinstance(su, dict):
+                    continue
+                idx = su.get("index")
+                if not isinstance(idx, int) or idx < 0 or idx >= len(plan.steps):
+                    logger.warning(
+                        "Plan update for %s: step index %r out of range (%d steps) — dropped",
+                        self.object_id, idx, len(plan.steps),
+                    )
+                    continue
+                step = plan.steps[idx]
+                status = su.get("status")
+                if status in STEP_TERMINAL_STATUSES:
+                    step.status = status
+                elif status:
+                    logger.warning(
+                        "Plan update for %s step[%d]: status=%r not allowed (terminal only) — ignored",
+                        self.object_id, idx, status,
+                    )
+                rs = su.get("result_summary")
+                if rs is not None:
+                    step.result_summary = rs
+            for raw in update.add_steps or []:
+                if not isinstance(raw, dict):
+                    continue
+                kind = raw.get("kind")
+                if kind not in ("ask", "tell"):
+                    continue
+                plan.steps.append(PlanStep(
+                    kind=kind,
+                    description=raw.get("description", ""),
+                    target=raw.get("target"),
+                    status=raw.get("status") or "planned",
+                    result_summary=raw.get("result_summary"),
+                ))
+
+    def _correlate_outgoing(self, outgoing):
+        """Auto-stamp correlation on outgoing messages.
+
+        Two matching paths, checked in order:
+        1. Plan step match: first `planned` step of our active plan whose
+           `target` equals the recipient AND whose `kind` matches
+           `expects_reply`. Stamp plan_step_index. Tell steps → done on
+           dispatch; Ask steps → dispatched.
+        2. Pending inbound Ask: recipient has an outstanding Ask from us.
+           Stamp `is_reply=True` and `in_reply_to` so the runtime delivers
+           as a REPLY tied to the original Ask's correlation.
+        """
+        if not outgoing:
+            return outgoing
+        with self._plans_lock:
+            plan = self._active_plan
+
+        for out in outgoing:
+            out.plan_step_index = None
+            out.in_reply_to = None
+            out.is_reply = False
+
+            # Path 1 — plan step match.
+            if plan is not None and plan.status == "active":
+                wanted_kind = "ask" if out.expects_reply else "tell"
+                recipient_lc = (out.recipient or "").strip().lower()
+                matched_index = None
+                with self._plans_lock:
+                    for i, step in enumerate(plan.steps):
+                        if step.status != "planned" or step.kind != wanted_kind:
+                            continue
+                        target_lc = (step.target or "").strip().lower()
+                        if not target_lc:
+                            continue
+                        if (
+                            target_lc == recipient_lc
+                            or target_lc in recipient_lc
+                            or recipient_lc in target_lc
+                        ):
+                            matched_index = i
+                            break
+                    # Fallback: single planned step of wanted kind in the plan.
+                    if matched_index is None:
+                        candidates = [
+                            i for i, s in enumerate(plan.steps)
+                            if s.status == "planned" and s.kind == wanted_kind
+                        ]
+                        if len(candidates) == 1:
+                            matched_index = candidates[0]
+                    if matched_index is not None:
+                        step = plan.steps[matched_index]
+                        out.plan_step_index = matched_index
+                        # Tell steps are fire-and-forget — mark done on dispatch.
+                        # Ask steps flip to 'dispatched' after bus send (runtime does this).
+                        if step.kind == "tell":
+                            step.status = "done"
+                        continue
+
+            # Path 2 — reply to a pending inbound Ask.
+            with self._pending_inbound_lock:
+                pending = self._pending_inbound_asks.pop(out.recipient, None)
+            if pending is not None:
+                mid, asker_step_index = pending
+                out.in_reply_to = mid
+                out.plan_step_index = asker_step_index
+                out.is_reply = True
+        return outgoing
+
+    def _auto_mark_step_on_reply(self, step_index: int) -> None:
+        """Runtime hook: when a correlated reply arrives tagged with a step
+        index, mark that step done on the active plan (unless already terminal)."""
+        with self._plans_lock:
+            plan = self._active_plan
+            if plan is None or step_index < 0 or step_index >= len(plan.steps):
+                return
+            step = plan.steps[step_index]
+            if step.status not in STEP_TERMINAL_STATUSES:
+                step.status = "done"
+
+    def mark_step_dispatched(self, step_index: int) -> None:
+        """Runtime hook: after a plan-tagged outgoing goes on the bus, flip
+        the step from 'planned' to 'dispatched' (Ask steps only; Tell steps
+        are already 'done' via auto-correlation)."""
+        now = datetime.datetime.now(datetime.timezone.utc)  # noqa: F841 (future use)
+        with self._plans_lock:
+            plan = self._active_plan
+            if plan is None or step_index < 0 or step_index >= len(plan.steps):
+                return
+            step = plan.steps[step_index]
+            if step.status == "planned":
+                step.status = "dispatched"
 
     # --- Live Modification ---
 
@@ -261,11 +516,16 @@ class LLMObject:
 
     def snapshot(self) -> dict:
         """Return a debug snapshot of the object."""
+        with self._plans_lock:
+            plan_snap = asdict(self._active_plan) if self._active_plan else None
+            completed_snap = [asdict(p) for p in self._completed_plans]
         return {
             "object_id": self.object_id,
             "state": _coerce_state(self._state),
             "definition": asdict(self._definition),
             "history_length": len(self._history),
+            "active_plan": plan_snap,
+            "completed_plans": completed_snap,
         }
 
 

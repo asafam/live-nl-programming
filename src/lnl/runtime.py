@@ -432,13 +432,22 @@ class Runtime:
                     depth_remaining=next_depth,
                     id=self._next_msg_id(obj_id),
                     in_reply_to=result.source_message_id,
+                    # Propagate the original message's plan step index so the
+                    # asker's plan step auto-marks done when the reply arrives.
+                    plan_step_index=result.source_plan_step_index,
                 )
                 self._bus.deliver(reply_msg)
+                # Clear any pending-inbound entry for this recipient so later
+                # outgoings don't double-stamp with a now-consumed Ask.
+                sender_obj = self._bus.objects.get(obj_id)
+                if sender_obj is not None and hasattr(sender_obj, "clear_pending_inbound"):
+                    sender_obj.clear_pending_inbound(result.in_reply_to)
                 logger.debug("  ↩ reply routed: %s → %s", obj_id, result.in_reply_to)
             else:
                 logger.warning("Chain depth limit reached; dropping reply from %s to %s", obj_id, result.in_reply_to)
 
         # Deliver outgoing peer messages
+        sender_obj = self._bus.objects.get(obj_id)
         for out in result.outgoing_messages:
             next_depth = result.depth_remaining - 1
             if next_depth <= 0:
@@ -447,20 +456,39 @@ class Runtime:
                     obj_id, out.recipient,
                 )
                 continue
+            msg_id = self._next_msg_id(obj_id)
+            # `is_reply` is set when the outgoing fulfills a pending inbound Ask.
+            # Route it as MessageType.REPLY and release the asker's awaiting state.
+            msg_type = MessageType.REPLY if out.is_reply else MessageType.DOMAIN
             chained = Message(
                 sender=obj_id,
                 recipient=out.recipient,
-                type=MessageType.DOMAIN,
+                type=msg_type,
                 content=out.content,
                 depth_remaining=next_depth,
-                id=self._next_msg_id(obj_id),
-                reference=out.reference,
+                id=msg_id,
+                in_reply_to=out.in_reply_to,
                 expects_reply=out.expects_reply,
+                plan_step_index=out.plan_step_index,
             )
             self._bus.deliver(chained)
+            # If this outgoing dispatched one of our own plan steps, flip the
+            # step from 'planned' to 'dispatched' on the bus send (Ask only;
+            # Tells are already auto-marked 'done' by _correlate_outgoing).
+            if (
+                out.plan_step_index is not None
+                and not out.is_reply
+                and out.expects_reply
+                and sender_obj is not None
+                and hasattr(sender_obj, "mark_step_dispatched")
+            ):
+                sender_obj.mark_step_dispatched(out.plan_step_index)
+            if out.is_reply:
+                with self._awaiting_lock:
+                    self._awaiting_reply.get(out.recipient, set()).discard(obj_id)
             logger.debug(
                 "  → outgoing (%s): %s → %s: %s",
-                "ask" if out.expects_reply else "tell",
+                "reply" if out.is_reply else ("ask" if out.expects_reply else "tell"),
                 obj_id, out.recipient, repr(str(out.content)[:80]),
             )
             if out.expects_reply:

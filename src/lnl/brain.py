@@ -22,6 +22,8 @@ from .types import (
     MessageType,
     ObjectDefinition,
     OutgoingMessage,
+    Plan,
+    PlanUpdate,
     ReactFinish,
     ReactStep,
     StateDelta,
@@ -139,6 +141,72 @@ LLM_REACT_SCHEMA: dict[str, Any] = {
             "required": ["op", "key"],
             "additionalProperties": False,
         },
+        "plan_update": {
+            "type": "object",
+            "description": (
+                "Optional. Update the active plan. You never author plan or step ids — "
+                "refer to steps by their 0-based index. Emit one of three shapes: "
+                "(A) `goal` + `steps` to create a new plan or replace the active one; "
+                "(B) `step_updates` and/or `add_steps` to modify the active plan; "
+                "(C) `status` = 'complete' or 'cancelled' to close the active plan."
+            ),
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "Plan goal. Required for shape (A).",
+                },
+                "steps": {
+                    "type": "array",
+                    "description": "Plan steps for shape (A). Each: {kind, description, target}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["ask", "tell"]},
+                            "description": {"type": "string"},
+                            "target": {"type": "string"},
+                            "status": {"type": "string", "enum": ["planned", "done", "failed", "skipped"]},
+                            "result_summary": {"type": "string"},
+                        },
+                        "required": ["kind", "description"],
+                        "additionalProperties": False,
+                    },
+                },
+                "step_updates": {
+                    "type": "array",
+                    "description": "Incremental updates for shape (B). Each: {index, status?, result_summary?}.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer", "minimum": 0},
+                            "status": {"type": "string", "enum": ["done", "failed", "skipped"]},
+                            "result_summary": {"type": "string"},
+                        },
+                        "required": ["index"],
+                        "additionalProperties": False,
+                    },
+                },
+                "add_steps": {
+                    "type": "array",
+                    "description": "Steps to append to the active plan for shape (B).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["ask", "tell"]},
+                            "description": {"type": "string"},
+                            "target": {"type": "string"},
+                        },
+                        "required": ["kind", "description"],
+                        "additionalProperties": False,
+                    },
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["complete", "cancelled"],
+                    "description": "Terminate the active plan for shape (C).",
+                },
+            },
+            "additionalProperties": False,
+        },
         "finish": {
             "type": "object",
             "description": "Present only when action=finish.",
@@ -154,10 +222,6 @@ LLM_REACT_SCHEMA: dict[str, Any] = {
                             "expects_reply": {
                                 "type": "boolean",
                                 "description": "Set true for Ask messages — when you need information back before you can continue. Leave false (default) for Tell messages: notifications, writes, and one-way forwards.",
-                            },
-                            "reference": {
-                                "type": "string",
-                                "description": "Optional short tag for correlating a reply to this Ask message. Include when expects_reply is true so you can match the reply via [in-reply-to: <reference>].",
                             },
                         },
                         "required": ["recipient", "content"],
@@ -230,63 +294,55 @@ def _peer_interaction_loop(pending_timeout_seconds: float, heartbeat_interval_se
     return f"""
   ## Peer Sends: Ask vs. Tell
 
-  Every outgoing message is either an **Ask** or a **Tell**. Set `expects_reply`
-  accordingly on each entry in `outgoing_messages`.
+  Every outgoing message is either an **Ask** or a **Tell**.
 
-  **Tell (NOTIFY / WRITE / FORWARD) — `expects_reply: false` (the DEFAULT):**
-  You are informing, storing, or passing an event along — no reply expected.
-  The recipient is told this is a Tell so it knows not to reply. Send the message
-  and immediately proceed to your next action or finish. Do NOT set a PENDING flag.
-  Examples:
-  - Forwarding an event to the next object in the chain
-  - Writing a record to a store
-  - Posting a Slack notification
-  - Triggering a downstream action
+  **Tell (`expects_reply: false`, the DEFAULT):** informing, writing,
+  forwarding, notifying. No reply expected. Send and immediately finish or
+  continue to the next action. Examples: forwarding an event, writing a
+  record, posting a notification, triggering a downstream action.
 
-  **Ask (QUERY) — `expects_reply: true`:**
-  You need information back from the peer before you can continue. The recipient
-  is told this is an Ask so it knows to reply. Send your question with
-  `expects_reply: true`, set a `_pending` block in state, and STOP. When their
-  REPLY arrives, read your state to recall your intent, complete the goal, then
-  clear `_pending`.
-  Use this ONLY when you cannot proceed without the peer's answer. Examples:
-  - Looking up a manager's name/email before addressing a notification
-  - Checking policy rules before routing a ticket
-  - Querying an org directory before assigning work
+  **Ask (`expects_reply: true`):** you need information back before you can
+  continue. The reply arrives on a LATER turn as a separate message. Use
+  ONLY when you cannot proceed without the peer's answer.
 
-  **Saving a continuation when going PENDING:** Your `_pending` block must contain
-  everything needed to resume without re-reading the original trigger.
-  Every message is prefixed with "[system time: <timestamp>] [msg-id: <id>]" — use
-  the timestamp as `started_at` so you know when you went pending.
-  When an Ask reply arrives, it carries "[in-reply-to: <id>]" where <id> matches
-  the `reference` you set on the outgoing message — use it to match multiple
-  concurrent pending requests:
-    _pending: {{
-      waiting_for: "<peer-id>",
-      reference: "<short tag you set on the outgoing message>",
-      question: "<exact question sent>",
-      intent: "<what you will do once you have the answer>",
-      started_at: "<timestamp from the [system time: ...] prefix of the current message>",
-      context: {{ <all data from the original message needed to complete the action> }}
-    }}
+  **Rule:** If you already have all the data you need, send Tells to all
+  relevant peers and finish in one step. Do not defer action you can do now.
 
-  **Rule:** If you already have all the data you need to complete your action, send
-  Tell messages to all relevant peers and finish in one step. Never set PENDING
-  after a Tell send.
+  ## Plan — single active plan
 
-  **Heartbeat recovery:** A Heartbeat arrives every {heartbeat_interval_seconds:.0f}s.
-  Like all messages, it is prefixed with "[system time: <timestamp>]" — this is the
-  authoritative current time. On each Heartbeat, check your state for a `_pending`
-  block. If present:
-  - Read the current time from the "[system time: ...]" prefix of the Heartbeat.
-  - Compute elapsed seconds = current_time - `_pending.started_at`.
-  - If elapsed < {pending_timeout_seconds:.0f}s: re-send the original question to
-    `_pending.waiting_for` (with `expects_reply: true`) and remain PENDING (do not
-    update `started_at`).
-  - If elapsed >= {pending_timeout_seconds:.0f}s: the peer is unresponsive. Use
-    `_pending.intent` and `_pending.context` to take the best available fallback
-    action (proceed with a default, escalate, or log a failure), then clear
-    `_pending` from state."""
+  Use a plan when (a) you will send ≥1 Ask, (b) you act in multiple steps
+  across turns, or (c) you need to record evidence of an action you took.
+
+  - Create/replace: `plan_update: {{goal, steps: [{{kind, description, target}}, ...]}}`.
+    You never write plan or step ids — the runtime owns all correlation.
+  - Incremental update: `plan_update: {{step_updates: [{{index, status, result_summary}}], add_steps: [...]}}`.
+    Reference steps by their 0-based `index` from the rendered plan.
+  - Close: `plan_update: {{status: "complete" | "cancelled"}}`.
+
+  **Action evidence**: when your role produces an observable action
+  (write, store, post, send, update, upload), record it as a plan step
+  with `status="done"` and a `result_summary`. For a single-shot write
+  service, this looks like: create a one-step plan with the action as
+  the step, mark the step done in the same turn, close the plan.
+
+  **Heartbeat** (every {heartbeat_interval_seconds:.0f}s, prefix `[system time: <ts>]`):
+  scan the active plan. If any step is `dispatched` for ≥ {pending_timeout_seconds:.0f}s,
+  either re-dispatch (same target/kind) or mark it `failed` and proceed."""
+
+
+def _render_active_plan(plan: Optional[Plan]) -> str:
+    """Render the active plan for the prompt. Hides internal ids; LLM sees
+    goal, status, and steps with 0-based indices."""
+    if plan is None:
+        return "(none)"
+    lines = [f"goal: {plan.goal}", f"status: {plan.status}", "steps:"]
+    if not plan.steps:
+        lines.append("  (empty)")
+    for i, s in enumerate(plan.steps):
+        target = f" → {s.target}" if s.target else ""
+        rs = f"  result: {s.result_summary}" if s.result_summary else ""
+        lines.append(f"  [{i}] {s.kind}{target}: \"{s.description}\"  status={s.status}{rs}")
+    return "\n".join(lines)
 
 
 def build_system_prompt(
@@ -296,6 +352,7 @@ def build_system_prompt(
     react_cross_objects: bool = True,
     pending_timeout_seconds: float = 90.0,
     heartbeat_interval_seconds: float = 30.0,
+    active_plan: Optional["Plan"] = None,  # type: ignore[name-defined]
 ) -> str:
     """Build the system prompt from the YAML template and an ObjectDefinition."""
     config = _load_prompt_config()
@@ -321,6 +378,7 @@ def build_system_prompt(
         "peers": peers or "(none)",
         "event_sources": event_sources or "(none)",
         "current_state": (json.dumps(current_state, indent=2) if isinstance(current_state, dict) else current_state.strip()) if current_state else "(empty)",
+        "active_plan": _render_active_plan(active_plan),
         "tools": tools or "(none)",
         "peer_interaction_loop": _peer_interaction_loop(pending_timeout_seconds, heartbeat_interval_seconds) if react_cross_objects else "",
     }
@@ -982,13 +1040,31 @@ def _parse_state_delta(raw: dict) -> Optional[StateDelta]:
     return StateDelta(op=op, key=key, value=raw.get("value"))
 
 
+def _parse_plan_update(raw: dict) -> Optional[PlanUpdate]:
+    """Parse an optional plan_update dict. Accepts any of the three shapes.
+    Returns None only if the dict is entirely empty / unrelated."""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    steps = raw.get("steps")
+    step_updates = raw.get("step_updates")
+    add_steps = raw.get("add_steps")
+    return PlanUpdate(
+        goal=raw.get("goal"),
+        steps=steps if isinstance(steps, list) else None,
+        step_updates=step_updates if isinstance(step_updates, list) else None,
+        add_steps=add_steps if isinstance(add_steps, list) else None,
+        status=raw.get("status"),
+    )
+
+
 def _parse_react_step(raw: dict) -> ReactStep:
     """Parse a raw LLM dict into a ReactStep."""
     thought = raw.get("thought", "")
     action = raw.get("action", "finish")
 
-    # state_update is optional at any step
+    # state_update and plan_update are optional at any step
     state_update = _parse_state_delta(raw.get("state_update") or {})
+    plan_update = _parse_plan_update(raw.get("plan_update") or {})
 
     if action == "tool_call":
         tc_data = raw.get("tool_call") or {}
@@ -997,7 +1073,10 @@ def _parse_react_step(raw: dict) -> ReactStep:
             tool=tc_data.get("tool", ""),
             arguments=tc_data.get("arguments", {}),
         )
-        return ReactStep(thought=thought, action="tool_call", state_update=state_update, tool_call=tc)
+        return ReactStep(
+            thought=thought, action="tool_call",
+            state_update=state_update, plan_update=plan_update, tool_call=tc,
+        )
 
     # action == "finish"
     f_data = raw.get("finish") or {}
@@ -1008,7 +1087,6 @@ def _parse_react_step(raw: dict) -> ReactStep:
         OutgoingMessage(
             recipient=m["recipient"],
             content=m["content"],
-            reference=m.get("reference"),
             expects_reply=bool(m.get("expects_reply", False)),
         )
         for m in raw_msgs
@@ -1023,7 +1101,10 @@ def _parse_react_step(raw: dict) -> ReactStep:
         outgoing_messages=outgoing,
         updated_definition=updated_def,
     )
-    return ReactStep(thought=thought, action="finish", state_update=state_update, finish=finish)
+    return ReactStep(
+        thought=thought, action="finish",
+        state_update=state_update, plan_update=plan_update, finish=finish,
+    )
 
 
 def _parse_llm_result(result: Any) -> LLMResponse:
@@ -1041,7 +1122,7 @@ def _parse_llm_result(result: Any) -> LLMResponse:
     outgoing = []
     for m in data.get("outgoing_messages", []):
         if isinstance(m, dict):
-            outgoing.append(OutgoingMessage(recipient=m["recipient"], content=m["content"], reference=m.get("reference")))
+            outgoing.append(OutgoingMessage(recipient=m["recipient"], content=m["content"]))
         elif isinstance(m, OutgoingMessage):
             outgoing.append(m)
 

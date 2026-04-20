@@ -52,17 +52,25 @@ class Message:
     timestamp: datetime.datetime = field(default_factory=_utcnow)
     id: str = ""                         # runtime-assigned deterministic ID
     in_reply_to: Optional[str] = None    # ID of the message being replied to
-    reference: Optional[str] = None      # LLM-assigned correlation tag (copied from OutgoingMessage)
+    reference: Optional[str] = None      # legacy correlation tag (unused by runtime now)
     expects_reply: bool = False          # True = Ask (sender wants a reply); False = Tell (propagated from OutgoingMessage)
+    plan_step_index: Optional[int] = None  # runtime-stamped: index of plan step this message dispatches (for correlation)
 
 
 @dataclass
 class OutgoingMessage:
-    """An outgoing message produced by the LLM."""
+    """An outgoing message produced by the LLM.
+
+    The LLM sets only {recipient, content, expects_reply}. The runtime
+    populates the correlation fields during auto-matching.
+    """
     recipient: str
     content: str
-    reference: Optional[str] = None   # LLM-assigned correlation tag for request-reply tracking
     expects_reply: bool = False        # True = Ask (sender wants a reply); False = Tell (fire-and-forget)
+    # Runtime-stamped fields (LLM never sets these):
+    plan_step_index: Optional[int] = None  # index of the plan step this dispatches (if correlated)
+    in_reply_to: Optional[str] = None      # original message id when this is a cross-turn reply to a pending Ask
+    is_reply: bool = False                 # true when this fulfills a pending inbound Ask (routed as MessageType.REPLY)
 
 
 @dataclass
@@ -123,6 +131,7 @@ class ProcessingResult:
     depth_remaining: int = 10  # propagated from the processed message
     sequence: int = 0          # assigned by Runtime for ordering concurrent results
     source_message_id: str = ""  # ID of the message that was processed
+    source_plan_step_index: Optional[int] = None  # plan_step_index from the processed message (propagated onto replies)
 
 
 @dataclass
@@ -131,6 +140,46 @@ class StateDelta:
     op: str    # "set" | "delete" | "append"
     key: str
     value: Any = None  # required for set/append; ignored for delete
+
+
+# --- Plan types ---
+
+STEP_TERMINAL_STATUSES = ("done", "failed", "skipped")
+PLAN_TERMINAL_STATUSES = ("complete", "cancelled")
+
+
+@dataclass
+class PlanStep:
+    """One step in an active plan. The LLM never references steps by id —
+    it sees them by position (0-based index) in the rendered plan."""
+    kind: str                            # "ask" | "tell"
+    description: str
+    target: Optional[str] = None
+    status: str = "planned"              # "planned" | "dispatched" | "done" | "failed" | "skipped"
+    result_summary: Optional[str] = None
+
+
+@dataclass
+class Plan:
+    """An active or terminated plan. One active plan per object at a time."""
+    goal: str
+    steps: list[PlanStep] = field(default_factory=list)
+    status: str = "active"               # "active" | "complete" | "cancelled"
+
+
+@dataclass
+class PlanUpdate:
+    """A plan update emitted by the LLM. Exactly one of three shapes:
+
+    - Create/replace: `goal` + `steps` → new plan (or replace active)
+    - Incremental: `step_updates` and/or `add_steps` → modify active plan
+    - Close: `status="complete"` or `status="cancelled"` → terminate active plan
+    """
+    goal: Optional[str] = None
+    steps: Optional[list[dict]] = None         # for create/replace: [{kind, description, target}, ...]
+    step_updates: Optional[list[dict]] = None  # incremental: [{index, status?, result_summary?}, ...]
+    add_steps: Optional[list[dict]] = None     # incremental: steps to append
+    status: Optional[str] = None               # "complete" | "cancelled" to close the plan
 
 
 @dataclass
@@ -148,6 +197,7 @@ class ReactStep:
     thought: str
     action: str  # "tool_call" | "finish"
     state_update: Optional[StateDelta] = None  # optional at any step; accumulated by runtime
+    plan_update: Optional[PlanUpdate] = None   # optional at any step; accumulated by runtime
     tool_call: Optional[ToolCall] = None
     finish: Optional[ReactFinish] = None
 
