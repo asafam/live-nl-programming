@@ -757,9 +757,12 @@ def _write_worker_config(
 
     agents_cfg["list"] = new_lst
     tools_cfg = config.setdefault("tools", {})
+    # Accumulate allow list (union) so previously registered agents remain
+    # reachable when sessions_send targets an agent from an earlier TC.
+    old_allow = set(tools_cfg.get("agentToAgent", {}).get("allow", []))
     tools_cfg["agentToAgent"] = {
         "enabled": True,
-        "allow": sorted(registered_ids),
+        "allow": sorted(old_allow | registered_ids),
     }
     tools_cfg.setdefault("sessions", {})["visibility"] = "all"
 
@@ -1260,8 +1263,11 @@ async def _execute_tc_async(
                     # Single-agent: no agentToAgent chains, short wait suffices
                     await asyncio.sleep(0.3)
                 else:
-                    # Multi-agent: wait for any agentToAgent cascade to complete
-                    await _wait_mock_quiescence(mock_server, slot_id=slot_suffix or "default")
+                    # Multi-agent: wait for any agentToAgent cascade to complete.
+                    # With sessions_send(timeout=300s) per hop, cascades can still
+                    # be running after execute() returns — give them extra time.
+                    await _wait_mock_quiescence(mock_server, max_wait_s=30.0, quiet_s=3.0,
+                                                slot_id=slot_suffix or "default")
                 event_tool_calls = mock_server.get_log(slot_id=slot_suffix or "default")
                 _mock_tool_calls = len(event_tool_calls)
 
@@ -1865,6 +1871,16 @@ async def _run_all_tcs_concurrent(
                                 _bsp = ws_dir / "BOOTSTRAP.md"
                                 if _bsp.exists():
                                     _bsp.write_text(_bs_stub)
+                                # Clear agent-written memory summaries to prevent cross-TC
+                                # contamination: OpenClaw writes session summaries to memory/
+                                # after each run; shared agent names (e.g. zapier-table used
+                                # by 24 TCs) accumulate memories from earlier TCs and confuse
+                                # the LLM about the current task.
+                                mem_dir = ws_dir / "memory"
+                                if mem_dir.is_dir():
+                                    for mf in mem_dir.iterdir():
+                                        if mf.is_file():
+                                            mf.unlink(missing_ok=True)
 
                             mod_type_str = tc.modifications[0].mod_type.value if tc.modifications else "none"
                             tqdm.write(f"\n  {tc.id}[{mod_type_str}] run={run_idx} [slot={slot}]")
