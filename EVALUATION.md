@@ -155,11 +155,12 @@ tools:
 
 #### Test case selection and debugging
 
-**`--tc N [N2 ...]`** — Run specific test cases by 1-based index or ID:
+**`--tc N [N2 ...]`** — Run specific test cases by 1-based index, ID, or `sample_id`:
 - `--tc 3` — run test case at position 3
 - `--tc 1 3 5` — run test cases 1, 3, and 5
 - `--tc TC007 TC015` — run test cases by ID
-- `--tc 2 TC010 5` — mix indices and IDs
+- `--tc S001` — run all TCs that share `sample_id == "S001"` (all mod-type variants of the same sample)
+- `--tc 2 TC010 S003` — mix indices, IDs, and sample IDs
 
 Overrides `--limit`. Useful for isolating flaky or incomplete test cases.
 
@@ -343,6 +344,8 @@ See [`docker/README.md`](docker/README.md) for full setup details: bind-mount me
 | `--limit`, `-n` | First N test cases only | First N test cases only |
 | `--tc` | Specific test cases by 1-based index or ID (overrides `--limit`) | Same |
 | `--steps-only` | Run only steps; skip modifications and events | N/A |
+| `--modifications N` | Limit to the first N modifications; events referencing later mods are skipped | Same |
+| `--concurrency N` | Fire N events concurrently per mod window (0 = sequential, default). Requires TCs with `concurrent_group` fields. | N/A |
 | `--reuse-steps` / `--no-reuse-steps` | Run steps once per sample; reuse state across variants (saves ~6× step cost). **Default: on.** | N/A |
 | `--debug-messages` | Print messages exchanged between LLM-objects | N/A |
 | `--mock-config` | YAML file(s) with shared mock tool definitions (repeatable) | N/A |
@@ -377,6 +380,100 @@ Key metrics in `EvalSummary`:
 | `mean_mod_latency_ms` | Average latency per modification |
 
 Per-test-case results (`TestCaseResult` lines) include per-event pass/fail with reasoning, token costs, the `expected` assertion condition, and the `evidence` text that was presented to the judge.
+
+## Generating Test Cases
+
+Test cases are generated from validated samples in `data/zapier/samples.jsonl`. The generation script produces JSONL files in `data/zapier/`.
+
+### Basic usage
+
+```bash
+python -m src.data.generate_test_cases \
+  -i data/zapier/samples.jsonl \
+  -o data/zapier/test_cases__1mod.jsonl \
+  --model gpt-4o \
+  --workers 4
+```
+
+### Flavours
+
+Different flavours are generated from the same base samples by varying the key parameters:
+
+| Flavour | Command | Events per TC |
+|---|---|---|
+| 1 mod (baseline) | `--mods-per-scenario 1` | ~4 |
+| 3 mods | `--mods-per-scenario 3` | ~8 |
+| 3 mods + concurrency | `--mods-per-scenario 3 --concurrent-events 3` | ~8 + 6 concurrent groups |
+
+### Generation parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--mods-per-scenario N` | 1 | Modifications per scenario. Each mod refines the previous one. |
+| `--events-before N` | 1 | Baseline events before the first modification (`pre_mod`). |
+| `--events-inter-mod N` | 1 | Events per gap between consecutive modifications (`post_mod`). |
+| `--events-after N` | 2 | Events after the last modification (`post_mod`). |
+| `--events-unrelated N` | = mods | Irrelevant events, one per modification window. |
+| `--concurrent-events N` | 0 | Events per concurrent group per mod window (0 = no concurrent groups). When >0, generates `cgroup_pre_{mod_id}` and `cgroup_post_{mod_id}` groups: 1 relevant + N-1 irrelevant events each. |
+| `--scenario-count N` | 1 | Scenarios per (sample, mod-type) pair. |
+| `--mod-type TYPE` | all | Modification type: `temporal`, `contextual`, `exception`, `correction`, `expansion`, `removal`, `mixed`. Default generates all types. |
+| `--ambiguity LEVEL` | random | Ambiguity level for modification intents: `precise`, `semantic`, `vague`, `implicit`, `random`. |
+| `--workers N` | 1 | Parallel workers. One per (sample, mod-type) unit. Safe up to ~12 with Anthropic/OpenAI. |
+
+### Concurrency experiment
+
+Generate once with N concurrent events, evaluate with different C values without re-generating:
+
+```bash
+# Generate with 4 concurrent events per group
+python -m src.data.generate_test_cases \
+  -i data/zapier/samples.jsonl \
+  -o data/zapier/test_cases__3mod_conc4.jsonl \
+  --mods-per-scenario 3 --concurrent-events 4 --model gpt-4o --workers 4
+
+# Evaluate: sequential baseline
+python -m src.data.evaluate -i data/zapier/test_cases__3mod_conc4.jsonl \
+  --concurrency 0 --model gpt-4o
+
+# Evaluate: 2 concurrent events (sampled from 4)
+python -m src.data.evaluate -i data/zapier/test_cases__3mod_conc4.jsonl \
+  --concurrency 2 --seed 42 --model gpt-4o
+
+# Evaluate: all 4 concurrent events
+python -m src.data.evaluate -i data/zapier/test_cases__3mod_conc4.jsonl \
+  --concurrency 4 --seed 42 --model gpt-4o
+```
+
+`--seed` controls which C events are sampled from each group of N. The same seed always picks the same subset — different seeds explore different subsets.
+
+### Evaluation-time slicing: `--modifications` and `--concurrency`
+
+These two flags let you re-use the same generated file at different evaluation granularities without regenerating.
+
+**`--modifications N`** — Limit evaluation to the first N modifications per TC. Events whose `after_mod_ids` reference mods beyond N are automatically excluded. This lets you evaluate a 3-mod file as a 1-mod or 2-mod run:
+
+```bash
+# Full 3-mod evaluation
+python -m src.data.evaluate -i data/zapier/test_cases__3mod.jsonl --model gpt-4o
+
+# Same file, evaluated as 1-mod only
+python -m src.data.evaluate -i data/zapier/test_cases__3mod.jsonl --modifications 1 --model gpt-4o
+
+# Same for the baseline
+python -m src.data.evaluate_baseline -i data/zapier/test_cases__3mod.jsonl --modifications 1 --model gpt-4o
+```
+
+**`--concurrency N`** (LNL only) — Fire N events concurrently per modification window. Requires TCs generated with `--concurrent-events`. With `--concurrency 0` (default), concurrent groups are ignored entirely and each event fires sequentially, identical to files without concurrent groups:
+
+```bash
+# Sequential (default)
+python -m src.data.evaluate -i data/zapier/test_cases__3mod_conc4.jsonl --concurrency 0 --model gpt-4o
+
+# Fire 2 concurrent events per group (sampled from the 4 generated)
+python -m src.data.evaluate -i data/zapier/test_cases__3mod_conc4.jsonl --concurrency 2 --seed 42 --model gpt-4o
+```
+
+Both flags compose: `--modifications 1 --concurrency 2` evaluates only the first modification and fires at most 2 concurrent events around it.
 
 ## Analysis
 

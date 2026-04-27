@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,7 +30,7 @@ load_dotenv()
 
 from src.data.schema import (
     Sample, Scenarios, TestCase, Modification, ModType, Ambiguity,
-    Event, EventExpect, EventExpectations,
+    Event, EventExpect, EventExpectations, ConcurrentGroupEvents,
 )
 from src.data.llm import create_llm
 from src.data.utils import (
@@ -122,6 +123,7 @@ def format_prompt(
     events_before: int,
     events_after: int,
     events_unrelated: int,
+    events_inter_mod: int,
     modification_type: str,
     modification_type_description: str,
     mods_per_scenario: int,
@@ -136,6 +138,7 @@ def format_prompt(
         "EVENTS_BEFORE_COUNT": str(events_before),
         "EVENTS_AFTER_COUNT": str(events_after),
         "EVENTS_UNRELATED_COUNT": str(events_unrelated),
+        "EVENTS_INTER_MOD_COUNT": str(events_inter_mod),
         "MODIFICATION_TYPE": modification_type,
         "MODIFICATION_TYPE_DESCRIPTION": modification_type_description,
         "MODS_PER_SCENARIO": str(mods_per_scenario),
@@ -188,9 +191,14 @@ def _rewrite_event_expectations(llm, test_case: TestCase, sample: Sample) -> Non
         for m in test_case.modifications
     ) or "(none)"
 
+    mod_ids_set = {m.id for m in test_case.modifications}
     event_lines_parts = []
     for e in test_case.events:
-        active = _active_mods_for(e.when, test_case.modifications)
+        # Prefer after_mod_ids when populated; fall back to timestamp inference
+        if e.after_mod_ids:
+            active = [mid for mid in e.after_mod_ids if mid in mod_ids_set]
+        else:
+            active = _active_mods_for(e.when, test_case.modifications)
         mod_note = f" [active modifications: {', '.join(active)}]" if active else " [no modifications active — use baseline behavior]"
         event_lines_parts.append(
             f"{e.id} | {e.when}{mod_note} | recipient={e.recipient} | input: {e.input}"
@@ -219,6 +227,139 @@ def _rewrite_event_expectations(llm, test_case: TestCase, sample: Sample) -> Non
         if evt.id in expect_map:
             item = expect_map[evt.id]
             evt.expect = EventExpect(action=item.action, reason=item.reason)
+
+
+_CONCURRENT_EVENTS_PROMPT_PATH = (
+    Path(__file__).parent.parent.parent
+    / "config" / "prompts" / "data-gen" / "generate_concurrent_events.yaml"
+)
+
+
+def _next_event_id(events: list[Event]) -> int:
+    """Return the next available E{NNN} integer after all existing event IDs."""
+    nums = [int(m.group(1)) for e in events if (m := re.match(r"E(\d+)$", e.id))]
+    return max(nums, default=0) + 1
+
+
+def _generate_concurrent_group(
+    llm,
+    sample: Sample,
+    tc: TestCase,
+    mod: Modification,
+    group_type: str,   # "pre" or "post"
+    n: int,
+    start_id: int,
+) -> list[Event]:
+    """Generate N concurrent events for one (mod, group_type) pair via a focused LLM call.
+
+    group_type="pre"  → cgroup_pre_{mod.id}: fires before the mod (1 pre_mod + n-1 irrelevant)
+    group_type="post" → cgroup_post_{mod.id}: fires after the mod settles (1 post_mod + n-1 irrelevant)
+    """
+    import yaml as _yaml
+    with open(_CONCURRENT_EVENTS_PROMPT_PATH) as f:
+        prompt_template = _yaml.safe_load(f)["prompt"]
+
+    group_name = f"cgroup_{group_type}_{mod.id}"
+    role = "pre_mod" if group_type == "pre" else "post_mod"
+
+    # Active mod IDs for the relevant event's after_mod_ids
+    mod_index = next((i for i, m in enumerate(tc.modifications) if m.id == mod.id), 0)
+    after_mod_ids: list[str] = (
+        [] if group_type == "pre"
+        else [m.id for m in tc.modifications[:mod_index + 1]]
+    )
+    after_mod_ids_str = "[]" if not after_mod_ids else str(after_mod_ids).replace("'", '"')
+
+    role_description = (
+        "before the modification fires — use baseline system behavior (no mods active)"
+        if group_type == "pre"
+        else "after the modification has settled — the change must be reflected in the outcome"
+    )
+
+    existing_inputs = "\n".join(
+        f"- [{e.role}] {e.input[:120]}"
+        for e in tc.events
+        if not e.concurrent_group
+    ) or "(none)"
+
+    # Format sample summary (objects + steps)
+    sample_str = format_sample(sample)
+
+    prompt = (
+        prompt_template
+        .replace("{SAMPLE}", sample_str)
+        .replace("{MOD_TARGET}", mod.target)
+        .replace("{MOD_INTENT}", mod.intent)
+        .replace("{GROUP_NAME}", group_name)
+        .replace("{ROLE}", role)
+        .replace("{ROLE_DESCRIPTION}", role_description)
+        .replace("{AFTER_MOD_IDS}", after_mod_ids_str)
+        .replace("{N}", str(n))
+        .replace("{N_IRRELEVANT}", str(n - 1))
+        .replace("{WHEN}", mod.when)
+        .replace("{START_ID}", str(start_id))
+        .replace("{EXISTING_EVENTS}", existing_inputs)
+    )
+
+    result = generate_with_retries(
+        llm=llm,
+        prompt=prompt,
+        response_model=ConcurrentGroupEvents,
+        item_id=f"{tc.id}-{group_name}",
+        validator=lambda r: len(r.events) > 0,
+    )
+    if not result:
+        return []
+
+    # Convert GeneratedEvents → Events, enforce correct metadata, assign sequential IDs
+    out: list[Event] = []
+    for i, ge in enumerate(result.events):
+        d = ge.model_dump()
+        d["id"] = f"E{start_id + i:03d}"
+        d["concurrent_group"] = group_name
+        d["expect"] = None   # filled by _rewrite_event_expectations
+        d["triggered_by"] = None
+        # enforce role and after_mod_ids per position in the group
+        if i == 0:
+            d["role"] = role
+            d["after_mod_ids"] = after_mod_ids
+        else:
+            d["role"] = "irrelevant"
+            d["after_mod_ids"] = []
+        out.append(Event(**d))
+    return out
+
+
+def _add_concurrent_events_to_tc(llm, sample: Sample, tc: TestCase, n: int, workers: int = 1) -> None:
+    """Generate concurrent groups for all mods in tc and append to tc.events (mutates in place).
+
+    All groups are generated in parallel (one LLM call per group) using pre-assigned IDs
+    so parallel generation doesn't race on tc.events.
+    """
+    groups = [
+        (mod, group_type)
+        for mod in tc.modifications
+        for group_type in ("pre", "post")
+    ]
+    if not groups:
+        return
+
+    # Pre-assign start IDs: each group gets exactly n event slots
+    base_id = _next_event_id(tc.events)
+    start_ids = {(mod.id, gt): base_id + i * n for i, (mod, gt) in enumerate(groups)}
+
+    def _gen(mod_gt):
+        mod, gt = mod_gt
+        return _generate_concurrent_group(llm, sample, tc, mod, gt, n, start_ids[(mod.id, gt)])
+
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(groups))) as pool:
+            results = list(pool.map(_gen, groups))
+    else:
+        results = [_gen(g) for g in groups]
+
+    for new_events in results:
+        tc.events.extend(new_events)
 
 
 def scenario_to_test_case(
@@ -314,8 +455,26 @@ Examples:
     parser.add_argument(
         "--events-unrelated",
         type=int,
+        default=None,
+        help="Number of events unaffected by modifications (default: mods-per-scenario, i.e. one per mod)",
+    )
+    parser.add_argument(
+        "--events-inter-mod",
+        type=int,
         default=1,
-        help="Number of events unaffected by modification (default: 1)",
+        help="Number of events per gap between consecutive modifications (default: 1)",
+    )
+    parser.add_argument(
+        "--concurrent-events",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of events per concurrent group per modification window (default: 0 = none). "
+            "When >0, generates a pre-mod and post-mod concurrent group for each modification: "
+            "1 relevant event + N-1 irrelevant events tagged with concurrent_group. "
+            "Use --concurrency at eval time to control how many actually fire concurrently."
+        ),
     )
     parser.add_argument(
         "--mod-type",
@@ -395,11 +554,17 @@ def run(args: argparse.Namespace) -> Path:
 
     print(f"Loaded {len(samples)} samples from {args.input}")
 
-    # Setup output and determine completed items
-    # Key by sample.id (unique per generated sample). Test case IDs are "{sample_id}-TC{NNN}",
-    # so we strip the trailing "-TC{NNN}" suffix to recover the sample ID.
-    # Using 'link' would collide when --samples-per-template > 1 generates multiple samples
-    # from the same template (they share the same link).
+    # Determine which modification types to generate
+    # Concrete mod types (excluding "mixed") for random sampling
+    concrete_mod_types = [k for k in MODIFICATION_TYPES.keys() if k != "mixed"]
+    if args.mod_type:
+        mod_types_to_generate = [args.mod_type]
+    else:
+        mod_types_to_generate = concrete_mod_types
+
+    # Setup output and determine completed items.
+    # TC IDs are "{sample_id}-{mod_type}-TC{NNN}", so stripping "-TC{NNN}" gives
+    # "{sample_id}-{mod_type}" — the natural completion key for each (sample, mod_type) pair.
     completed, file_mode = setup_output(
         args.output,
         args.force,
@@ -409,24 +574,27 @@ def run(args: argparse.Namespace) -> Path:
         ),
     )
 
-    pending = [s for s in samples if s.id not in completed]
+    # Flatten (sample, mod_type) work units, skipping already-completed pairs.
+    # completed keys are "{sample_id}-{mod_type}", so check at that granularity.
+    work_units = [
+        (sample, mod_type)
+        for sample in samples
+        for mod_type in mod_types_to_generate
+        if f"{sample.id}-{mod_type}" not in completed
+    ]
 
-    if not pending:
+    if not work_units:
         print("All samples already generated. Use --force to regenerate.")
+        # Still run concurrent events pass if requested.
+        if args.concurrent_events > 0:
+            _run_concurrent_events_pass(args, samples)
         return args.output
 
+    total_units = len(samples) * len(mod_types_to_generate)
     if completed:
-        print(f"Resuming: {len(completed)} already completed, {len(pending)} remaining")
+        print(f"Resuming: {len(completed)} already completed, {len(work_units)} remaining")
     else:
-        print(f"Processing {len(pending)} samples")
-
-    # Determine which modification types to generate
-    # Concrete mod types (excluding "mixed") for random sampling
-    concrete_mod_types = [k for k in MODIFICATION_TYPES.keys() if k != "mixed"]
-    if args.mod_type:
-        mod_types_to_generate = [args.mod_type]
-    else:
-        mod_types_to_generate = concrete_mod_types
+        print(f"Processing {len(work_units)} work units")
 
     # Concrete ambiguity values for random sampling
     ambiguity_values = [a.value for a in Ambiguity]
@@ -440,7 +608,7 @@ def run(args: argparse.Namespace) -> Path:
             "Scenario count": str(args.scenario_count),
             "Modification types": ", ".join(mod_types_to_generate),
             "Ambiguity": args.ambiguity,
-            "Events": f"{args.events_before} before, {args.events_after} after, {args.events_unrelated} unrelated",
+            "Events": f"{args.events_before} before, {args.events_inter_mod} inter-mod, {args.events_after} after, {args.events_unrelated or args.mods_per_scenario} unrelated",
             "Workers": str(workers),
         },
     )
@@ -458,13 +626,6 @@ def run(args: argparse.Namespace) -> Path:
     success_count = 0
     fail_count = 0
     write_lock = threading.Lock()
-
-    # Flatten (sample, mod_type) work units
-    work_units = [
-        (sample, mod_type)
-        for sample in pending
-        for mod_type in mod_types_to_generate
-    ]
 
     def _process_unit(sample: Sample, mod_type: str) -> list[TestCase]:
         """Generate test cases for one (sample, mod_type) pair."""
@@ -489,13 +650,15 @@ def run(args: argparse.Namespace) -> Path:
             ambiguity_constraint = args.ambiguity
         ambiguity_description = AMBIGUITY_DESCRIPTIONS[ambiguity_constraint]
 
+        events_unrelated = args.events_unrelated if args.events_unrelated is not None else args.mods_per_scenario
         prompt = format_prompt(
             prompt_template,
             sample,
             args.scenario_count,
             args.events_before,
             args.events_after,
-            args.events_unrelated,
+            events_unrelated,
+            args.events_inter_mod,
             modification_type=mod_type_label,
             modification_type_description=mod_description,
             mods_per_scenario=args.mods_per_scenario,
@@ -515,7 +678,7 @@ def run(args: argparse.Namespace) -> Path:
             return []
 
         scenarios = result.scenarios[:args.scenario_count]
-        return [
+        test_cases = [
             scenario_to_test_case(
                 sample, scenario, i,
                 mod_types=[ModType(mt) for mt in resolved_mod_types],
@@ -523,6 +686,9 @@ def run(args: argparse.Namespace) -> Path:
             )
             for i, scenario in enumerate(scenarios, start=1)
         ]
+        for tc in test_cases:
+            _rewrite_event_expectations(llm, tc, sample)
+        return test_cases
 
     with open(args.output, file_mode) as f:
         with tqdm(total=len(work_units), desc="Generating test cases") as pbar:
@@ -552,7 +718,130 @@ def run(args: argparse.Namespace) -> Path:
     print()
     print(f"Complete. Output: {args.output}")
     print(f"Test cases generated: {success_count} (failed: {fail_count})")
+
+    # Concurrent events pass — runs after scenario generation (or on continuation).
+    # Loads all TCs from the output file, adds concurrent groups to any TC that is missing
+    # them, and writes the file back in place. Safe to re-run: TCs that already have
+    # concurrent groups are skipped.
+    if args.concurrent_events > 0:
+        _run_concurrent_events_pass(args, samples)
+
     return args.output
+
+
+def _run_concurrent_events_pass(args: argparse.Namespace, samples: list[Sample]) -> None:
+    """Add concurrent groups to all TCs in the output file that don't have them yet."""
+    import json as _json
+    from src.data.llm import create_llm as _create_llm
+
+    n = args.concurrent_events
+    output_path = args.output
+    sample_map = {s.id: s for s in samples}
+
+    # Load all lines; deduplicate TCs keeping the last occurrence of each ID.
+    raw_lines: list[str] = []
+    seen_ids: dict[str, int] = {}   # tc_id → last line index
+
+    with open(output_path) as f:
+        for i, line in enumerate(f):
+            line = line.rstrip("\n")
+            raw_lines.append(line)
+            if not line:
+                continue
+            try:
+                d = _json.loads(line)
+                if "id" in d and "events" in d:
+                    seen_ids[d["id"]] = i
+            except Exception:
+                pass
+
+    # Build deduplicated TC list (one entry per unique ID, at its last line position)
+    tcs: list[tuple[int, TestCase]] = []
+    for tc_id, idx in seen_ids.items():
+        try:
+            tc = TestCase.model_validate(_json.loads(raw_lines[idx]))
+            tcs.append((idx, tc))
+        except Exception:
+            pass
+
+    n_dupes = len(raw_lines) - len(tcs)
+    if n_dupes > 0:
+        print(f"Deduplicating: {len(raw_lines)} lines → {len(tcs)} unique TCs ({n_dupes} duplicates removed)")
+
+    def _has_correct_groups(tc: TestCase) -> bool:
+        """True when tc already has correctly-named cgroup_pre/post groups for every mod."""
+        expected = {f"cgroup_{gt}_{mod.id}" for mod in tc.modifications for gt in ("pre", "post")}
+        actual = {e.concurrent_group for e in tc.events if e.concurrent_group}
+        return expected.issubset(actual)
+
+    needs_conc = [(i, tc) for i, tc in tcs if not _has_correct_groups(tc)]
+    if not needs_conc:
+        print("Concurrent events: all TCs already have concurrent groups.")
+        _write_deduped(output_path, raw_lines, seen_ids)
+        return
+
+    workers = getattr(args, "workers", 1)
+    print(f"Concurrent events pass: {len(needs_conc)} TCs need concurrent groups "
+          f"({n} events/group, {workers} workers)")
+
+    llm = _create_llm(model=args.model, provider=args.provider)
+    write_lock = threading.Lock()
+    done = 0
+    failed = 0
+
+    def _process_one(item: tuple[int, TestCase]) -> tuple[int, TestCase]:
+        idx, tc = item
+        sample = sample_map.get(tc.sample_id) or Sample(
+            id=tc.sample_id or tc.id, name=tc.name, domain=tc.domain,
+            source_type=tc.source_type, link=tc.link,
+            raw_steps=[s.text for s in tc.steps], objects=tc.objects,
+            steps=tc.steps, mock_tools=tc.mock_tools,
+        )
+        _add_concurrent_events_to_tc(llm, sample, tc, n, workers=1)
+        _rewrite_event_expectations(llm, tc, sample)
+        return idx, tc
+
+    with open(output_path, "a") as append_f:
+        with tqdm(total=len(needs_conc), desc="Adding concurrent events") as pbar:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_process_one, item): item for item in needs_conc}
+                for future in as_completed(futures):
+                    try:
+                        idx, tc = future.result()
+                        line = tc.model_dump_json()
+                        with write_lock:
+                            # Append immediately so progress survives interruption.
+                            # The final dedup step keeps only the last occurrence.
+                            append_f.write(line + "\n")
+                            append_f.flush()
+                            raw_lines[idx] = line
+                        done += 1
+                    except Exception as e:
+                        _, orig_tc = futures[future]
+                        tqdm.write(f"  WARN: {orig_tc.id}: {e}", file=sys.stderr)
+                        failed += 1
+                    pbar.update(1)
+
+    # Collapse duplicates now that all appends are done
+    _write_deduped(output_path, raw_lines, seen_ids)
+    print(f"Concurrent events pass: {done} updated, {failed} failed. Written to {output_path}")
+
+
+def _write_deduped(output_path: Path, raw_lines: list[str], seen_ids: dict[str, int]) -> None:
+    """Write output keeping only the last occurrence of each TC ID."""
+    import json as _json
+    canonical: set[int] = set(seen_ids.values())
+    with open(output_path, "w") as f:
+        for i, line in enumerate(raw_lines):
+            if not line:
+                continue
+            try:
+                d = _json.loads(line)
+                if "id" in d and "events" in d and i not in canonical:
+                    continue   # skip duplicate
+            except Exception:
+                pass
+            f.write(line + "\n")
 
 
 def main():

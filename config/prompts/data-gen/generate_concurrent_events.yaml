@@ -1,0 +1,65 @@
+prompt: |
+  # Task: Generate Concurrent Events
+
+  You are generating a small burst of external triggers that arrive **simultaneously** at one point
+  in an automation workflow. These model realistic concurrent load — multiple external systems
+  firing at the same moment.
+
+  ---
+
+  ## Automation Sample
+
+  {SAMPLE}
+
+  ---
+
+  ## Modification in effect
+
+  **Target object:** {MOD_TARGET}
+  **Change:** {MOD_INTENT}
+
+  ---
+
+  ## Existing events (generate DISTINCT inputs — do not repeat these)
+
+  {EXISTING_EVENTS}
+
+  ---
+
+  ## Your task
+
+  Generate exactly {N} events, all tagged `concurrent_group: "{GROUP_NAME}"`, that arrive at `{WHEN}`.
+
+  ### Event 1 — the relevant trigger (`role: {ROLE}`)
+
+  This event tests the automation {ROLE_DESCRIPTION}.
+  - `role: {ROLE}`
+  - `after_mod_ids: {AFTER_MOD_IDS}`
+  - Input must be a realistic external trigger of the same kind as the existing events above.
+  - It must carry all data the downstream chain needs (identifiers, outcomes, context).
+
+  ### Events 2–{N} — irrelevant triggers (`role: irrelevant`)
+
+  These test that unrelated automation paths are **not** affected by the modification above.
+  Write inputs that exercise parts of the system that the modification does NOT touch.
+  They must be meaningfully unrelated to: "{MOD_INTENT}"
+  - `role: irrelevant`
+  - `after_mod_ids: []`
+
+  ---
+
+  ## Rules
+
+  - `recipient`: always the entry-point object (the one that receives external triggers directly).
+    It must be an object whose `event_sources` list is non-empty.
+  - `call_type`: always `"send_event"`
+  - `source`: `"__external__"` for system events, `"__user__"` for user messages
+  - All {N} events share the same `when: "{WHEN}"` timestamp
+  - IDs must be sequential starting at `E{START_ID}`
+  - Do NOT include an `expect` field — expectations are written in a separate pass
+
+  ---
+
+  ## Output
+
+  Return a JSON object with an `events` array containing exactly {N} `GeneratedEvent` objects.

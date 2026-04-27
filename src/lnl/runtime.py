@@ -313,6 +313,31 @@ class Runtime:
             return item.results
         return self._dispatch([msg])
 
+    def send_many(
+        self,
+        items: list[tuple[str, str, str]],
+    ) -> list[ProcessingResult]:
+        """Dispatch multiple messages simultaneously in one transaction.
+
+        All messages are delivered to the bus before waiting for the wave to
+        settle, achieving true concurrent processing within a single dispatch.
+
+        Args:
+            items: list of (recipient, content, sender) tuples.
+        """
+        messages = [
+            Message(
+                sender=sender,
+                recipient=recipient,
+                type=MessageType.DOMAIN,
+                content=content,
+                depth_remaining=self._max_chain_depth,
+                id=self._next_msg_id(sender),
+            )
+            for recipient, content, sender in items
+        ]
+        return self._dispatch(messages)
+
     def process_pending(self) -> list[ProcessingResult]:
         """Process all pending mailbox messages and polled events until committed."""
         if self._running.is_set():

@@ -38,6 +38,13 @@ class Event(BaseModel):
     # pre_mod:    fires before the modification; tests that baseline behavior is unaffected
     # post_mod:   fires after the modification; tests that the system correctly reflects the change
     # irrelevant: fires at any time; tests functionality unrelated to the modification
+    after_mod_ids: list[str] = Field(default_factory=list)
+    # IDs of modifications that must have fired before this event is evaluated.
+    # Empty → baseline (no mods active). Supersedes role-based inference for multi-mod scenarios.
+    concurrent_group: Optional[str] = None
+    # If set, this event belongs to a named concurrent group (e.g. "cgroup_pre_M001").
+    # Events in the same group are dispatched together in one transaction at eval time.
+    # Excluded from the main timeline sort; fired via the concurrent dispatch path instead.
 
 
 class GeneratedEvent(BaseModel):
@@ -52,6 +59,8 @@ class GeneratedEvent(BaseModel):
     trigger_delay_minutes: float = 0.0
     trigger_delay_seconds: float = 0.0
     role: Optional[Literal["pre_mod", "post_mod", "irrelevant"]] = None
+    after_mod_ids: list[str] = Field(default_factory=list)
+    concurrent_group: Optional[str] = None
 
 
 class EventExpectationItem(BaseModel):
@@ -62,6 +71,12 @@ class EventExpectationItem(BaseModel):
 
 class EventExpectations(BaseModel):
     expectations: list[EventExpectationItem]
+
+
+class ConcurrentGroupEvents(BaseModel):
+    """LLM output for a concurrent event group — one focused generation call per group."""
+    events: list[GeneratedEvent]
+
 
 class GeneratedModification(BaseModel):
     """LLM output schema — mod_type and ambiguity are set by the script, not the LLM."""
@@ -364,6 +379,11 @@ class EvalSummary(BaseModel):
     mean_mod_input_tokens: float
     mean_mod_output_tokens: float
     mean_mod_latency_ms: float
+    # ── Token totals ───────────────────────────────────────────────────────────
+    total_agent_input_tokens: int = 0
+    total_agent_output_tokens: int = 0
+    total_judge_input_tokens: int = 0
+    total_judge_output_tokens: int = 0
 
 
 # ── Mock external system schemas (OpenClaw baseline) ─────────────────────────

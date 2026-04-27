@@ -331,6 +331,9 @@ def _execute_test_case_inner(
     on_raw_event=None,
     steps_snapshot: "Optional[StepsSnapshot]" = None,
     snapshot_out: "Optional[list]" = None,
+    concurrency: int = 0,
+    concurrency_seed: int = 42,
+    max_modifications: Optional[int] = None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase and return event + modification results."""
     from src.lnl.gateway import EventGateway
@@ -394,6 +397,9 @@ def _execute_test_case_inner(
         trigger_map=trigger_map,
         on_event_result=on_event_result,
         on_mod_applied=on_mod_applied,
+        concurrency=concurrency,
+        concurrency_seed=concurrency_seed,
+        max_modifications=max_modifications,
     )
 
 
@@ -435,6 +441,39 @@ def _format_prior_state(rt) -> str:
     return "\n\n".join(lines)
 
 
+def _format_active_mods(modifications) -> str:
+    """Format active modifications as a context block for the judge.
+
+    'Later modifications supersede earlier ones where they overlap' is stated
+    explicitly so the judge reasons against the cumulative, ordered state.
+    """
+    if not modifications:
+        return ""
+    lines = ["=== ACTIVE MODIFICATIONS (applied in order; later ones supersede earlier where they overlap) ==="]
+    for i, m in enumerate(modifications, 1):
+        lines.append(f"[{i}] {m.id} → {m.target}: {m.intent}")
+    return "\n".join(lines)
+
+
+def _build_event_ctx(event, modifications, prior_context: str) -> str:
+    """Build the full judge context string for one event.
+
+    Uses event.after_mod_ids when populated; falls back to timestamp-based
+    inference for old test cases that lack the field.
+    """
+    mod_by_id = {m.id: m for m in modifications}
+    if event.after_mod_ids:
+        active = [mod_by_id[mid] for mid in event.after_mod_ids if mid in mod_by_id]
+    else:
+        # Backward-compat: infer from timestamp ordering
+        ek = parse_when(event.when)
+        active = [m for m in modifications if parse_when(m.when) <= ek]
+    mods_ctx = _format_active_mods(active)
+    if mods_ctx and prior_context:
+        return f"{mods_ctx}\n\n{prior_context}"
+    return mods_ctx or prior_context
+
+
 def _snapshot_logs(mock_executors: list) -> list[int]:
     return [len(ex.call_log) for ex in mock_executors]
 
@@ -457,6 +496,9 @@ def _run_test_case_timeline(
     on_mod_applied=None,    # callable(Modification)
     steps_snapshot: "Optional[StepsSnapshot]" = None,   # restore from this; skip step execution
     snapshot_out: "Optional[list]" = None,              # append StepsSnapshot here after steps
+    concurrency: int = 0,       # number of concurrent events per group (0 = sequential)
+    concurrency_seed: int = 42, # seed for sampling concurrent events from each group
+    max_modifications: Optional[int] = None,  # limit to first N modifications (None = all)
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Execute steps and timeline events against a live runtime."""
     event_results: list[EventResult] = []
@@ -533,14 +575,33 @@ def _run_test_case_timeline(
 
     tmap = trigger_map or {}
 
+    # Apply --modifications N: limit to first N modifications and filter events.
+    active_mods = tc.modifications[:max_modifications] if max_modifications is not None else tc.modifications
+    allowed_mod_ids: set[str] = {m.id for m in active_mods}
+
+    def _event_in_scope(evt) -> bool:
+        """Event is in scope if all its after_mod_ids refer to allowed mods."""
+        return all(mid in allowed_mod_ids for mid in (evt.after_mod_ids or []))
+
+    # Build concurrent group map: group_name → ordered list of events.
+    # Concurrent events are excluded from the main timeline and fired as batches
+    # around their associated modification (when concurrency > 0).
+    group_map: dict[str, list] = {}
+    concurrent_event_ids: set[str] = set()
+    if concurrency > 0:
+        for evt in tc.events:
+            if evt.concurrent_group and _event_in_scope(evt):
+                group_map.setdefault(evt.concurrent_group, []).append(evt)
+                concurrent_event_ids.add(evt.id)
+
     # 3. Build sorted timeline: tag each item with its type and when-ordinal.
-    # Triggered events are dispatched as reactions after their parent fires —
-    # exclude them from the main timeline ordering.
+    # Triggered events and concurrent-group events are excluded from the main
+    # timeline ordering — they are dispatched via their own mechanisms.
     timeline: list[tuple[int, str, object]] = []
-    for mod in tc.modifications:
+    for mod in active_mods:
         timeline.append((parse_when(mod.when), "mod", mod))
     for evt in tc.events:
-        if evt.triggered_by is None:
+        if evt.triggered_by is None and evt.id not in concurrent_event_ids and _event_in_scope(evt):
             timeline.append((parse_when(evt.when), "event", evt))
     timeline.sort(key=lambda x: x[0])
 
@@ -597,10 +658,56 @@ def _run_test_case_timeline(
                 judge_votes=votes,
             ))
 
+    def _dispatch_concurrent_group(group: list, ctx: str, group_key: str = "") -> None:
+        """Dispatch a sampled subset of a concurrent group in one transaction.
+
+        Samples `concurrency` events from `group` using a deterministic seed
+        derived from the base seed, TC id, and group name — so the same C events
+        are always chosen for a given (TC, seed, group) triple.
+        """
+        if not group:
+            return
+        import random as _random
+        if concurrency >= len(group):
+            batch = list(group)
+        else:
+            rng = _random.Random(f"{concurrency_seed}:{tc.id}:{group_key}")
+            batch = rng.sample(group, concurrency)
+        log_snap = len(rt.message_log)
+        exec_s = _snapshot_logs(execs)
+        t0 = time.monotonic()
+
+        if all(e.call_type == "send_event" for e in batch):
+            items = [
+                (e.recipient, json.dumps({"system": e.source, "content": e.input}), e.source)
+                for e in batch
+            ]
+            res, tout = _run_with_timeout(lambda its=items: gw.dispatch_many(its), timeout_s)
+        else:
+            items = [(e.recipient, e.input, e.source) for e in batch]
+            res, tout = _run_with_timeout(lambda its=items: rt.send_many(its), timeout_s)
+
+        lat_ms = (time.monotonic() - t0) * 1000
+        new_calls = _new_tool_calls(execs, exec_s)
+
+        for evt in batch:
+            evt_ctx = _build_event_ctx(evt, active_mods, ctx)
+            _record_event_result(evt, res or [], tout, lat_ms, log_snap, exec_s, evt_ctx)
+            if on_event_result:
+                on_event_result(event_results[-1], False)
+
     for _, kind, item in timeline:
         if kind == "mod":
             if on_mod_applied:
                 on_mod_applied(item)
+
+            # pre-mod concurrent group fires before the modification
+            if concurrency > 0:
+                pre_key = f"cgroup_pre_{item.id}"
+                pre_group = group_map.get(pre_key, [])
+                _dispatch_concurrent_group(pre_group, prior_context, group_key=pre_key)
+                prior_context = _format_prior_state(rt)
+
             t0 = time.monotonic()
             results, timed_out = _run_with_timeout(
                 lambda it=item: rt.send(it.target, it.intent, sender=it.source),
@@ -620,10 +727,18 @@ def _run_test_case_timeline(
                 ))
             prior_context = _format_prior_state(rt)
 
+            # post-mod concurrent group fires after the modification settles
+            if concurrency > 0:
+                post_key = f"cgroup_post_{item.id}"
+                post_group = group_map.get(post_key, [])
+                _dispatch_concurrent_group(post_group, prior_context, group_key=post_key)
+                prior_context = _format_prior_state(rt)
+
         else:  # event
             res, tout, lat, log_snap, exec_s = _dispatch_event(item)
             if item.expect is not None:
-                _record_event_result(item, res, tout, lat, log_snap, exec_s, prior_context)
+                ctx = _build_event_ctx(item, active_mods, prior_context)
+                _record_event_result(item, res, tout, lat, log_snap, exec_s, ctx)
                 if on_event_result:
                     on_event_result(event_results[-1], False)
             prior_context = _format_prior_state(rt)
@@ -632,7 +747,8 @@ def _run_test_case_timeline(
             for triggered_evt in tmap.get(item.id, []):
                 tr, tt, tl, tls, tes = _dispatch_event(triggered_evt)
                 if triggered_evt.expect is not None:
-                    _record_event_result(triggered_evt, tr, tt, tl, tls, tes, prior_context)
+                    tctx = _build_event_ctx(triggered_evt, active_mods, prior_context)
+                    _record_event_result(triggered_evt, tr, tt, tl, tls, tes, tctx)
                     if on_event_result:
                         on_event_result(event_results[-1], False)
                 prior_context = _format_prior_state(rt)
@@ -655,6 +771,9 @@ def execute_test_case(
     on_mod_applied=None,
     steps_snapshot: "Optional[StepsSnapshot]" = None,
     snapshot_out: "Optional[list]" = None,
+    concurrency: int = 0,
+    concurrency_seed: int = 42,
+    max_modifications: Optional[int] = None,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase with a per-event timeout (seconds).
 
@@ -667,6 +786,9 @@ def execute_test_case(
         progress_callback: Optional callable(msg) invoked on every bus message delivery.
         on_event_result: Optional callable(EventResult, is_step: bool) for real-time display.
         on_mod_applied: Optional callable(Modification) called before each modification runs.
+        concurrency: Number of concurrent events to fire per group (0 = sequential).
+        concurrency_seed: Seed for sampling concurrent events from each group (default 42).
+        max_modifications: Limit evaluation to the first N modifications (None = all).
     """
     return _execute_test_case_inner(
         tc, brain, harness,
@@ -681,6 +803,9 @@ def execute_test_case(
         on_mod_applied=on_mod_applied,
         steps_snapshot=steps_snapshot,
         snapshot_out=snapshot_out,
+        concurrency=concurrency,
+        concurrency_seed=concurrency_seed,
+        max_modifications=max_modifications,
     )
 
 
@@ -758,6 +883,11 @@ def _print_summary(summary, output_path=None, elapsed_s=None) -> None:
     print(f"  Post-mod:          {_fmt_mod(summary.post_mod_pass_rate, summary.post_mod_pass_rate_std, summary.post_mod_pass_rate_all, summary.post_mod_pass_rate_all_std)}")
     print(f"  Irrelevant:        {_fmt_mod(summary.irrelevant_pass_rate, summary.irrelevant_pass_rate_std, summary.irrelevant_pass_rate_all, summary.irrelevant_pass_rate_all_std)}")
     print(f"Inconclusive TCs:    {summary.inconclusive_tcs}")
+    n_events = summary.total_events or 1
+    print(f"Agent tokens:        {summary.total_agent_input_tokens:,} in / {summary.total_agent_output_tokens:,} out"
+          f"  (mean/event: {summary.mean_event_input_tokens:.0f} in / {summary.mean_event_output_tokens:.0f} out)")
+    print(f"Judge tokens:        {summary.total_judge_input_tokens:,} in / {summary.total_judge_output_tokens:,} out"
+          f"  (mean/event: {summary.total_judge_input_tokens/n_events:.0f} in / {summary.total_judge_output_tokens/n_events:.0f} out)")
 
 
 def run(args: argparse.Namespace) -> Path:
@@ -801,7 +931,8 @@ def run(args: argparse.Namespace) -> Path:
                     sys.exit(1)
                 selected.extend(matched)
             else:
-                matched = [tc for tc in test_cases if tc.id == selector]
+                # Match by TC ID, or by sample_id (selects all TCs sharing that sample)
+                matched = [tc for tc in test_cases if tc.id == selector or tc.sample_id == selector]
                 if not matched:
                     print(f"Error: --tc {selector!r} not found. Available IDs: {[tc.id for tc in test_cases[:5]]}...", file=sys.stderr)
                     sys.exit(1)
@@ -970,6 +1101,11 @@ def run(args: argparse.Namespace) -> Path:
     _snapshot_events: dict[tuple, threading.Event] = {}
     _snapshot_registry_lock = threading.Lock()
 
+    # Shared counters updated across all concurrent workers. Approximate (no lock) — display-only.
+    _event_counter: list[int] = [0]   # judge-evaluated events (updates postfix per event)
+    _msg_counter: list[int] = [0]     # bus messages (updates postfix during TC execution)
+    _pbar_holder: list = [None]       # set to the tqdm pbar once the loop starts
+
     def _run_one(tc_idx: int, tc: TestCase, run_idx: int) -> Optional[TestCaseResult]:
         mod_type_str = tc.modifications[0].mod_type.value if tc.modifications else "none"
         label = f"{tc.id}[{mod_type_str}]"
@@ -1003,23 +1139,37 @@ def run(args: argparse.Namespace) -> Path:
                     steps_snapshot = _snapshots.get(key)
 
         tc_log: list[str] = []  # buffered per-TC output, flushed atomically at end
+        # In verbose single-worker mode, stream results live instead of buffering.
+        _live = workers == 1 and getattr(args, "verbose", False)
+
+        def _emit(line: str) -> None:
+            if _live:
+                tqdm.write(line)
+            else:
+                tc_log.append(line)
 
         def _on_event_result(result: EventResult, is_step: bool, _args=args):
             tag = " (baseline)" if is_step else ""
             lat = f"  {result.latency_ms/1000:.1f}s" if result.latency_ms else ""
             if not result.passed:
-                tc_log.append(f"  {'✗'} {result.event_id}{tag}{lat}: {result.reasoning[:120]}")
+                _emit(f"  {'✗'} {result.event_id}{tag}{lat}: {result.reasoning[:120]}")
             else:
-                tc_log.append(f"  {'✓'} {result.event_id}{tag}{lat}: {result.reasoning[:80]}")
+                _emit(f"  {'✓'} {result.event_id}{tag}{lat}: {result.reasoning[:80]}")
+            _event_counter[0] += 1
+            if _pbar_holder[0] is not None:
+                _pbar_postfix(_pbar_holder[0], all_tc_results, _event_counter[0], _msg_counter[0])
 
         def _on_mod_applied(mod, _tc=tc):
-            tc_log.append(
+            _emit(
                 f"  ── [{mod.mod_type.value}/{mod.ambiguity.value}] {mod.id}: "
                 f"{mod.intent[:70]}"
             )
 
         def _on_message(_msg, _label=label, _count=msg_count, _start=tc_start):
             _count[0] += 1
+            _msg_counter[0] += 1
+            if _pbar_holder[0] is not None:
+                _pbar_postfix(_pbar_holder[0], all_tc_results, _event_counter[0], _msg_counter[0])
 
         try:
             event_results, mod_results = execute_test_case(
@@ -1034,6 +1184,9 @@ def run(args: argparse.Namespace) -> Path:
                 on_mod_applied=_on_mod_applied,
                 steps_snapshot=steps_snapshot,
                 snapshot_out=snapshot_out,
+                concurrency=getattr(args, "concurrency", 0),
+                concurrency_seed=getattr(args, "seed", None) or 42,
+                max_modifications=getattr(args, "modifications", None),
             )
         finally:
             # Always store snapshot and signal waiting workers — even on failure —
@@ -1133,8 +1286,9 @@ def run(args: argparse.Namespace) -> Path:
         f.write(run_config.model_dump_json() + "\n")
         f.flush()
         with tqdm(total=total_runs, initial=n_skipped, unit="run", desc="Evaluating") as pbar:
+            _pbar_holder[0] = pbar
             if all_tc_results:  # continuation — show running metrics immediately
-                _pbar_postfix(pbar, all_tc_results)
+                _pbar_postfix(pbar, all_tc_results, _event_counter[0], _msg_counter[0])
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 for phase_label, phase_runs in run_phases:
                     if not phase_runs:
@@ -1154,7 +1308,7 @@ def run(args: argparse.Namespace) -> Path:
                                 f.write(tc_result.model_dump_json() + "\n")
                                 f.flush()
                                 all_tc_results.append(tc_result)
-                                _pbar_postfix(pbar, all_tc_results)
+                                _pbar_postfix(pbar, all_tc_results, _event_counter[0], _msg_counter[0])
                         except Exception as e:
                             tqdm.write(f"FAILED {label} run={run_idx}: {e}", file=sys.stderr)
                         pbar.update(1)
@@ -1202,16 +1356,17 @@ def _running_metrics(results: "list[TestCaseResult]") -> tuple[Optional[float], 
     return mean_pr, sample_pr
 
 
-def _pbar_postfix(pbar, results) -> None:
-    """Update pbar postfix with running mean + sample pass rates."""
+def _pbar_postfix(pbar, results, events_done: int = 0, msgs_done: int = 0) -> None:
+    """Update pbar postfix with running mean + sample pass rates + live counters."""
     mean_pr, sample_pr = _running_metrics(results)
     fields: dict[str, str] = {}
     if mean_pr is not None:
         fields["mean"] = f"{mean_pr:.1%}"
     if sample_pr is not None:
         fields["sample"] = f"{sample_pr:.1%}"
-    if fields:
-        pbar.set_postfix(refresh=False, **fields)
+    fields["evts"] = str(events_done)
+    fields["msgs"] = str(msgs_done)
+    pbar.set_postfix(refresh=False, **fields)
 
 
 def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
@@ -1377,6 +1532,10 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
         mean_mod_input_tokens=mean([m.input_tokens for m in all_mods]),
         mean_mod_output_tokens=mean([m.output_tokens for m in all_mods]),
         mean_mod_latency_ms=mean([m.latency_ms for m in all_mods]),
+        total_agent_input_tokens=sum(e.input_tokens for e in all_events) + sum(m.input_tokens for m in all_mods),
+        total_agent_output_tokens=sum(e.output_tokens for e in all_events) + sum(m.output_tokens for m in all_mods),
+        total_judge_input_tokens=sum(e.judge_input_tokens for e in all_events),
+        total_judge_output_tokens=sum(e.judge_output_tokens for e in all_events),
     )
 
 
@@ -1441,13 +1600,36 @@ Examples:
         nargs="+",
         default=None,
         metavar="N_OR_ID",
-        help="Run specific test cases by 1-based index, ID, or ID[mod_type] (e.g. --tc 2 TC007 TC001[temporal]). Overrides --limit.",
+        help="Run specific test cases by 1-based index, ID, sample_id, or ID[mod_type] (e.g. --tc 2 TC007 S001 TC001[temporal]). Passing a sample_id selects all TCs sharing that sample. Overrides --limit.",
     )
     parser.add_argument(
         "--steps-only",
         action="store_true",
         default=False,
         help="Run only the steps (baseline behavior); skip modifications and events",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of events to fire concurrently per modification window (default: 0 = sequential). "
+            "When >0, each mod window fires a pre-mod and post-mod concurrent group: "
+            "1 relevant event + up to N-1 irrelevant events dispatched in one transaction. "
+            "Requires test cases generated with --concurrent-events."
+        ),
+    )
+    parser.add_argument(
+        "--modifications",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Limit evaluation to the first N modifications per test case (default: all). "
+            "Events whose after_mod_ids reference mods beyond N are skipped. "
+            "Useful for evaluating 3-mod test cases as if they were 1-mod or 2-mod."
+        ),
     )
     parser.add_argument(
         "--reuse-steps",
@@ -1538,7 +1720,8 @@ def main():
     if args.stats:
         results = _load_tc_results(args.stats)
         summary = _compute_summary(results)
-        _print_summary(summary)
+        elapsed_s = sum(r.elapsed_ms for r in results if r.elapsed_ms) / 1000 or None
+        _print_summary(summary, elapsed_s=elapsed_s)
         return
     if args.input is None:
         build_parser().error("the following arguments are required: --input/-i")

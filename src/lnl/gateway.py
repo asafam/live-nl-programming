@@ -49,3 +49,25 @@ class EventGateway:
             return self._rt.process_pending()
 
         return self._rt.inject_event(recipient, content, source=source)
+
+    def dispatch_many(
+        self,
+        items: list[tuple[str, str, str]],
+    ) -> list[ProcessingResult]:
+        """Dispatch multiple external events simultaneously in one transaction.
+
+        Each item is (recipient, content, source). All events are injected into
+        their recipients' event sources before the wave settles — true concurrent
+        dispatch without serialization between items.
+        """
+        for recipient, content, source in items:
+            registry = self._rt.event_registry
+            descriptors = registry.get(recipient)
+            if descriptors:
+                event_source = self._rt.get_event_source(recipient, descriptors[0])
+                if event_source is not None:
+                    event_source.fire(content, source=source)
+                    continue
+            # fallback: inject directly
+            self._rt._event_sources.inject(recipient, content, source)
+        return self._rt.process_pending()

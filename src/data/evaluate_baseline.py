@@ -757,12 +757,9 @@ def _write_worker_config(
 
     agents_cfg["list"] = new_lst
     tools_cfg = config.setdefault("tools", {})
-    # Accumulate allow list (union) so previously registered agents remain
-    # reachable when sessions_send targets an agent from an earlier TC.
-    old_allow = set(tools_cfg.get("agentToAgent", {}).get("allow", []))
     tools_cfg["agentToAgent"] = {
         "enabled": True,
-        "allow": sorted(old_allow | registered_ids),
+        "allow": sorted(registered_ids),
     }
     tools_cfg.setdefault("sessions", {})["visibility"] = "all"
 
@@ -1058,6 +1055,36 @@ def _tool_call_matches(match: dict[str, str], args: dict) -> bool:
     return True
 
 
+async def _snapshot_session_tokens(
+    gateway: Any,
+    session_keys: list[str],
+) -> dict[str, tuple[int, int]]:
+    """Call sessions.list and return {key: (inputTokens, outputTokens)} for given keys."""
+    try:
+        result = await gateway.call("sessions.list", {})
+        sess_map = {s.get("key", ""): s for s in result.get("sessions", [])}
+        return {
+            k: (sess_map.get(k, {}).get("inputTokens", 0),
+                sess_map.get(k, {}).get("outputTokens", 0))
+            for k in session_keys
+        }
+    except Exception:
+        return {k: (0, 0) for k in session_keys}
+
+
+def _delta_tokens(
+    before: dict[str, tuple[int, int]],
+    after: dict[str, tuple[int, int]],
+) -> tuple[int, int]:
+    """Sum the token delta across all sessions."""
+    total_in = total_out = 0
+    for key, (after_in, after_out) in after.items():
+        before_in, before_out = before.get(key, (0, 0))
+        total_in += max(0, after_in - before_in)
+        total_out += max(0, after_out - before_out)
+    return total_in, total_out
+
+
 # ── Core execution ───────────────────────────────────────────────────────────
 
 async def _execute_tc_async(
@@ -1072,6 +1099,9 @@ async def _execute_tc_async(
     partial_events: Optional[list],
     partial_mods: Optional[list],
     slot_suffix: str = "",
+    max_modifications: Optional[int] = None,
+    event_concurrency: int = 0,
+    concurrency_seed: int = 42,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Async core: open persistent sessions for ALL agents simultaneously, then send messages.
 
@@ -1120,12 +1150,25 @@ async def _execute_tc_async(
             "expect": step.expect,
         })
 
+    active_mods = tc.modifications[:max_modifications] if max_modifications is not None else tc.modifications
+    allowed_mod_ids: set[str] = {m.id for m in active_mods}
+
+    # Build concurrent group map (event_concurrency > 0 only).
+    # Concurrent events are dispatched as batches around mods, not in the main timeline.
+    group_map: dict[str, list] = {}
+    if event_concurrency > 0:
+        for evt in tc.events:
+            if evt.concurrent_group:
+                group_map.setdefault(evt.concurrent_group, []).append(evt)
+
     timeline: list[tuple[int, str, Any]] = []
-    for mod in tc.modifications:
+    for mod in active_mods:
         timeline.append((parse_when(mod.when), "mod", mod))
     for evt in tc.events:
         if evt.triggered_by is None:
-            timeline.append((parse_when(evt.when), "event", evt))
+            if all(mid in allowed_mod_ids for mid in (evt.after_mod_ids or [])):
+                if not evt.concurrent_group or event_concurrency == 0:
+                    timeline.append((parse_when(evt.when), "event", evt))
     timeline.sort(key=lambda x: x[0])
 
     for _, kind, item in timeline:
@@ -1214,9 +1257,103 @@ async def _execute_tc_async(
             handles: dict[str, Any] = {single_agent_id: client.get_agent(single_agent_id, session_name=sname)}
             session_names: dict[str, str] = {single_agent_id: sname}
 
+        async def _dispatch_concurrent_group(group: list, ctx: str, group_key: str = "") -> None:
+            """Fire events in `group` simultaneously; append EventResults to event_results."""
+            if not group:
+                return
+
+            import random as _random
+            if event_concurrency >= len(group):
+                batch = list(group)
+            else:
+                rng = _random.Random(f"{concurrency_seed}:{tc.id}:{group_key}")
+                batch = rng.sample(group, event_concurrency)
+
+            async def _one(evt):
+                # Each event gets its own independent session so OpenClaw receives
+                # N truly concurrent requests rather than serializing them within
+                # a shared session.
+                if not single_agent_id:
+                    evt_handles, _ = await _make_event_handles(client)
+                else:
+                    evt_handles = handles
+                lookup = single_agent_id or evt.recipient
+                h = evt_handles.get(lookup)
+                if h is None:
+                    return evt, None
+                content = f"[Event from {evt.source} at {evt.when}]: {evt.input}"
+                try:
+                    res = await h.execute(content)
+                    return evt, res
+                except Exception as exc:
+                    return evt, exc
+
+            t0 = time.time()
+            if single_agent_id:
+                # Single-agent uses one shared session — concurrent calls race on it
+                # and drop the connection. Run sequentially instead.
+                pairs = [await _one(e) for e in group]
+            else:
+                pairs = await asyncio.gather(*[_one(e) for e in group])
+            lat_ms = (time.time() - t0) * 1000
+
+            if mock_server:
+                await _wait_mock_quiescence(mock_server, max_wait_s=60.0, quiet_s=3.0,
+                                            slot_id=slot_suffix or "default")
+                batch_tool_calls = mock_server.get_log(slot_id=slot_suffix or "default")
+            else:
+                await asyncio.sleep(0.5)
+                batch_tool_calls = []
+
+            if single_agent_id:
+                sf = openclaw_home / f"workspace-{single_agent_id}" / "state.md"
+                batch_state = sf.read_text().strip() if sf.exists() else ""
+            else:
+                parts = []
+                for obj in tc.objects:
+                    sf = openclaw_home / f"workspace-{obj.object_id}{slot_suffix}" / "state.md"
+                    if sf.exists():
+                        text = sf.read_text().strip()
+                        if text:
+                            parts.append(f"[{obj.object_id}]:\n{text}")
+                batch_state = "\n\n".join(parts)
+
+            for evt, res in pairs:
+                if evt.expect is None:
+                    continue
+                if isinstance(res, Exception) or res is None:
+                    event_results.append(EventResult(
+                        event_id=evt.id, passed=False, reasoning=f"Dispatch error: {res}",
+                        role=evt.role, latency_ms=lat_ms,
+                    ))
+                    continue
+                agent_out = res.content if res.success else f"(error: {res.content})"
+                evidence = gather_evidence(
+                    agent_out,
+                    tool_calls=batch_tool_calls if mock_server else None,
+                    state_content=batch_state,
+                )
+                passed, reasoning, _votes, _in_tok, _out_tok = harness.evaluate_assertion(
+                    evt.expect.action, evidence, ctx)
+                tqdm.write(f"    {evt.id} {'✓' if passed else '✗'} {lat_ms/1000:.1f}s [conc]  {reasoning[:100]}")
+                event_results.append(EventResult(
+                    event_id=evt.id, passed=passed, reasoning=reasoning,
+                    expected=evt.expect.action, evidence=evidence,
+                    prior_context=ctx, latency_ms=lat_ms,
+                    role=evt.role,
+                    judge_input_tokens=_in_tok, judge_output_tokens=_out_tok,
+                    judge_votes=_votes,
+                ))
+
         for msg in messages:
             if steps_only and msg["kind"] != "step":
                 break
+
+            # Fire pre-mod concurrent group before dispatching the modification.
+            if msg["kind"] == "mod" and event_concurrency > 0:
+                mod_id = msg["item"].id
+                pre_key = f"cgroup_pre_{mod_id}"
+                await _dispatch_concurrent_group(group_map.get(pre_key, []), prior_context, pre_key)
 
             target_id = msg["target"]
 
@@ -1240,6 +1377,16 @@ async def _execute_tc_async(
                 mock_key = f"agent:{agent_id_for_key}:{sname}"
                 mock_server.configure(mock_key, slot_id=slot_suffix or "default")
 
+            # Build session keys for token tracking (entry + all peer "main" sessions).
+            _entry_agent_id = lookup_id if single_agent_id else f"{lookup_id}{slot_suffix}"
+            _entry_sess_key = f"agent:{_entry_agent_id}:{session_names[lookup_id]}"
+            _peer_sess_keys = (
+                [] if single_agent_id else
+                [f"agent:{obj.object_id}{slot_suffix}:main" for obj in tc.objects]
+            )
+            _all_sess_keys = [_entry_sess_key] + _peer_sess_keys
+            _tok_before = await _snapshot_session_tokens(client.gateway, _all_sess_keys)
+
             t0 = time.time()
             result = await handle.execute(msg["content"])
             latency_ms = (time.time() - t0) * 1000
@@ -1251,8 +1398,6 @@ async def _execute_tc_async(
             _oc_tool_calls = result.tool_calls  # list[ToolCall] from ExecutionResult
             _agent_tool_calls = len(_oc_tool_calls)
             _a2a_calls = sum(1 for c in _oc_tool_calls if c.tool == "sessions_send")
-            _agent_in_tok = result.token_usage.input
-            _agent_out_tok = result.token_usage.output
             _mock_tool_calls = 0  # updated below if mock_server is active
 
             # Collect tool calls for this event only
@@ -1261,7 +1406,7 @@ async def _execute_tc_async(
             if mock_server:
                 if single_agent_id:
                     # Single-agent: no agentToAgent chains, short wait suffices
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
                 else:
                     # Multi-agent: wait for any agentToAgent cascade to complete.
                     # With sessions_send(timeout=300s) per hop, cascades can still
@@ -1270,7 +1415,17 @@ async def _execute_tc_async(
                                                 slot_id=slot_suffix or "default")
                 event_tool_calls = mock_server.get_log(slot_id=slot_suffix or "default")
                 _mock_tool_calls = len(event_tool_calls)
+            else:
+                # No mock server: add a brief delay so the gateway can flush session
+                # token counts to sessions.list before we snapshot.
+                await asyncio.sleep(0.5)
 
+            # Snapshot session tokens AFTER cascade completes (gateway updates sessions.list
+            # asynchronously — ~0.5s after execute() returns).
+            _tok_after = await _snapshot_session_tokens(client.gateway, _all_sess_keys)
+            _agent_in_tok, _agent_out_tok = _delta_tokens(_tok_before, _tok_after)
+
+            if mock_server:
                 # In-process triggers: dispatch tool-triggered messages directly
                 # (mirrors MockInProcessExecutor in evaluate.py)
                 for call in list(event_tool_calls):
@@ -1375,6 +1530,10 @@ async def _execute_tc_async(
                 tqdm.write(f"    ── [{tag}] {mod.id} {latency_ms/1000:.1f}s  {mod.intent[:70]}")
                 mod_results.append(ModificationResult(mod_id=mod.id, latency_ms=latency_ms))
                 prior_context = _read_prior_context(tc, openclaw_home, single_agent_id)
+                # Fire post-mod concurrent group after mod settles.
+                if event_concurrency > 0:
+                    post_key = f"cgroup_post_{mod.id}"
+                    await _dispatch_concurrent_group(group_map.get(post_key, []), prior_context, post_key)
 
             else:  # event
                 item = msg["item"]
@@ -1419,6 +1578,9 @@ def _execute_test_case_inner(
     _partial_events: Optional[list] = None,
     _partial_mods: Optional[list] = None,
     slot_suffix: str = "",
+    max_modifications: Optional[int] = None,
+    event_concurrency: int = 0,
+    concurrency_seed: int = 42,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Sync wrapper: delegate to _execute_tc_async with persistent multi-agent sessions."""
     gateway_url = next(iter(agents.values()))._gateway_url if agents else None
@@ -1427,6 +1589,9 @@ def _execute_test_case_inner(
         mock_server, verbose, steps_only, single_agent_id,
         _partial_events, _partial_mods,
         slot_suffix=slot_suffix,
+        max_modifications=max_modifications,
+        event_concurrency=event_concurrency,
+        concurrency_seed=concurrency_seed,
     ))
 
 
@@ -1441,6 +1606,9 @@ def execute_test_case(
     steps_only: bool = False,
     single_agent_id: Optional[str] = None,
     slot_suffix: str = "",
+    max_modifications: Optional[int] = None,
+    event_concurrency: int = 0,
+    concurrency_seed: int = 42,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase with an optional wall-clock timeout."""
     if timeout_s is None:
@@ -1448,7 +1616,10 @@ def execute_test_case(
                                         mock_server=mock_server, verbose=verbose,
                                         steps_only=steps_only,
                                         single_agent_id=single_agent_id,
-                                        slot_suffix=slot_suffix)
+                                        slot_suffix=slot_suffix,
+                                        max_modifications=max_modifications,
+                                        event_concurrency=event_concurrency,
+                                        concurrency_seed=concurrency_seed)
 
     partial_events: list[EventResult] = []
     partial_mods: list[ModificationResult] = []
@@ -1457,7 +1628,8 @@ def execute_test_case(
         future = executor.submit(
             _execute_test_case_inner, tc, agents, openclaw_home,
             harness, mock_server, verbose, steps_only, single_agent_id,
-            partial_events, partial_mods, slot_suffix,
+            partial_events, partial_mods, slot_suffix, max_modifications,
+            event_concurrency, concurrency_seed,
         )
         try:
             return future.result(timeout=timeout_s)
@@ -1477,15 +1649,17 @@ def execute_test_case(
                         event_id=eid, passed=False,
                         reasoning=f"Timeout after {timeout_s}s",
                     ))
+            _active_mod_ids = {m.id for m in (tc.modifications[:max_modifications] if max_modifications else tc.modifications)}
             for evt in tc.events:
                 if evt.id not in collected_event_ids and evt.expect is not None:
-                    partial_events.append(EventResult(
-                        event_id=evt.id, passed=False,
-                        reasoning=f"Timeout after {timeout_s}s",
-                        role=getattr(evt, "role", None),
-                    ))
+                    if all(mid in _active_mod_ids for mid in (evt.after_mod_ids or [])):
+                        partial_events.append(EventResult(
+                            event_id=evt.id, passed=False,
+                            reasoning=f"Timeout after {timeout_s}s",
+                            role=getattr(evt, "role", None),
+                        ))
             collected_mod_ids = {m.mod_id for m in partial_mods}
-            for mod in tc.modifications:
+            for mod in (tc.modifications[:max_modifications] if max_modifications else tc.modifications):
                 if mod.id not in collected_mod_ids:
                     partial_mods.append(ModificationResult(mod_id=mod.id))
 
@@ -1721,6 +1895,10 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
         mean_mod_input_tokens=mean([m.input_tokens for m in all_mods]),
         mean_mod_output_tokens=mean([m.output_tokens for m in all_mods]),
         mean_mod_latency_ms=mean([m.latency_ms for m in all_mods]),
+        total_agent_input_tokens=sum(e.input_tokens for e in all_events) + sum(m.input_tokens for m in all_mods),
+        total_agent_output_tokens=sum(e.output_tokens for e in all_events) + sum(m.output_tokens for m in all_mods),
+        total_judge_input_tokens=sum(e.judge_input_tokens for e in all_events),
+        total_judge_output_tokens=sum(e.judge_output_tokens for e in all_events),
     )
 
 
@@ -1751,7 +1929,7 @@ async def _run_all_tcs_concurrent(
     a clean gateway (no cached agent state), then agents are exported and
     configured fresh on every run.
     """
-    concurrency = len(workers) if workers else getattr(args, "concurrency", 1)
+    concurrency = len(workers) if workers else getattr(args, "parallel", 1)
     sem = asyncio.Semaphore(concurrency)
     slot_queue: asyncio.Queue[int] = asyncio.Queue()
     for s in range(concurrency):
@@ -1886,6 +2064,8 @@ async def _run_all_tcs_concurrent(
                             tqdm.write(f"\n  {tc.id}[{mod_type_str}] run={run_idx} [slot={slot}]")
                             tc_t0 = time.time()
                             tc_timeout = timeout_s
+                            _partial_ev: list[EventResult] = []
+                            _partial_mod: list[ModificationResult] = []
                             try:
                                 coro = _execute_tc_async(
                                     tc, slot_gateway_url, slot_openclaw_home, harness,
@@ -1893,8 +2073,11 @@ async def _run_all_tcs_concurrent(
                                     getattr(args, "verbose", False),
                                     getattr(args, "steps_only", False),
                                     single_agent_id,
-                                    None, None,
+                                    _partial_ev, _partial_mod,
                                     slot_suffix=slot_suffix,
+                                    max_modifications=getattr(args, "modifications", None),
+                                    event_concurrency=getattr(args, "concurrency", 0),
+                                    concurrency_seed=getattr(args, "seed", None) or 42,
                                 )
                                 if tc_timeout:
                                     event_results, mod_results = await asyncio.wait_for(coro, timeout=tc_timeout)
@@ -1903,30 +2086,48 @@ async def _run_all_tcs_concurrent(
                             except (asyncio.TimeoutError, *(
                                 (OcTimeoutError,) if OcTimeoutError is not None else ()
                             )) as _timeout_exc:
-                                # TC exceeded wall-clock timeout OR per-agent SDK timeout
-                                # — mark remaining events as timed out and write results
+                                # TC exceeded wall-clock timeout OR per-agent SDK timeout.
+                                # Preserve events that completed; fill the rest with placeholders.
                                 _timeout_label = str(_timeout_exc) or f"Timeout after {tc_timeout}s"
                                 tc_elapsed_ms = (time.time() - tc_t0) * 1000
-                                timeout_results: list[EventResult] = []
+                                collected_ev_ids = {e.event_id for e in _partial_ev}
                                 for i, step in enumerate(tc.steps):
-                                    if step.expect is not None:
-                                        timeout_results.append(EventResult(
-                                            event_id=f"S{i+1:03d}", passed=False,
+                                    eid = f"S{i+1:03d}"
+                                    if eid not in collected_ev_ids and step.expect is not None:
+                                        _partial_ev.append(EventResult(
+                                            event_id=eid, passed=False,
                                             reasoning=_timeout_label,
                                         ))
+                                _max_mods = getattr(args, "modifications", None)
+                                _active_mod_ids = {m.id for m in (tc.modifications[:_max_mods] if _max_mods else tc.modifications)}
                                 for evt in tc.events:
-                                    if evt.expect is not None:
-                                        timeout_results.append(EventResult(
-                                            event_id=evt.id, passed=False,
-                                            reasoning=_timeout_label,
-                                            role=getattr(evt, "role", None),
-                                        ))
-                                timeout_mod_results = [ModificationResult(mod_id=m.id) for m in tc.modifications]
+                                    if evt.id not in collected_ev_ids and evt.expect is not None:
+                                        if all(mid in _active_mod_ids for mid in (evt.after_mod_ids or [])):
+                                            _partial_ev.append(EventResult(
+                                                event_id=evt.id, passed=False,
+                                                reasoning=_timeout_label,
+                                                role=getattr(evt, "role", None),
+                                            ))
+                                collected_mod_ids = {m.mod_id for m in _partial_mod}
+                                for mod in (tc.modifications[:_max_mods] if _max_mods else tc.modifications):
+                                    if mod.id not in collected_mod_ids:
+                                        _partial_mod.append(ModificationResult(mod_id=mod.id))
+                                # Dedup: last occurrence wins (real result appended first, placeholder after)
+                                seen_ev: dict[str, int] = {}
+                                for i, e in enumerate(_partial_ev):
+                                    seen_ev[e.event_id] = i
+                                event_results = [_partial_ev[i] for i in sorted(seen_ev.values())]
+                                seen_mod: dict[str, int] = {}
+                                for i, m in enumerate(_partial_mod):
+                                    seen_mod[m.mod_id] = i
+                                mod_results = [_partial_mod[i] for i in sorted(seen_mod.values())]
+                                n_timeout = sum(1 for e in event_results if not e.passed)
+                                n_pass = sum(1 for e in event_results if e.passed)
                                 tc_result = TestCaseResult(
                                     tc_id=tc.id, sample_id=tc.sample_id, tc_index=tc_idx,
                                     name=tc.name, domain=tc.domain, run_index=run_idx,
-                                    events=timeout_results, modifications=timeout_mod_results,
-                                    pass_rate=0.0 if timeout_results else None,
+                                    events=event_results, modifications=mod_results,
+                                    pass_rate=sum(1 for e in event_results if e.passed) / len(event_results) if event_results else None,
                                     elapsed_ms=tc_elapsed_ms,
                                 )
                                 async with results_lock:
@@ -1934,7 +2135,7 @@ async def _run_all_tcs_concurrent(
                                     new_tc_results.append(tc_result)
                                     output_file.write(tc_result.model_dump_json() + "\n")
                                     output_file.flush()
-                                    tqdm.write(f"\n  → TIMEOUT ({_timeout_label})  pass=0/{len(timeout_results)}")
+                                    tqdm.write(f"\n  → TIMEOUT ({_timeout_label})  pass={n_pass}/{len(event_results)}")
                                     _pbar_postfix(pbar, all_tc_results)
                                     if pbar is not None:
                                         pbar.update(1)
@@ -2000,13 +2201,16 @@ async def _run_all_tcs_concurrent(
                         err_results.append(EventResult(
                             event_id=f"S{i+1:03d}", passed=False, reasoning=_err_label,
                         ))
+                _max_mods_err = getattr(args, "modifications", None)
+                _active_mod_ids_err = {m.id for m in (tc.modifications[:_max_mods_err] if _max_mods_err else tc.modifications)}
                 for evt in tc.events:
                     if evt.expect is not None:
-                        err_results.append(EventResult(
-                            event_id=evt.id, passed=False, reasoning=_err_label,
-                            role=getattr(evt, "role", None),
-                        ))
-                err_mod_results = [ModificationResult(mod_id=m.id) for m in tc.modifications]
+                        if all(mid in _active_mod_ids_err for mid in (evt.after_mod_ids or [])):
+                            err_results.append(EventResult(
+                                event_id=evt.id, passed=False, reasoning=_err_label,
+                                role=getattr(evt, "role", None),
+                            ))
+                err_mod_results = [ModificationResult(mod_id=m.id) for m in (tc.modifications[:_max_mods_err] if _max_mods_err else tc.modifications)]
                 tc_result = TestCaseResult(
                     tc_id=tc.id, sample_id=tc.sample_id, tc_index=tc_idx,
                     name=tc.name, domain=tc.domain, run_index=run_idx,
@@ -2071,6 +2275,11 @@ def _print_summary(summary, output_path: Optional[Path] = None, elapsed_s: Optio
     print(f"  Post-mod:          {_fmt_mod(summary.post_mod_pass_rate, summary.post_mod_pass_rate_std, summary.post_mod_pass_rate_all, summary.post_mod_pass_rate_all_std)}")
     print(f"  Irrelevant:        {_fmt_mod(summary.irrelevant_pass_rate, summary.irrelevant_pass_rate_std, summary.irrelevant_pass_rate_all, summary.irrelevant_pass_rate_all_std)}")
     print(f"Inconclusive TCs:    {summary.inconclusive_tcs}")
+    n_events = summary.total_events or 1
+    print(f"Agent tokens:        {summary.total_agent_input_tokens:,} in / {summary.total_agent_output_tokens:,} out"
+          f"  (mean/event: {summary.mean_event_input_tokens:.0f} in / {summary.mean_event_output_tokens:.0f} out)")
+    print(f"Judge tokens:        {summary.total_judge_input_tokens:,} in / {summary.total_judge_output_tokens:,} out"
+          f"  (mean/event: {summary.total_judge_input_tokens/n_events:.0f} in / {summary.total_judge_output_tokens/n_events:.0f} out)")
 
 
 def run(args: argparse.Namespace) -> Path:
@@ -2080,6 +2289,7 @@ def run(args: argparse.Namespace) -> Path:
     import os
     if args.output is None:
         args.output = default_output_path(args.input)
+    print(f"Output: {args.output}")
 
     # Ensure the gateway token is available as an env var so the SDK picks it up
     # regardless of which code path triggers a connection.
@@ -2105,7 +2315,8 @@ def run(args: argparse.Namespace) -> Path:
                     sys.exit(1)
                 selected.append(test_cases[idx])
             else:
-                matched = [tc for tc in test_cases if tc.id == selector]
+                # Match by TC ID, or by sample_id (selects all TCs sharing that sample)
+                matched = [tc for tc in test_cases if tc.id == selector or tc.sample_id == selector]
                 if not matched:
                     print(f"Error: --tc {selector!r} not found", file=sys.stderr)
                     sys.exit(1)
@@ -2272,7 +2483,7 @@ def run(args: argparse.Namespace) -> Path:
         "params": run_params,
     }
 
-    concurrency = len(workers) if workers else getattr(args, "concurrency", 1)
+    concurrency = len(workers) if workers else getattr(args, "parallel", 1)
     file_mode = "a" if completed else "w"
 
     with open(args.output, file_mode) as f:
@@ -2414,6 +2625,8 @@ def run(args: argparse.Namespace) -> Path:
                         verbose=getattr(args, "verbose", False),
                         steps_only=getattr(args, "steps_only", False),
                         single_agent_id=single_agent_id,
+                        event_concurrency=getattr(args, "concurrency", 0),
+                        concurrency_seed=getattr(args, "seed", None) or 42,
                     )
                     pass_rate = (
                         sum(1 for e in event_results if e.passed) / len(event_results)
@@ -2456,6 +2669,8 @@ def run(args: argparse.Namespace) -> Path:
                                 verbose=getattr(args, "verbose", False),
                                 steps_only=getattr(args, "steps_only", False),
                                 single_agent_id=single_agent_id,
+                                event_concurrency=getattr(args, "concurrency", 0),
+                                concurrency_seed=getattr(args, "seed", None) or 42,
                             )
                             pass_rate = (
                                 sum(1 for e in event_results if e.passed) / len(event_results)
@@ -2533,7 +2748,7 @@ Examples:
     parser.add_argument("--limit", "-n", type=int, default=None,
                         help="Process only the first N test cases")
     parser.add_argument("--tc", nargs="+", metavar="INDEX_OR_ID",
-                        help="Run specific test cases by 1-based index or ID. Overrides --limit.")
+                        help="Run specific test cases by 1-based index, ID, or sample_id (selects all TCs sharing that sample). Overrides --limit.")
     parser.add_argument("--mock-server", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable mock external system integration (default: enabled). Use --no-mock-server to disable.")
     parser.add_argument("--mock-server-port", type=int, default=18888,
@@ -2551,14 +2766,27 @@ Examples:
     parser.add_argument("--single-agent", dest="multi_agent", action="store_false",
                         help="Use a single combined agent for all LNL-objects instead of one agent per object.")
     parser.set_defaults(multi_agent=True)
-    parser.add_argument("--concurrency", "-j", type=int, default=1, metavar="N",
+    parser.add_argument("--seed", "-s", type=int, default=None, metavar="N",
+                        help="Random seed for concurrent event group sampling (default: 42). "
+                             "Mirrors --seed in evaluate.py so both evals pick the same subset "
+                             "of concurrent events for a fair head-to-head comparison.")
+    parser.add_argument("--parallel", "-j", type=int, default=1, metavar="N",
+                        dest="parallel",
                         help="Number of TCs to run concurrently (default: 1). "
                              "N>1 requires --multi-agent. Each concurrent slot gets isolated "
                              "workspace dirs (workspace-{id}-cN) and session names.")
+    parser.add_argument("--concurrency", type=int, default=0, metavar="N",
+                        help="Fire N events per concurrent group simultaneously (default: 0 = sequential). "
+                             "Mirrors --concurrency in evaluate.py: same stress test, same semantics, "
+                             "applied to OpenClaw. Requires TCs generated with --concurrent-events.")
+    parser.add_argument("--modifications", type=int, default=None, metavar="N",
+                        help="Limit evaluation to the first N modifications per test case (default: all). "
+                             "Events whose after_mod_ids reference mods beyond N are skipped. "
+                             "Useful for evaluating 3-mod test cases as if they were 1-mod or 2-mod.")
     parser.add_argument("--pool", default=None, metavar="YAML",
                         help="Path to a worker-pool YAML file (see docker/worker-pool.yaml). "
                              "Distributes TCs across Docker worker containers, each with its own "
-                             "isolated OpenClaw gateway and mock server. Overrides --concurrency, "
+                             "isolated OpenClaw gateway and mock server. Overrides --parallel, "
                              "--gateway-url, and --mock-server-url.")
     parser.add_argument("--stats", default=None, metavar="FILE", type=Path,
                         help="Recompute and reprint summary stats from an existing results JSONL "

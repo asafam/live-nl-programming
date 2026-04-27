@@ -49,8 +49,10 @@ user_prompt: |
       source: "__user__"
       target: "notification-manager"
       when: "W02-2T14:00"
-      intent: "Another rule change that builds on or interacts with M001"
+      intent: "Another rule change that refines or extends M001 — consistent with it, not contradicting it"
   ```
+
+  **Modification coherence rule:** Modifications must form a coherent sequence. Each modification must be consistent with all prior modifications in the scenario. They represent the user progressively tuning the same automation — not independent or contradictory changes. For example: first restrict scope, then add an exception to the restriction, then adjust the notification format. Never have M002 undo or contradict M001.
 
   ### Events
 
@@ -66,11 +68,13 @@ user_prompt: |
   `call_type`: always `"send_event"` for external system triggers, `"send"` for direct user messages.
   `source`: `"__external__"` for system-originated events, `"__user__"` for user messages.
 
-  Each test case may include:
-  - **Before events** (`role: pre_mod`): Trigger the SAME logic the modification will change. Shows "before" behavior.
-  - **After events** (`role: post_mod`): Same type of external trigger, but now the modification applies. Shows "after" behavior.
-  - **Unrelated events** (`role: irrelevant`): A different external trigger that exercises logic unaffected by the modification.
-  - If multiple modifications: events between modifications to test intermediate states.
+  Each test case must include events distributed across **all N+1 timeline windows** formed by N modifications:
+  - **Baseline events** (`role: pre_mod`, `after_mod_ids: []`): Fire before any modification. Test the system's default behavior before any change is applied.
+  - **Inter-mod events** (`role: post_mod`, `after_mod_ids: ["M001"]` etc.): Fire after one modification but before the next. Test the cumulative state at each intermediate point. Include at least one event per gap between consecutive modifications.
+  - **Post-all events** (`role: post_mod`, `after_mod_ids: ["M001", "M002", ...]`): Fire after all modifications. Test the fully-updated system.
+  - **Unrelated events** (`role: irrelevant`, `after_mod_ids: []` or any subset): Fire at any point; test logic that should be unaffected by any of the modifications.
+
+  `after_mod_ids` must list the IDs of ALL modifications that have fired before this event, in the order they were applied. An event with `when` between M001 and M002 has `after_mod_ids: ["M001"]`. An event after all mods has `after_mod_ids: ["M001", "M002", ...]`.
 
   Focus on writing high-quality `input` values — realistic external triggers that carry enough
   information for the full automation chain to run to completion. Expectations are written in a
@@ -103,10 +107,11 @@ user_prompt: |
   of those conditions. A partial trigger that satisfies only some conditions will cause the system
   to correctly wait or block — making the test case unresolvable.
 
-  Each event must include a `role` field that classifies it relative to the modification:
-  - `pre_mod`: fires **before** the modification; tests that baseline behavior is unaffected
-  - `post_mod`: fires **after** the modification; tests that the system correctly reflects the change
-  - `irrelevant`: fires at any time; tests functionality **unrelated** to the modification
+  Each event must include a `role` field and an `after_mod_ids` list:
+  - `pre_mod` + `after_mod_ids: []`: fires **before** any modification; tests baseline behavior
+  - `post_mod` + `after_mod_ids: ["M001"]`: fires after M001 but before M002; tests intermediate state
+  - `post_mod` + `after_mod_ids: ["M001", "M002"]`: fires after all modifications; tests fully-updated behavior
+  - `irrelevant` + `after_mod_ids: []` (or any subset): fires at any time; tests logic **unrelated** to any modification
 
   ```yaml
   events:
@@ -116,22 +121,33 @@ user_prompt: |
       recipient: "<entry-point object from sample>"
       when: "W02-1T09:00"
       role: "pre_mod"
+      after_mod_ids: []
       input: "<external trigger content matching the sample's step pattern>"
     - id: "E002"
       call_type: "send_event"
       source: "__external__"
       recipient: "<entry-point object from sample>"
-      when: "W02-2T10:00"
+      when: "W02-2T12:00"
       role: "post_mod"
-      input: "<another external trigger>"
-      triggered_by: "E001"   # optional: E001 causes E002 to fire
+      after_mod_ids: ["M001"]
+      input: "<trigger to test behavior after M001 but before M002>"
     - id: "E003"
       call_type: "send_event"
       source: "__external__"
       recipient: "<entry-point object from sample>"
-      when: "W02-3T11:00"
+      when: "W02-3T10:00"
+      role: "post_mod"
+      after_mod_ids: ["M001", "M002"]
+      input: "<trigger to test fully-updated behavior after all modifications>"
+      triggered_by: "E002"   # optional: E002 causes E003 to fire
+    - id: "E004"
+      call_type: "send_event"
+      source: "__external__"
+      recipient: "<entry-point object from sample>"
+      when: "W02-2T08:00"
       role: "irrelevant"
-      input: "<trigger that exercises logic unaffected by the modification>"
+      after_mod_ids: []
+      input: "<trigger that exercises logic unaffected by any modification>"
   ```
 
   **`triggered_by` constraint:** If an event is triggered as a downstream consequence of another
@@ -167,6 +183,8 @@ user_prompt: |
   Write all modification `intent` texts in this style.
 
   Each scenario must include:
-  - {EVENTS_BEFORE_COUNT} events before the first modification
-  - {EVENTS_AFTER_COUNT} events after the last modification
-  - {EVENTS_UNRELATED_COUNT} events unaffected by the modifications
+  - {EVENTS_BEFORE_COUNT} baseline event(s) before the first modification (`role: pre_mod`, `after_mod_ids: []`)
+  - {EVENTS_INTER_MOD_COUNT} inter-mod event(s) per gap between consecutive modifications (`role: post_mod`, `after_mod_ids` lists the mods fired so far)
+  - {EVENTS_AFTER_COUNT} event(s) after the last modification (`role: post_mod`, `after_mod_ids` lists all mod IDs)
+  - {EVENTS_UNRELATED_COUNT} irrelevant event(s), one per modification window: place each in the gap immediately after a mod fires (before the next mod, or in the final window after all mods). Each irrelevant event must have `role: irrelevant` and `after_mod_ids` set to the mods that have fired by that point — it shares the same window as the inter-mod event for that gap.
+

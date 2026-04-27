@@ -183,6 +183,15 @@ def find_missing_step_data(tc: "TestCase") -> list[str]:
         available_text += " " + tool.response_template
         for resp in tool.scripted_responses:
             available_text += " " + resp
+        # Extract channel_name values from JSON mock data and add with # prefix
+        # so validators match "#technical-support" even when stored as "technical-support"
+        try:
+            import json as _json
+            mock_json = _json.loads(tool.response_template)
+            for match in re.findall(r'"channel_name"\s*:\s*"([\w-]+)"', tool.response_template):
+                available_text += f" #{match}"
+        except Exception:
+            pass
     available_text_lower = available_text.lower()
 
     issues = []
