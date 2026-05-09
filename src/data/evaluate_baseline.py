@@ -723,12 +723,18 @@ def _write_worker_config(
     single_agent_id: Optional[str],
     *,
     verbose: bool = True,
+    preserve_a2a_allow: bool = False,
 ) -> int:
     """Write the agent config to a single worker's bind-mount.
 
     Returns the number of agents registered.  The gateway's file watcher
     detects the change and applies an in-process hot-reload — no SDK
     config.patch needed (which would trigger a full process restart).
+
+    preserve_a2a_allow: if True, keep the existing tools.agentToAgent.allow
+    list unchanged (only set enabled=True).  Use this for per-TC writes so
+    that in-flight cascades from a previous TC are not blocked by a narrowed
+    allow list.
     """
     import json
 
@@ -780,10 +786,16 @@ def _write_worker_config(
 
     agents_cfg["list"] = new_lst
     tools_cfg = config.setdefault("tools", {})
-    tools_cfg["agentToAgent"] = {
-        "enabled": True,
-        "allow": sorted(registered_ids),
-    }
+    if preserve_a2a_allow:
+        # Keep the existing allow list (set during pre-registration with all agents).
+        # Per-TC writes must not narrow the allow list — that would block sessions_send
+        # from agents whose TC completed but whose gateway cascade is still draining.
+        tools_cfg.setdefault("agentToAgent", {})["enabled"] = True
+    else:
+        tools_cfg["agentToAgent"] = {
+            "enabled": True,
+            "allow": sorted(registered_ids),
+        }
     tools_cfg.setdefault("sessions", {})["visibility"] = "all"
 
     # Write directly to the bind-mount — the gateway's file watcher
@@ -1424,16 +1436,6 @@ async def _execute_tc_async(
                 mock_key = f"agent:{agent_id_for_key}:{sname}"
                 mock_server.configure(mock_key, slot_id=slot_suffix or "default")
 
-            # Build session keys for token tracking (entry + all peer "main" sessions).
-            _entry_agent_id = lookup_id if single_agent_id else f"{lookup_id}{slot_suffix}"
-            _entry_sess_key = f"agent:{_entry_agent_id}:{session_names[lookup_id]}"
-            _peer_sess_keys = (
-                [] if single_agent_id else
-                [f"agent:{obj.object_id}{slot_suffix}:main" for obj in tc.objects]
-            )
-            _all_sess_keys = [_entry_sess_key] + _peer_sess_keys
-            _tok_before = await _snapshot_session_tokens(client.gateway, _all_sess_keys)
-
             t0 = time.time()
             result = await handle.execute(msg["content"], options=_exec_opts)
             latency_ms = (time.time() - t0) * 1000
@@ -1463,14 +1465,12 @@ async def _execute_tc_async(
                 event_tool_calls = mock_server.get_log(slot_id=slot_suffix or "default")
                 _mock_tool_calls = len(event_tool_calls)
             else:
-                # No mock server: add a brief delay so the gateway can flush session
-                # token counts to sessions.list before we snapshot.
                 await asyncio.sleep(0.5)
 
-            # Snapshot session tokens AFTER cascade completes (gateway updates sessions.list
-            # asynchronously — ~0.5s after execute() returns).
-            _tok_after = await _snapshot_session_tokens(client.gateway, _all_sess_keys)
-            _agent_in_tok, _agent_out_tok = _delta_tokens(_tok_before, _tok_after)
+            # Token usage from SDK result (available immediately, avoids sessions.list
+            # timing issues where sessions stay "running" and report no token data).
+            _agent_in_tok = getattr(result.token_usage, "input", 0) or 0
+            _agent_out_tok = getattr(result.token_usage, "output", 0) or 0
 
             if mock_server:
                 # In-process triggers: dispatch tool-triggered messages directly
@@ -2068,7 +2068,7 @@ async def _run_all_tcs_concurrent(
                             _provider = getattr(args, "provider", None) or infer_provider(_model)
                             _write_worker_config(
                                 worker, tc_agent_ids, _provider, _model, single_agent_id,
-                                verbose=False,
+                                verbose=False, preserve_a2a_allow=True,
                             )
                             await asyncio.sleep(3)  # file watcher pickup
                             # Delete BOOTSTRAP.md so the gateway doesn't run its

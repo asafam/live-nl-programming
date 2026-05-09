@@ -75,11 +75,20 @@ while true; do
         exit 1
     fi
 
-    # Gateway exit → check whether it self-restarted
+    # Gateway exit → check whether it self-restarted.
+    # Full-process restarts spawn a new "openclaw" parent which then
+    # launches an "openclaw-gateway" child; the original OC_PID is the
+    # "openclaw" launcher (not "openclaw-gateway"), so pgrep for the
+    # launcher by exact name and fall back to the gateway child name.
     if ! kill -0 "${OC_PID}" 2>/dev/null; then
-        # Give the new process a moment to start
-        sleep 2
-        NEW_PID=$(pgrep -f "openclaw gateway run" | head -1 || true)
+        NEW_PID=""
+        for _i in 1 2 3 4 5; do
+            sleep 2
+            NEW_PID=$(pgrep -x "openclaw" 2>/dev/null | head -1 || true)
+            [ -n "${NEW_PID}" ] && break
+            NEW_PID=$(pgrep -x "openclaw-gateway" 2>/dev/null | head -1 || true)
+            [ -n "${NEW_PID}" ] && break
+        done
         if [ -n "${NEW_PID}" ]; then
             echo "[entrypoint] Gateway restarted as PID ${NEW_PID} (was ${OC_PID})."
             OC_PID="${NEW_PID}"
