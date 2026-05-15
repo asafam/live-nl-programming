@@ -699,7 +699,7 @@ class Runtime:
                 and sender_obj is not None
                 and hasattr(sender_obj, "mark_step_dispatched")
             ):
-                sender_obj.mark_step_dispatched(out.plan_step_index)
+                sender_obj.mark_step_dispatched(out.plan_step_index, result.source_trace_id)
             if out.is_reply:
                 with self._awaiting_lock:
                     self._awaiting_reply.get(out.recipient, set()).discard(obj_id)

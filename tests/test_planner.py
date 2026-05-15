@@ -296,7 +296,7 @@ def test_planning_hook_runs_once_per_trace():
     assert planner.plan_calls == 1
     # Clear plan as the runtime would after completion, but mark the trace
     # as already-planned. Simulate a second DOMAIN msg same trace:
-    obj._active_plan = None
+    obj._active_plans.pop("t", None)
     obj.process_message(_make_message(trace_id="t"))
     assert planner.plan_calls == 1  # still just one — trace was already planned
 
@@ -319,7 +319,7 @@ def test_planning_hook_replans_on_new_trace():
         planner_brain=planner,
     )
     obj.process_message(_make_message(trace_id="t1"))
-    obj._active_plan = None
+    obj._active_plans.pop("t1", None)
     obj.process_message(_make_message(trace_id="t2"))
     assert planner.plan_calls == 2
 

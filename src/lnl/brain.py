@@ -389,7 +389,7 @@ def build_evaluator_prompt(
     )
 
 
-def plan_dict_to_plan(plan_dict: dict) -> "Plan":  # type: ignore[name-defined]
+def plan_dict_to_plan(plan_dict: dict, trace_id: Optional[str] = None) -> "Plan":  # type: ignore[name-defined]
     """Convert a raw plan dict (matching PLANNER_RESPONSE_SCHEMA) into a Plan
     object the runtime can use. Filters out the terminal `final` step — it's
     a planning marker, not an executable step.
@@ -413,7 +413,7 @@ def plan_dict_to_plan(plan_dict: dict) -> "Plan":  # type: ignore[name-defined]
             status="planned",
             result_summary=None,
         ))
-    return Plan(goal=goal, steps=steps_out, status="active")
+    return Plan(goal=goal, steps=steps_out, status="active", trace_id=trace_id)
 
 
 def build_system_prompt(

@@ -45,7 +45,7 @@ def _make_definition(n_peers: int = 3) -> ObjectDefinition:
     )
 
 
-def _make_plan() -> Plan:
+def _make_plan(trace_id: str = "t1") -> Plan:
     return Plan(
         goal="Forward event to A and B",
         steps=[
@@ -53,6 +53,7 @@ def _make_plan() -> Plan:
             PlanStep(kind="tell", target="peer-B", description="send to B", status="planned"),
         ],
         status="active",
+        trace_id=trace_id,
     )
 
 
@@ -163,7 +164,7 @@ def test_default_evaluate_call_raises_not_implemented():
 
 def test_run_evaluator_returns_none_when_disabled():
     obj = LLMObject(_make_definition(2), _NoopBrain(), enable_evaluator=False)
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     eval_dict, metrics = obj.run_evaluator([], "")
     assert eval_dict is None and metrics is None
 
@@ -176,7 +177,7 @@ def test_run_evaluator_skips_when_no_message():
         _make_definition(2), _NoopBrain(),
         enable_evaluator=True, evaluator_brain=eval_brain,
     )
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     eval_dict, _ = obj.run_evaluator([], "", message=None)
     assert eval_dict is None
     assert eval_brain.calls == 0
@@ -196,7 +197,7 @@ def test_run_evaluator_invokes_brain_when_enabled_with_plan():
         _make_definition(2), _NoopBrain(),
         enable_evaluator=True, evaluator_brain=eval_brain,
     )
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     outgoings = [OutgoingMessage(recipient="peer-A", content="x")]
     eval_dict, metrics = obj.run_evaluator(outgoings, "reply text", _domain_msg())
     assert eval_brain.calls == 1
@@ -209,7 +210,7 @@ def test_run_evaluator_recovers_from_notimplemented():
         _make_definition(2), _NoopBrain(),
         enable_evaluator=True, evaluator_brain=_NoopBrain(),
     )
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     eval_dict, _ = obj.run_evaluator([], "", _domain_msg())
     assert eval_dict is None
 
@@ -223,7 +224,7 @@ def test_run_evaluator_recovers_from_unexpected_exception():
         _make_definition(2), _NoopBrain(),
         enable_evaluator=True, evaluator_brain=_Bad(),
     )
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     eval_dict, _ = obj.run_evaluator([], "", _domain_msg())
     assert eval_dict is None  # treated as PASS, no crash
 
@@ -264,7 +265,7 @@ def test_run_evaluator_runs_on_single_peer_objects():
         enable_evaluator=True,
         evaluator_brain=eval_brain,
     )
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     eval_dict, _ = obj.run_evaluator([], "", _domain_msg())
     assert eval_brain.calls == 1
     assert eval_dict == eval_result
@@ -294,13 +295,14 @@ def test_run_evaluator_skips_when_all_plan_steps_terminal():
         _make_definition(2), _NoopBrain(),
         enable_evaluator=True, evaluator_brain=eval_brain,
     )
-    obj._active_plan = Plan(
+    obj._active_plans["t1"] = Plan(
         goal="all done",
         steps=[
             PlanStep(kind="tell", target="peer-A", description="x", status="done"),
             PlanStep(kind="tell", target="peer-B", description="y", status="done"),
         ],
         status="active",
+        trace_id="t1",
     )
     eval_dict, _ = obj.run_evaluator([], "", _domain_msg())
     assert eval_dict is None
@@ -315,7 +317,7 @@ def test_run_evaluator_skips_when_steps_mixed_terminal_and_failed():
         _make_definition(2), _NoopBrain(),
         enable_evaluator=True, evaluator_brain=eval_brain,
     )
-    obj._active_plan = Plan(
+    obj._active_plans["t1"] = Plan(
         goal="mixed",
         steps=[
             PlanStep(kind="tell", target="peer-A", description="x", status="done"),
@@ -323,6 +325,7 @@ def test_run_evaluator_skips_when_steps_mixed_terminal_and_failed():
             PlanStep(kind="tell", target="peer-C", description="z", status="skipped"),
         ],
         status="active",
+        trace_id="t1",
     )
     eval_dict, _ = obj.run_evaluator([], "", _domain_msg())
     assert eval_dict is None
@@ -344,13 +347,14 @@ def test_run_evaluator_fires_when_at_least_one_planned_step_remains():
         _make_definition(2), _NoopBrain(),
         enable_evaluator=True, evaluator_brain=eval_brain,
     )
-    obj._active_plan = Plan(
+    obj._active_plans["t1"] = Plan(
         goal="one remaining",
         steps=[
             PlanStep(kind="tell", target="peer-A", description="x", status="done"),
             PlanStep(kind="tell", target="peer-B", description="y", status="planned"),
         ],
         status="active",
+        trace_id="t1",
     )
     eval_dict, _ = obj.run_evaluator([], "", _domain_msg())
     assert eval_brain.calls == 1
@@ -403,7 +407,7 @@ def _finish_step(reply="", outgoings=None):
     )
 
 
-def _domain_msg(trace_id=None):
+def _domain_msg(trace_id="t1"):
     return Message(
         sender="x", recipient="orchestrator", type=MessageType.DOMAIN,
         content="go", id="m1", depth_remaining=5, trace_id=trace_id,
@@ -425,7 +429,7 @@ def test_process_message_self_corrects_on_fail_then_pass():
         _make_definition(2), brain,
         enable_evaluator=True, evaluator_brain=brain,
     )
-    obj._active_plan = _make_plan()  # 2 planned steps; no outgoings → stays active
+    obj._active_plans["t1"] = _make_plan()  # 2 planned steps; no outgoings → stays active
     result = obj.process_message(_domain_msg())
     assert brain.react_calls == 2
     assert brain.eval_calls == 2
@@ -442,7 +446,7 @@ def test_process_message_single_cycle_on_pass():
         _make_definition(2), brain,
         enable_evaluator=True, evaluator_brain=brain,
     )
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     result = obj.process_message(_domain_msg())
     assert brain.react_calls == 1
     assert brain.eval_calls == 1
@@ -460,7 +464,7 @@ def test_process_message_caps_self_correction_cycles():
         enable_evaluator=True, evaluator_brain=brain,
         evaluator_max_cycles_per_trace=3,
     )
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     result = obj.process_message(_domain_msg(trace_id="t1"))
     # cap=3 → initial cycle + 3 correction cycles = 4 ReAct calls, 3 evals
     assert brain.react_calls == 4
@@ -488,7 +492,7 @@ def test_process_message_accumulates_outgoings_across_cycles():
         _make_definition(2), brain,
         enable_evaluator=True, evaluator_brain=brain,
     )
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     result = obj.process_message(_domain_msg())
     recipients = {o.recipient for o in result.outgoing_messages}
     assert recipients == {"peer-A", "peer-B"}
@@ -506,7 +510,7 @@ def test_process_message_no_evaluator_runs_single_cycle():
         _make_definition(2), brain,
         enable_evaluator=False, evaluator_brain=brain,
     )
-    obj._active_plan = _make_plan()
+    obj._active_plans["t1"] = _make_plan()
     result = obj.process_message(_domain_msg())
     assert brain.react_calls == 1
     assert brain.eval_calls == 0
@@ -577,10 +581,11 @@ def test_mark_effect_steps_done_on_evaluator_pass():
         enable_evaluator=True, evaluator_brain=brain,
     )
     from src.lnl.types import Plan, PlanStep
-    obj._active_plan = Plan(
+    obj._active_plans["t1"] = Plan(
         goal="Store record",
         steps=[PlanStep(kind="effect", description="Record in state", target=None, status="planned")],
         status="active",
+        trace_id="t1",
     )
     result = obj.process_message(_domain_msg())
     # After PASS, effect step should be done and plan closed

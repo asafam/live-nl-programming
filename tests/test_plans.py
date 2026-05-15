@@ -28,12 +28,19 @@ def _defn(object_id="obj", **overrides):
     return ObjectDefinition(object_id=object_id, role="A test object.", **overrides)
 
 
-def _user_msg(content, recipient="obj"):
+_msg_seq = 0
+def _user_msg(content, recipient="obj", trace_id: str | None = None):
+    global _msg_seq
+    _msg_seq += 1
+    mid = f"test-msg-{_msg_seq}"
+    tid = trace_id if trace_id is not None else mid
     return Message(
         sender="__user__",
         recipient=recipient,
         type=MessageType.DOMAIN,
         content=content,
+        id=mid,
+        trace_id=tid,
     )
 
 
@@ -198,15 +205,15 @@ class TestIncrementalUpdate:
         ]), brain)
 
         # First user message → creates plan with ask peer-a
-        obj.process_message(_user_msg("go", recipient="obj-a"))
+        obj.process_message(_user_msg("go", recipient="obj-a", trace_id="t1"))
 
         plan_after_1 = obj.active_plan
         assert plan_after_1 is not None
         assert len(plan_after_1.steps) == 1
         assert plan_after_1.steps[0].target == "peer-a"
 
-        # Second user message → extends plan with ask peer-b (new target)
-        obj.process_message(_user_msg("also ask", recipient="obj-a"))
+        # Second user message on the SAME trace → extends plan with ask peer-b
+        obj.process_message(_user_msg("also ask", recipient="obj-a", trace_id="t1"))
 
         plan_after_2 = obj.active_plan
         assert plan_after_2 is not None
@@ -460,13 +467,84 @@ class TestPromptRendering:
         """_apply_plan_update is still callable for backward compat (e.g. tests/scripts)."""
         brain = MockBrain()
         obj = LLMObject(_defn(), brain)
-        # Directly call _apply_plan_update (not via process_message)
+        # Directly call _apply_plan_update (not via process_message) with a trace_id
         from src.lnl.types import PlanUpdate
         obj._apply_plan_update(PlanUpdate(
             goal="test goal",
             steps=[{"kind": "ask", "description": "test step", "target": "peer"}],
-        ))
+        ), trace_id="t1")
         plan = obj.active_plan
         assert plan is not None
         assert plan.goal == "test goal"
         assert plan.steps[0].kind == "ask"
+
+
+class TestConcurrentTraces:
+    """Per-trace plan isolation: two cascades through the same object
+    produce separate plans, each keyed by their own trace_id."""
+
+    def test_two_traces_create_separate_plans(self):
+        brain = MockBrain()
+        # Each call asks a different peer
+        for peer in ("peer-a", "peer-b"):
+            brain.script_react(ReactStep(
+                thought=f"Ask {peer}.",
+                action="finish",
+                finish=ReactFinish(
+                    reply="",
+                    outgoing_messages=[OutgoingMessage(recipient=peer, content="?", expects_reply=True)],
+                ),
+            ))
+        brain.set_default(LLMResponse(updated_state={}, reply=""))
+
+        obj = LLMObject(_defn("obj-a", peers=[
+            PeerDeclaration("peer-a", "q"),
+            PeerDeclaration("peer-b", "q"),
+        ]), brain)
+
+        obj.process_message(_user_msg("first cascade", recipient="obj-a", trace_id="trace-A"))
+        obj.process_message(_user_msg("second cascade", recipient="obj-a", trace_id="trace-B"))
+
+        plans = obj.active_plans
+        assert set(plans.keys()) == {"trace-A", "trace-B"}
+        assert plans["trace-A"].trace_id == "trace-A"
+        assert plans["trace-B"].trace_id == "trace-B"
+        # Each plan has its own single step pointing at its peer
+        assert len(plans["trace-A"].steps) == 1
+        assert plans["trace-A"].steps[0].target == "peer-a"
+        assert len(plans["trace-B"].steps) == 1
+        assert plans["trace-B"].steps[0].target == "peer-b"
+
+    def test_plan_for_returns_only_matching_trace(self):
+        obj = LLMObject(_defn(), MockBrain())
+        obj._active_plans["t1"] = __import__("src.lnl.types", fromlist=["Plan"]).Plan(
+            goal="A", steps=[], status="active", trace_id="t1",
+        )
+        obj._active_plans["t2"] = __import__("src.lnl.types", fromlist=["Plan"]).Plan(
+            goal="B", steps=[], status="active", trace_id="t2",
+        )
+        assert obj.plan_for("t1").goal == "A"
+        assert obj.plan_for("t2").goal == "B"
+        assert obj.plan_for("missing") is None
+        assert obj.plan_for(None) is None
+        # active_plan backward-compat: returns None when there are multiple
+        assert obj.active_plan is None
+
+    def test_reply_routes_to_correct_trace_plan(self):
+        """A reply tagged with plan_step_index marks the step done on the
+        plan keyed by message.trace_id — not any other concurrent plan."""
+        obj = LLMObject(_defn(), MockBrain())
+        from src.lnl.types import Plan, PlanStep
+        obj._active_plans["t1"] = Plan(
+            goal="A", trace_id="t1", status="active",
+            steps=[PlanStep(kind="ask", target="peer", description="x", status="dispatched")],
+        )
+        obj._active_plans["t2"] = Plan(
+            goal="B", trace_id="t2", status="active",
+            steps=[PlanStep(kind="ask", target="peer", description="y", status="dispatched")],
+        )
+        # Mark step 0 done on t1 via the reply hook
+        obj._auto_mark_step_on_reply(0, trace_id="t1")
+        # t1 closes (only step is now done); t2 remains active and untouched
+        assert "t1" not in obj._active_plans
+        assert obj._active_plans["t2"].steps[0].status == "dispatched"

@@ -179,10 +179,14 @@ class PlanStep:
 
 @dataclass
 class Plan:
-    """An active or terminated plan. One active plan per object at a time."""
+    """An active or terminated plan, scoped to one trace_id. Multiple plans
+    may coexist on a single object — one per concurrent cascade."""
     goal: str
     steps: list[PlanStep] = field(default_factory=list)
-    status: str = "active"               # "active" | "complete" | "cancelled"
+    status: str = "active"               # "active" | "complete" | "cancelled" | "abandoned" | "failed"
+    trace_id: Optional[str] = None       # cascade this plan belongs to
+    created_at: datetime.datetime = field(default_factory=_utcnow)
+    last_progress_at: datetime.datetime = field(default_factory=_utcnow)
 
 
 @dataclass
