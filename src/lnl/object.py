@@ -98,8 +98,6 @@ class LLMObject:
         self._auto_track_knowledge_gaps = auto_track_knowledge_gaps
         self._auto_ask_peers_on_gap = auto_ask_peers_on_gap
         self._enable_sink_completion_shim = enable_sink_completion_shim
-        # Cache sink-role detection (one-time evaluation)
-        self._is_sink_cached: Optional[bool] = None
         # Pre-execution planner: separate LLM call producing a plan before
         # the ReAct loop.
         self._enable_planner = enable_planner
@@ -406,17 +404,6 @@ class LLMObject:
     # Keywords that identify a "sink" / terminal-effect object by its role text.
     # Sinks are the runtime's representation of external systems (write services,
     # notifiers, publishers). The shim guarantees they emit a completion artifact.
-    _SINK_ROLE_KEYWORDS = (
-        "write service", "write-service", "write_service",
-        "upload", "uploader",
-        "storage", "store ",  # trailing space avoids matching "stored"
-        "notif",  # matches "notifier", "notifications"
-        "publish",
-        "post ",  # trailing space avoids matching "postmortem" etc.
-        "send ",  # trailing space avoids matching "sender", "sends"
-        "draft",
-        "writer",
-    )
     # Terminal-status values we accept as evidence the sink completed.
     _SINK_COMPLETION_TERMS = (
         "sent", "stored", "uploaded", "created", "posted", "written",
@@ -449,19 +436,6 @@ class LLMObject:
         "no drive peer",
         "no email peer",
     )
-
-    def is_sink_role(self) -> bool:
-        """Heuristically detect whether this object is a terminal write/notify
-        sink based on its role text. Cached after first call.
-
-        DEPRECATED for shim activation — see `is_sink_for_this_turn`. Kept
-        for backward compatibility and as a fallback signal.
-        """
-        if self._is_sink_cached is not None:
-            return self._is_sink_cached
-        role = (self._definition.role or "").lower()
-        self._is_sink_cached = any(kw in role for kw in self._SINK_ROLE_KEYWORDS)
-        return self._is_sink_cached
 
     def is_sink_for_this_turn(self, trace_id: Optional[str]) -> bool:
         """Plan-driven sink detection — per-turn, no vocabulary.
@@ -604,20 +578,16 @@ class LLMObject:
 
         Sink detection: plan-driven, per-turn. The object is acting as a sink
         when the planner generated a plan with no peer dispatch (tell/ask)
-        steps — only tool/reason steps. Falls back to the legacy role-text
-        keyword check when no plan exists (planner disabled or didn't fire),
-        preserving compatibility with non-planner setups.
+        steps — only tool/reason steps. Domain-agnostic; uses the planner's
+        actual decision, no role-text vocabulary.
 
         Fires when: sink-for-this-turn AND state has no completion marker
-        AND reply has no artifact.
+        AND reply has no artifact. The shim is gated by the
+        `enable_sink_completion_shim` config flag (default True).
         """
         if not self._enable_sink_completion_shim:
             return finish
-        # Plan-driven detection takes precedence; fall back to role keywords
-        # when no plan exists.
-        plan_says_sink = self.is_sink_for_this_turn(trace_id)
-        no_plan = self.plan_for(trace_id) is None
-        if not plan_says_sink and not (no_plan and self.is_sink_role()):
+        if not self.is_sink_for_this_turn(trace_id):
             return finish
         merged = self._merged_state(pending_deltas)
         if self._state_has_completion(merged):
