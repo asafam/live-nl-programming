@@ -63,8 +63,8 @@ class LLMObject:
         auto_track_knowledge_gaps: bool = False,
         auto_ask_peers_on_gap: bool = False,
         enable_sink_completion_shim: bool = False,
-        enable_planner: bool = False,
-        enable_evaluator: bool = False,
+        enable_planner: bool = True,
+        enable_evaluator: bool = True,
         evaluator_max_cycles_per_trace: int = 3,
         planner_brain: "Optional[LLMBrain]" = None,
         evaluator_brain: "Optional[LLMBrain]" = None,
@@ -251,6 +251,15 @@ class LLMObject:
         """Return state: a dict if parseable, otherwise the raw string (or {} if empty)."""
         return _coerce_state(self._state)
 
+    def _working_state_for(self, trace_id: Optional[str]) -> str:
+        """Return the working state for a trace: plan.state if an active plan
+        exists, otherwise the master state. The LLM always sees this view."""
+        with self._plans_lock:
+            plan = self._active_plans.get(trace_id) if trace_id is not None else None
+            if plan is None:
+                return self._state
+            return plan.state
+
     @property
     def definition(self) -> ObjectDefinition:
         return self._definition
@@ -410,7 +419,7 @@ class LLMObject:
         try:
             prompt = build_evaluator_prompt(
                 self._definition,
-                self._state,
+                self._working_state_for(message.trace_id),
                 plan,
                 outgoing_messages,
                 reply,
@@ -602,15 +611,15 @@ class LLMObject:
         text = reply.lower()
         return any(phrase in text for phrase in self._SINK_DEFERRAL_PHRASES)
 
-    def _merged_state(self, pending_deltas: "list[StateDelta]") -> dict:
-        merged = _coerce_state(self._state)
-        if not isinstance(merged, dict):
-            merged = {}
+    def _merged_state(self, pending_deltas: "list[StateDelta]", trace_id: "Optional[str]" = None) -> dict:
+        base = _coerce_state(self._working_state_for(trace_id))
+        if not isinstance(base, dict):
+            base = {}
         else:
-            merged = dict(merged)
+            base = dict(base)
         for delta in pending_deltas:
-            merged = _apply_delta(merged, delta)
-        return merged
+            base = _apply_delta(base, delta)
+        return base
 
     def _state_has_completion(self, merged: dict) -> bool:
         """True if any string value in merged state matches a completion term."""
@@ -651,7 +660,7 @@ class LLMObject:
             return finish
         if not (self.is_sink_for_this_turn(trace_id) or self.is_sink_role()):
             return finish
-        merged = self._merged_state(pending_deltas)
+        merged = self._merged_state(pending_deltas, trace_id)
         if self._state_has_completion(merged):
             return finish
         if self._reply_has_artifact(finish.reply or ""):
@@ -761,6 +770,7 @@ class LLMObject:
                     # executor falls back to its own definition + behavior,
                     # which is the safer recovery path.
                     if plan.steps:
+                        plan.state = self._state  # snapshot master at plan creation
                         with self._plans_lock:
                             if trace_id is not None:
                                 self._active_plans[trace_id] = plan
@@ -809,7 +819,7 @@ class LLMObject:
             total_metrics = _accumulate_metrics(total_metrics, planner_metrics)
 
         sys_prompt = build_system_prompt(
-            self._definition, self._state,
+            self._definition, self._working_state_for(trace_id),
             tools=tools_desc,
             react_cross_objects=self._react_cross_objects,
             pending_timeout_seconds=self._pending_timeout_seconds,
@@ -863,13 +873,28 @@ class LLMObject:
             finish = self._apply_sink_shim(finish, pending_deltas, trace_id)
 
             if pending_deltas:
-                current = _coerce_state(self._state)
-                if not isinstance(current, dict):
-                    current = {}
-                for delta in pending_deltas:
-                    current = _apply_delta(current, delta)
-                self._state = json.dumps(current)
-            elif finish.updated_state:
+                with self._plans_lock:
+                    active_plan = self._active_plans.get(trace_id) if trace_id is not None else None
+                if active_plan is not None:
+                    # Apply deltas to the plan's working state copy; master is
+                    # untouched until the plan completes.
+                    current = _coerce_state(active_plan.state)
+                    if not isinstance(current, dict):
+                        current = {}
+                    for delta in pending_deltas:
+                        current = _apply_delta(current, delta)
+                    with self._plans_lock:
+                        active_plan.state = json.dumps(current)
+                        active_plan.accumulated_deltas.extend(pending_deltas)
+                else:
+                    # No plan — apply directly to master (planner-off path).
+                    current = _coerce_state(self._state)
+                    if not isinstance(current, dict):
+                        current = {}
+                    for delta in pending_deltas:
+                        current = _apply_delta(current, delta)
+                    self._state = json.dumps(current)
+            elif finish.updated_state and self.plan_for(trace_id) is None:
                 self._state = finish.updated_state
 
             self._auto_create_plan_from_outgoing(finish.outgoing_messages or [], message)
@@ -956,12 +981,12 @@ class LLMObject:
             })})
             messages.append({"role": "user", "content": feedback_text})
 
-            # Refresh the system prompt so the next cycle sees the committed
-            # state and the updated plan (steps marked dispatched/done).
+            # Refresh the system prompt so the next cycle sees the working
+            # state (plan copy or master) and the updated plan steps.
             messages[0] = {
                 "role": "system",
                 "content": build_system_prompt(
-                    self._definition, self._state,
+                    self._definition, self._working_state_for(trace_id),
                     tools=tools_desc,
                     react_cross_objects=self._react_cross_objects,
                     pending_timeout_seconds=self._pending_timeout_seconds,
@@ -1232,11 +1257,16 @@ class LLMObject:
                     self._active_plans[trace_id] = Plan(
                         goal=update.goal, steps=new_steps, status="active",
                         trace_id=trace_id,
+                        # Carry over the working state and accumulated deltas from
+                        # the previous plan — the plan is being reshaped, not restarted.
+                        state=prev.state if prev is not None else self._state,
+                        accumulated_deltas=list(prev.accumulated_deltas) if prev is not None else [],
                     )
             return
 
         # Shape 3: close active plan.
         if update.status in PLAN_TERMINAL_STATUSES:
+            accumulated = []
             with self._plans_lock:
                 plan = self._active_plans.get(trace_id) if trace_id is not None else None
                 if plan is None:
@@ -1247,9 +1277,18 @@ class LLMObject:
                         self.object_id, trace_id,
                     )
                     return
+                if update.status == "complete":
+                    accumulated = list(plan.accumulated_deltas)
                 plan.status = update.status
                 self._completed_plans.append(plan)
                 del self._active_plans[trace_id]
+            if accumulated:
+                current = _coerce_state(self._state)
+                if not isinstance(current, dict):
+                    current = {}
+                for delta in accumulated:
+                    current = _apply_delta(current, delta)
+                self._state = json.dumps(current)
             return
 
         # Shape 2: incremental updates to active plan.
@@ -1529,6 +1568,7 @@ class LLMObject:
                     steps=steps,
                     status="active",
                     trace_id=trace_id,
+                    state=self._state,  # snapshot master at plan creation
                 )
             else:
                 # Extend with steps for genuinely new targets (avoid duplicates).
@@ -1942,8 +1982,10 @@ class LLMObject:
 
     def _auto_close_plan_if_complete(self, trace_id: Optional[str] = None) -> None:
         """If the active plan for `trace_id` has at least one step and ALL
-        steps are terminal, close the plan automatically (status='complete')."""
+        steps are terminal, close the plan automatically (status='complete')
+        and commit its accumulated deltas to the master state."""
         closed = False
+        accumulated = []
         with self._plans_lock:
             plan = self._active_plans.get(trace_id) if trace_id is not None else None
             if plan is None or not plan.steps:
@@ -1951,10 +1993,18 @@ class LLMObject:
             all_terminal = all(s.status in STEP_TERMINAL_STATUSES for s in plan.steps)
             if all_terminal:
                 plan.status = "complete"
+                accumulated = list(plan.accumulated_deltas)
                 self._completed_plans.append(plan)
                 del self._active_plans[trace_id]
                 closed = True
         if closed:
+            if accumulated:
+                current = _coerce_state(self._state)
+                if not isinstance(current, dict):
+                    current = {}
+                for delta in accumulated:
+                    current = _apply_delta(current, delta)
+                self._state = json.dumps(current)
             self._unregister_waits_for_trace(trace_id)
 
     def mark_step_dispatched(self, step_index: int, trace_id: Optional[str] = None) -> None:

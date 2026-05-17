@@ -110,13 +110,13 @@ class SystemConfig:
     # Pre-execution planner: separate LLM call that produces a structured plan
     # BEFORE the executor's ReAct loop. The plan is stored in active_plan and
     # surfaces in the executor's prompt as an explicit checklist.
-    enable_planner: bool = False
+    enable_planner: bool = True
     # Post-execution evaluator: separate LLM call that grades the executor's
     # most recent turn against the active plan, returning structured criterion-
     # level pass/fail. On FAIL, the runtime delivers a feedback heartbeat to
     # the orchestrator so it can fix the gaps. Capped at N cycles per trace
     # to bound cost.
-    enable_evaluator: bool = False
+    enable_evaluator: bool = True
     evaluator_max_cycles_per_trace: int = 3
     # Plan retirement policy. Plans that don't progress for stale_plan_seconds
     # are moved from _active_plans to _completed_plans with status='abandoned'.

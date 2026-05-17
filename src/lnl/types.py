@@ -233,6 +233,11 @@ class Plan:
     # both the primary trace_id and this set so post-correlation lookups
     # resolve to the absorbing plan.
     additional_trace_ids: set[str] = field(default_factory=set)
+    # Per-plan state: initialized from master on creation; deltas apply here
+    # instead of master during plan execution. Committed to master on complete;
+    # discarded on cancel/abandon.
+    state: str = ""
+    accumulated_deltas: list["StateDelta"] = field(default_factory=list)
 
 
 @dataclass
