@@ -807,7 +807,7 @@ Examples:
     )
     shared.add_argument(
         "--model", "-m",
-        default="claude-sonnet-4-6",
+        default="gpt-5.4",
         help="Model name (default: claude-sonnet-4-6)",
     )
     shared.add_argument(

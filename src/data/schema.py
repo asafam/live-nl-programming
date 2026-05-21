@@ -400,6 +400,18 @@ class WorkflowStepsJudgement(BaseModel):
     missed_triggers: list[MissedTrigger] = Field(default_factory=list)
 
 
+class StepExpectOutput(BaseModel):
+    """LLM output: one step's regenerated expect.action + expect.reason."""
+    step_index: int  # 1-based
+    action: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class WorkflowExpectsRegenOutput(BaseModel):
+    """LLM output for regen_expects: one entry per Step, in input order."""
+    step_expects: list[StepExpectOutput]
+
+
 class StepVerdict(BaseModel):
     """Per-workflow-Step verdict combining deterministic health + LLM fidelity + LLM quality.
 

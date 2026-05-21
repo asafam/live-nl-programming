@@ -158,14 +158,14 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--provider",
         "-p",
         choices=["openai", "azure", "anthropic", "google"],
-        default=None,
-        help="LLM provider (inferred from model if not specified). Use 'azure' for Azure OpenAI deployments.",
+        default="azure",
+        help="LLM provider (default: azure). Use 'azure' for Azure OpenAI deployments. If omitted with a model name, provider is inferred from the name when possible.",
     )
     parser.add_argument(
         "--model",
         "-m",
-        default="claude-sonnet-4-6",
-        help="Model name (default: claude-sonnet-4-6). Provider is inferred: claude-* → anthropic, gpt-*/o1-*/o3-* → openai, gemini-* → google. For Azure, use --provider azure with the deployment name.",
+        default="gpt-5.4",
+        help="Model name (default: gpt-5.4 on azure). Provider is inferred when explicit: claude-* → anthropic, gpt-*/o1-*/o3-* → openai, gemini-* → google. For Azure, use --provider azure with the deployment name (default already azure).",
     )
     parser.add_argument(
         "--seed",

@@ -1,0 +1,85 @@
+prompt: |
+  # Task: Write per-Step expect.action (no other changes)
+
+  You are given a workflow whose Steps have `text` and `target` set, but
+  whose `expect.action` / `expect.reason` fields need to be (re)written.
+
+  Your job: for each Step, produce a single, immediate, observable
+  `expect.action` describing what happens directly when that trigger
+  arrives — NOT the whole downstream cascade.
+
+  Do NOT modify text/target/source. Do NOT add new steps. Only produce
+  per-step expects.
+
+  ---
+
+  ## Automation
+
+  **Name:** {NAME}
+
+  **Scenario steps (template context):**
+  {GROUNDED_STEPS}
+
+  ---
+
+  ## Object System
+
+  {OBJECTS}
+
+  ---
+
+  ## Steps (text + target already set)
+
+  {STEPS}
+
+  ---
+
+  ## What `expect.action` should look like
+
+  - **A SINGLE observable outcome**, not the whole cascade.
+  - Describe ONE concrete thing that happens directly as a result of the
+    trigger arriving (a row appended, a message stored, a row's status
+    flipped) — NOT every downstream action.
+  - Use the SAME concrete names from the Step's `text` and the same
+    product/system names the scenario uses.
+
+  **Right shape (single outcome):**
+    ✓ "A new row appended to the `customer-intake` Airtable table with
+       name 'Sarah Mitchell', email 'sarah@example.com', phone, address."
+    ✓ "Lead record `LEAD-4821` stored in the `crm.leads` Snowflake table
+       with status 'new'."
+
+  **Wrong (bundles cascade outcomes):**
+    ✗ "A new row appended; a Google Contact created; a Slack notification
+       sent; a Canvas log entry written." (four downstream outcomes)
+    ✗ "Lead stored, scored, routed to the assigned rep, and confirmation
+       email sent." (cascade enumerated)
+
+  Describe natural-language messages and data writes — NOT interactive UI
+  elements. Use the same vendor/product names the scenario already mentions.
+
+  `expect.reason` is one sentence naming the rule or peer relationship
+  that causes the outcome (e.g., "the customer-intake object stores all
+  incoming Typeform submissions per its behavior").
+
+  **Omit `expect` entirely (leave it null)** for scheduled / heartbeat /
+  cron triggers where the outcome isn't deterministic at the trigger
+  moment — set `action` and `reason` both to `null` for that step.
+
+  ---
+
+  ## Output
+
+  Return strictly a JSON object matching this schema:
+    {{
+      "step_expects": [
+        {{
+          "step_index": 1,
+          "action": "<single observable outcome or null>",
+          "reason": "<one-sentence rule or null>"
+        }},
+        ...
+      ]
+    }}
+
+  Include one entry per Step, in the same order, using 1-based step_index.
