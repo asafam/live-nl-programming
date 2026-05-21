@@ -412,7 +412,7 @@ def _execute_test_case_inner(
     # response_template — not in ObjectDef. LLM-objects are never seeded with data.
     #
     # Skills are intentionally NOT included here — they are internal computations
-    # (the generate_samples prompt marks them as "purely internal, no external system
+    # (the generate_workflows prompt marks them as "purely internal, no external system
     # calls"). Registering them as tools would tell the LLM to call them externally.
     # Triggered events are dispatched directly by the harness (no mock tool needed).
     final_mock_tools = merge_mock_tools(global_mock_tools or [], tc.mock_tools)

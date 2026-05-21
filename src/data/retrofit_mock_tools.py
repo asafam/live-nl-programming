@@ -39,7 +39,7 @@ from tqdm import tqdm
 
 load_dotenv()
 
-from src.data.generate_samples import _generate_mock_tool_data
+from src.data.generate_workflows import _generate_mock_tool_data
 from src.data.llm import create_llm
 from src.data.llm.base import ChatMessage
 from src.data.schema import MockToolDef, Sample

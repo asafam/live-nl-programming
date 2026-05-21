@@ -37,7 +37,7 @@ load_dotenv()
 from src.data.schema import Workflow
 from src.data.llm import create_llm
 from src.data.utils import infer_provider, add_common_args
-from src.data.generate_samples import _generate_mock_tool_data, _infer_data_hint
+from src.data.generate_workflows import _generate_mock_tool_data, _infer_data_hint
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -44,10 +44,10 @@ Objects treated fire-and-forget peer sends (writing to Notion, posting to Slack)
 
 #### 4. Mock tool data field mismatches
 
-`_generate_mock_tool_data()` in `generate_samples.py` generated data using only the tool name and generic step context. The function `_infer_data_hint()` only handled knowledge bases, org directories, and policy stores — no patterns for HubSpot, Salesforce, Airtable, Zapier Tables, Zendesk (the most common platforms in the dataset). This caused status field mismatches: mock data would generate `status: "captured"` but the expectation (and object behavior) expected `status: "new"`. Objects stored whatever field names the mock data used, causing downstream mismatches.
+`_generate_mock_tool_data()` in `generate_workflows.py` generated data using only the tool name and generic step context. The function `_infer_data_hint()` only handled knowledge bases, org directories, and policy stores — no patterns for HubSpot, Salesforce, Airtable, Zapier Tables, Zendesk (the most common platforms in the dataset). This caused status field mismatches: mock data would generate `status: "captured"` but the expectation (and object behavior) expected `status: "new"`. Objects stored whatever field names the mock data used, causing downstream mismatches.
 
 **Files changed:**
-- `src/data/generate_samples.py` — Expanded `_infer_data_hint()` with platform-specific patterns (HubSpot/CRM, Salesforce, Zendesk/ticketing, Airtable/Zapier Tables/spreadsheets, Slack message stores, generic data stores). Added guidance to the mock data generation prompt: "Use field names and value formats that match how the behavior description refers to the data — downstream objects will access fields by exact name."
+- `src/data/generate_workflows.py` — Expanded `_infer_data_hint()` with platform-specific patterns (HubSpot/CRM, Salesforce, Zendesk/ticketing, Airtable/Zapier Tables/spreadsheets, Slack message stores, generic data stores). Added guidance to the mock data generation prompt: "Use field names and value formats that match how the behavior description refers to the data — downstream objects will access fields by exact name."
 
 #### 5. Steps sparsity — single entry-point for multi-trigger automations
 
@@ -163,7 +163,7 @@ In this specific case the identifier format (`U4821` vs `priya.nair`) is NOT cau
 3. IDs in expectations are over-specific: if the system sends the DM to `priya.nair` (correct) but the expectation anchors on `U4821`, a strict judge might fail a correct outcome.
 
 **Fix applied:**
-- `src/data/generate_samples.py` — Added identifier format guidance to `_generate_mock_tool_data` prompt: Slack user IDs must be 9 alphanumeric chars (e.g. `U01ABCDEF`, not `U4821`); ticket IDs should follow realistic conventions (`PROJ-1042`, not `PROJ-42`); prefer names over opaque IDs where possible.
+- `src/data/generate_workflows.py` — Added identifier format guidance to `_generate_mock_tool_data` prompt: Slack user IDs must be 9 alphanumeric chars (e.g. `U01ABCDEF`, not `U4821`); ticket IDs should follow realistic conventions (`PROJ-1042`, not `PROJ-42`); prefer names over opaque IDs where possible.
 - `config/prompts/data-gen/write_expectations.yaml` — Added "Use names as primary identifiers" rule: reference people by name, not system ID. Only include an ID if it is the sole identifier in the evidence or is itself the meaningful output. Over-specifying identifiers causes false failures when system and evidence use different forms.
 
 **Priority:** Medium. Does not cause failures by itself in current evals, but adds noise and risks future false failures.

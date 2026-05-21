@@ -39,7 +39,7 @@ from tqdm import tqdm
 
 load_dotenv()
 
-from src.data.generate_samples import _generate_mock_tool_data
+from src.data.generate_workflows import _generate_mock_tool_data
 from src.data.evaluate import _run_with_timeout, merge_mock_tools
 from src.data.llm import create_llm
 from src.data.schema import MockToolDef, Sample

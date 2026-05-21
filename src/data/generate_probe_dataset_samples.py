@@ -22,7 +22,7 @@ Run through both evaluate.py (LNL) and evaluate_baseline.py (OpenClaw):
         --tracked-judge config/prompts/lnl/judge_memory_fidelity.yaml
 
 Usage:
-    python -m src.data.generate_probe_dataset_tcs \\
+    python -m src.data.generate_probe_dataset_samples \\
         -i outputs/data/zapier/20260411_zapier_clean/workflows.jsonl \\
         --depths 10 20 30 50 \\
         --seeds 3 \\
@@ -43,7 +43,7 @@ from tqdm import tqdm
 
 load_dotenv()
 
-from src.data.generate_test_cases import format_sample
+from src.data.generate_samples import format_sample
 from src.data.schema import (
     BackgroundEventsList,
     Event,
@@ -595,7 +595,7 @@ def _fmt_background_events(
     )
 
 
-# ── Workflow loader (shared with generate_state_probe_tcs.py) ──────────────────
+# ── Workflow loader (shared with generate_state_probe_samples.py) ──────────────────
 
 def _load_samples(input_path: Path) -> list[Workflow]:
     """Load samples from JSONL — accepts both workflows.jsonl and samples.jsonl."""

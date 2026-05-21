@@ -116,7 +116,7 @@ def format_prompt(
     )
 
 
-def generate_test_cases(
+def generate_samples(
     llm,
     prompt: str,
     example: dict,
@@ -200,7 +200,7 @@ Examples:
     parser.add_argument(
         "--prompt-template",
         type=Path,
-        default=Path("config/prompts/data-gen/generate_samples.yaml"),
+        default=Path("config/prompts/data-gen/generate_workflows.yaml"),
         help="Path to prompt template (default: config/prompts/data-gen/generate.yaml)",
     )
     parser.add_argument(
@@ -343,7 +343,7 @@ Examples:
             prompt = format_prompt(template, example, test_case_count, events_per_tc)
 
             # Generate test cases
-            result = generate_test_cases(llm, prompt, example)
+            result = generate_samples(llm, prompt, example)
 
             if result:
                 # Write each test case as a separate line

@@ -22,7 +22,7 @@ Run with both evaluate.py (LNL) and evaluate_baseline.py (OpenClaw), then
 analyze with scripts/analyze_state_probes.py --mode fidelity.
 
 Usage:
-    python -m src.data.generate_state_fidelity_tcs \\
+    python -m src.data.generate_state_fidelity_samples \\
         -i data/zapier/workflows.jsonl \\
         -o outputs/state_fidelity/pilot_tcs.jsonl \\
         --depths 5 10 20 30 \\
@@ -43,7 +43,7 @@ from tqdm import tqdm
 
 load_dotenv()
 
-from src.data.generate_test_cases import format_sample
+from src.data.generate_samples import format_sample
 from src.data.schema import (
     Event,
     FidelityEventsList,

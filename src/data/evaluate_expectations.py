@@ -39,7 +39,7 @@ from src.data.schema import Sample, EventExpect
 from src.data.llm import create_llm
 from src.data.llm.base import ChatMessage
 from src.data.utils import infer_provider, add_common_args, generate_with_retries
-from src.data.generate_test_cases import _ts_key, _active_mods_for  # noqa: F401 (re-exported)
+from src.data.generate_samples import _ts_key, _active_mods_for  # noqa: F401 (re-exported)
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────

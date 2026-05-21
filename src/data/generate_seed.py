@@ -44,8 +44,8 @@ from tqdm import tqdm
 load_dotenv()
 
 from src.data.schema import Workflow, Sample
-from src.data.generate_samples import _generate_mock_tool_data, _DATA_TOOL_RE
-from src.data.generate_test_cases import _rewrite_event_expectations
+from src.data.generate_workflows import _generate_mock_tool_data, _DATA_TOOL_RE
+from src.data.generate_samples import _rewrite_event_expectations
 from src.data.llm import create_llm
 from src.data.utils import (
     add_common_args,

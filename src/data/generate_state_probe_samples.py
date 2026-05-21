@@ -14,7 +14,7 @@ Run with both evaluate.py (LNL) and evaluate_baseline.py (OpenClaw) to
 compare per-probe conditioned accuracy across depths.
 
 Usage:
-    python -m src.data.generate_state_probe_tcs \\
+    python -m src.data.generate_state_probe_samples \\
         -i outputs/data/zapier/20260421_zapier_fixed/samples.jsonl \\
         --depths 5 10 20 \\
         --k-probes 5 \\
@@ -34,7 +34,7 @@ from tqdm import tqdm
 
 load_dotenv()
 
-from src.data.generate_test_cases import format_sample
+from src.data.generate_samples import format_sample
 from src.data.schema import (
     Event,
     GeneratedEventWithExpect,

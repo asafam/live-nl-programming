@@ -5,7 +5,7 @@ Two-stage pipeline for generating test cases from Zapier automation templates us
 ## Pipeline Overview
 
 ```
-Templates (YAML) → [generate_samples] → Samples (JSONL) → [generate_test_cases] → Test Cases (JSONL)
+Templates (YAML) → [generate_workflows] → Samples (JSONL) → [generate_samples] → Test Cases (JSONL)
 ```
 
 1. **Stage 1: Generate Samples** - Instantiate templates with concrete values and (with `--step-style object`) identify LLM-objects including service objects
@@ -24,8 +24,8 @@ python -m src.data.pipeline -i data/zapier/raw/templates.yaml --target-dir outpu
 python -m src.data.pipeline --workflows outputs/data/zapier/templates_samples_object.jsonl
 
 # Stages can also be run individually
-python -m src.data.generate_samples -i data/zapier/raw/templates.yaml --step-style object
-python -m src.data.generate_test_cases -i outputs/data/zapier/templates_samples_object.jsonl
+python -m src.data.generate_workflows -i data/zapier/raw/templates.yaml --step-style object
+python -m src.data.generate_samples -i outputs/data/zapier/templates_samples_object.jsonl
 ```
 
 ---
@@ -37,7 +37,7 @@ Instantiates raw templates with specific, realistic values.
 ### Usage
 
 ```bash
-python -m src.data.generate_samples \
+python -m src.data.generate_workflows \
     --input data/zapier/raw/examples.yaml \
     --model claude-sonnet-4-5-20250929 \
     --workflows-per-template 3
@@ -49,7 +49,7 @@ python -m src.data.generate_samples \
 |-----------|---------|-------------|
 | `--input`, `-i` | (required) | Path to raw templates YAML file |
 | `--output`, `-o` | `outputs/data/zapier/<stem>_samples_<style>.jsonl` | Output JSONL path (derived from input and step-style) |
-| `--prompt-template` | `config/prompts/data-gen/generate_samples.yaml` | Prompt template path |
+| `--prompt-template` | `config/prompts/data-gen/generate_workflows.yaml` | Prompt template path |
 | `--model`, `-m` | `claude-sonnet-4-5-20250929` | Model name (provider auto-detected) |
 | `--seed`, `-s` | None | Random seed for reproducibility |
 | `--workflows-per-template` | `1` | Samples to generate per template |
@@ -86,7 +86,7 @@ Creates test scenarios with modifications and events from samples.
 ### Usage
 
 ```bash
-python -m src.data.generate_test_cases \
+python -m src.data.generate_samples \
     --input outputs/data/zapier/generated/workflows.jsonl \
     --model claude-sonnet-4-5-20250929 \
     --scenario-count 1
@@ -98,7 +98,7 @@ python -m src.data.generate_test_cases \
 |-----------|---------|-------------|
 | `--input`, `-i` | (required) | Path to samples JSONL (from Stage 1) |
 | `--output`, `-o` | `<input_stem>__<mod-type>__<ambiguity>.jsonl` | Output JSONL path (derived from input, mod-type, and ambiguity) |
-| `--prompt-template` | `config/prompts/data-gen/generate_test_cases.yaml` | Prompt template path |
+| `--prompt-template` | `config/prompts/data-gen/generate_samples.yaml` | Prompt template path |
 | `--model`, `-m` | `claude-sonnet-4-5-20250929` | Model name (provider auto-detected) |
 | `--seed`, `-s` | None | Random seed for reproducibility |
 | `--mod-type` | None | Modification type: `temporal`, `contextual`, `exception`, `correction`, `expansion`, `removal`, or `mixed` (random types). If omitted, generates all types separately. |
@@ -213,37 +213,37 @@ python -m src.data.pipeline -i data/zapier/raw/examples.yaml --target-dir output
 python -m src.data.pipeline -i data/zapier/raw/examples.yaml --target-dir outputs/my-run
 
 # Full pipeline without target folder (paths derived from input filename)
-python -m src.data.generate_samples -i data/zapier/raw/examples.yaml --step-style object --workflows-per-template 3
-python -m src.data.generate_test_cases -i outputs/data/zapier/examples_samples_object.jsonl
+python -m src.data.generate_workflows -i data/zapier/raw/examples.yaml --step-style object --workflows-per-template 3
+python -m src.data.generate_samples -i outputs/data/zapier/examples_samples_object.jsonl
 
 # Generate only temporal modification scenarios
-python -m src.data.generate_test_cases -i outputs/data/zapier/generated/workflows.jsonl --mod-type temporal
+python -m src.data.generate_samples -i outputs/data/zapier/generated/workflows.jsonl --mod-type temporal
 
 # Generate 3 scenarios per modification type
-python -m src.data.generate_test_cases -i outputs/data/zapier/generated/workflows.jsonl --scenario-count 3
+python -m src.data.generate_samples -i outputs/data/zapier/generated/workflows.jsonl --scenario-count 3
 
 # Generate scenarios with 2 modifications each (same type)
-python -m src.data.generate_test_cases -i outputs/data/zapier/generated/workflows.jsonl --mod-type temporal --mods-per-scenario 2
+python -m src.data.generate_samples -i outputs/data/zapier/generated/workflows.jsonl --mod-type temporal --mods-per-scenario 2
 
 # Generate scenarios with 3 random/mixed modification types
-python -m src.data.generate_test_cases -i outputs/data/zapier/generated/workflows.jsonl --mod-type mixed --mods-per-scenario 3
+python -m src.data.generate_samples -i outputs/data/zapier/generated/workflows.jsonl --mod-type mixed --mods-per-scenario 3
 
 # Force all modifications to be vague
-python -m src.data.generate_test_cases -i outputs/data/zapier/generated/workflows.jsonl --ambiguity vague
+python -m src.data.generate_samples -i outputs/data/zapier/generated/workflows.jsonl --ambiguity vague
 
 # Random ambiguity (default behavior)
-python -m src.data.generate_test_cases -i outputs/data/zapier/generated/workflows.jsonl --ambiguity random
+python -m src.data.generate_samples -i outputs/data/zapier/generated/workflows.jsonl --ambiguity random
 
 # With Anthropic Sonnet
-python -m src.data.generate_samples -i data/zapier/raw/examples.yaml --model claude-sonnet-4-5-20250929
-python -m src.data.generate_test_cases -i outputs/data/zapier/generated/workflows.jsonl --model claude-sonnet-4-5-20250929
+python -m src.data.generate_workflows -i data/zapier/raw/examples.yaml --model claude-sonnet-4-5-20250929
+python -m src.data.generate_samples -i outputs/data/zapier/generated/workflows.jsonl --model claude-sonnet-4-5-20250929
 
 # Resume after interruption (skips completed items)
-python -m src.data.generate_samples -i data/zapier/raw/examples.yaml
-python -m src.data.generate_test_cases -i outputs/data/zapier/generated/workflows.jsonl
+python -m src.data.generate_workflows -i data/zapier/raw/examples.yaml
+python -m src.data.generate_samples -i outputs/data/zapier/generated/workflows.jsonl
 
 # Force regeneration
-python -m src.data.generate_samples -i data/zapier/raw/examples.yaml --force
+python -m src.data.generate_workflows -i data/zapier/raw/examples.yaml --force
 ```
 
 ---

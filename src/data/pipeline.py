@@ -27,7 +27,7 @@ from pathlib import Path
 
 import signal
 
-from src.data import generate_samples, generate_test_cases, generate_seed
+from src.data import generate_workflows, generate_samples, generate_seed
 from src.data.validate_test_cases import (
     validate_sample, validate_test_case, print_validation_report,
     BLOCKING_VALIDATORS, WARNING_VALIDATORS,
@@ -566,7 +566,7 @@ def _validate_and_repair_samples(
         fix_args.ids = ids
         fix_args.force = True
         try:
-            generate_samples.run(fix_args)
+            generate_workflows.run(fix_args)
         except Exception as e:
             print(f"  [retry] Generation failed: {e}")
             break
@@ -773,7 +773,7 @@ Examples:
     stage2.add_argument(
         "--mod-type",
         type=str,
-        choices=list(generate_test_cases.MODIFICATION_TYPES.keys()),
+        choices=list(generate_samples.MODIFICATION_TYPES.keys()),
         default=None,
         help="Modification type (default: all types)",
     )
@@ -786,14 +786,14 @@ Examples:
     stage2.add_argument(
         "--ambiguity",
         type=str,
-        choices=list(generate_test_cases.AMBIGUITY_DESCRIPTIONS.keys()),
+        choices=list(generate_samples.AMBIGUITY_DESCRIPTIONS.keys()),
         default="random",
         help="Ambiguity level (default: random)",
     )
     stage2.add_argument(
         "--samples-prompt-template",
         type=Path,
-        default=Path("config/prompts/data-gen/generate_test_cases.yaml"),
+        default=Path("config/prompts/data-gen/generate_samples.yaml"),
         help="Prompt template for stage 2",
     )
 
@@ -937,7 +937,7 @@ Examples:
     )
 
     if not skip_stage1:
-        workflows_path = generate_samples.run(stage1_args)
+        workflows_path = generate_workflows.run(stage1_args)
 
     if not args.no_validate:
         workflows_path, modified_ids = _validate_and_repair_samples(
@@ -985,7 +985,7 @@ Examples:
 
     stage2_args = argparse.Namespace(
         input=workflows_path,
-        output=samples_output,  # None → derived by generate_test_cases.run()
+        output=samples_output,  # None → derived by generate_samples.run()
         prompt_template=args.test_cases_prompt_template,
         scenario_count=args.scenario_count,
         events_before=args.events_before,
@@ -1005,7 +1005,7 @@ Examples:
         limit=args.limit,
         workers=args.workers,
     )
-    samples_path = generate_test_cases.run(stage2_args)
+    samples_path = generate_samples.run(stage2_args)
 
     # --- Stage 3 ---
     print()

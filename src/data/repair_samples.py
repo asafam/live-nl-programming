@@ -10,7 +10,7 @@ Fixes:
       hallucinated channel names)
 
 Usage:
-    python -m src.data.repair_test_cases \\
+    python -m src.data.repair_samples \\
         --input outputs/data/zapier/ITER4/samples.jsonl \\
         --model claude-sonnet-4-6 \\
         --workers 4
@@ -32,7 +32,7 @@ from src.data.schema import Workflow, Sample, Workflows
 from src.data.validate_test_cases import find_trigger_reference_errors, find_missing_step_data
 from src.data.llm import create_llm
 from src.data.utils import infer_provider, add_common_args
-from src.data.generate_test_cases import _rewrite_event_expectations
+from src.data.generate_samples import _rewrite_event_expectations
 
 
 # ── Fix 1: triggered_by patch (deterministic, no LLM) ────────────────────────

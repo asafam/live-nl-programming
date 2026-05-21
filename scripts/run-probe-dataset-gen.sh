@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generate probe-dataset test cases (probe-first, 4-stage).
-# Activates the project venv and runs generate_probe_dataset_tcs.py.
+# Activates the project venv and runs generate_probe_dataset_samples.py.
 #
 # Usage:
 #   ./scripts/run-probe-dataset-gen.sh -i outputs/data/zapier/<run>/workflows.jsonl [options]
@@ -31,4 +31,4 @@ else
 fi
 
 cd "$REPO_ROOT"
-python -m src.data.generate_probe_dataset_tcs "$@"
+python -m src.data.generate_probe_dataset_samples "$@"
