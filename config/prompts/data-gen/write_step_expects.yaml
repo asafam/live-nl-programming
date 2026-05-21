@@ -1,12 +1,13 @@
 prompt: |
-  # Task: Write per-Step expect.action (no other changes)
+  # Task: Write per-Step expect.action (terminal-state outcomes)
 
   You are given a workflow whose Steps have `text` and `target` set, but
   whose `expect.action` / `expect.reason` fields need to be (re)written.
 
-  Your job: for each Step, produce a single, immediate, observable
-  `expect.action` describing what happens directly when that trigger
-  arrives — NOT the whole downstream cascade.
+  Your job: for each Step, write `expect.action` as **the terminal,
+  externally-observable state changes the cascade produces** — what the
+  outside world can verify happened (rows written, emails sent, status
+  fields updated, files created). NOT first-hop peer dispatches.
 
   Do NOT modify text/target/source. Do NOT add new steps. Only produce
   per-step expects.
@@ -36,35 +37,78 @@ prompt: |
 
   ## What `expect.action` should look like
 
-  - **A SINGLE observable outcome**, not the whole cascade.
-  - Describe ONE concrete thing that happens directly as a result of the
-    trigger arriving (a row appended, a message stored, a row's status
-    flipped) — NOT every downstream action.
-  - Use the SAME concrete names from the Step's `text` and the same
-    product/system names the scenario uses.
+  **Terminal-state checks — exhaustive.** Trace the cascade and list
+  EVERY observable side effect it produces. The eval judges what's
+  externally verifiable, so an exhaustive list is what makes a Step
+  testable.
 
-  **Right shape (single outcome):**
-    ✓ "A new row appended to the `customer-intake` Airtable table with
-       name 'Sarah Mitchell', email 'sarah@example.com', phone, address."
-    ✓ "Lead record `LEAD-4821` stored in the `crm.leads` Snowflake table
-       with status 'new'."
+  Categories to include — list every one that fires:
 
-  **Wrong (bundles cascade outcomes):**
-    ✗ "A new row appended; a Google Contact created; a Slack notification
-       sent; a Canvas log entry written." (four downstream outcomes)
-    ✗ "Lead stored, scored, routed to the assigned rep, and confirmation
-       email sent." (cascade enumerated)
+  1. **State changes in named storage** — rows inserted/updated, status
+     fields flipped, fields set on records, counters incremented.
+     Example: "Order ORD-1042 status set to 'fulfilled' in the
+     orders Postgres table."
 
-  Describe natural-language messages and data writes — NOT interactive UI
-  elements. Use the same vendor/product names the scenario already mentions.
+  2. **Outbound messages / notifications** — emails sent, Slack DMs/posts,
+     SMS, push notifications. Always include recipient + content summary.
+     Example: "Email sent to maya.patel@acme.com with subject 'Welcome
+     to Acme' and body containing onboarding checklist link."
 
-  `expect.reason` is one sentence naming the rule or peer relationship
-  that causes the outcome (e.g., "the customer-intake object stores all
-  incoming Typeform submissions per its behavior").
+  3. **Tool / API invocations** — calls to external systems (Stripe
+     charge, DocuSign envelope create, OpenAI completion, Bitly shorten,
+     etc.). Include the tool name + key args.
+     Example: "Stripe `charges.create` invoked with customer_id
+     'cus_8821', amount $4900, currency 'usd'."
+
+  4. **File / artifact writes** — files uploaded to Drive, S3, etc.
+     Example: "A PDF named 'invoice-1042.pdf' is uploaded to the
+     `invoices/2026/Q2/` folder in Google Drive."
+
+  5. **Any other externally observable effect** specifically named by the
+     cascade's behaviors.
+
+  - **NOT** "forwarded to peer X" / "dispatched to Y" / "sent to the next
+    object" — those are intermediate peer-dispatch hops. Trivial to pass.
+  - **YES** an exhaustive enumeration of categories 1-5 above for THIS
+    trigger's cascade.
+
+  If the cascade writes to two systems, list both. If it sends a
+  notification AND updates a status AND invokes a tool, list all three.
+  The benchmark exists to verify the agent produces EVERY required effect.
+
+  **Right shape (terminal outcomes, named destinations):**
+    ✓ "A new row is appended to the `New Submissions` tab of the `Contact
+       Intake` Google Sheet with name 'Sarah Mitchell', email
+       'sarah@example.com', phone, address; AND a new Google Contact
+       entry for Sarah Mitchell is created with the same fields."
+    ✓ "A Slack DM is sent to Maya Patel containing the KB article link;
+       AND a row is appended to the `helpdesk-events` ClickUp table with
+       the request payload and resolution timestamp."
+
+  **Wrong (first-hop peer dispatch — trivial to pass):**
+    ✗ "Lead payload forwarded to lead-routing object for processing."
+    ✗ "Submission data forwarded to the contact-verification peer."
+    ✗ "Full call payload forwarded to the sales-coaching-analyzer."
+
+  **Wrong (vague, no named destinations or content):**
+    ✗ "A notification is sent to the team."
+    ✗ "The data is stored in the database."
+
+  Describe natural-language messages and data writes only — NOT interactive
+  UI elements. Use product/destination names exactly as they appear in
+  the scenario / object behaviors. Include concrete payload data when it
+  would be visible at the terminal (names, IDs, message text).
+
+  `expect.reason` is one sentence naming the cascade path from trigger to
+  terminal output (e.g., "the contact-verification object validates the
+  submission and dispatches to both contact-intake-sheet and
+  google-contacts per its peer declarations").
 
   **Omit `expect` entirely (leave it null)** for scheduled / heartbeat /
   cron triggers where the outcome isn't deterministic at the trigger
-  moment — set `action` and `reason` both to `null` for that step.
+  moment AND no terminal output can be expected (e.g., a daily check that
+  finds nothing). If the schedule fires and the cascade has a terminal
+  outcome (a digest gets posted), then expect it.
 
   ---
 
@@ -75,8 +119,8 @@ prompt: |
       "step_expects": [
         {{
           "step_index": 1,
-          "action": "<single observable outcome or null>",
-          "reason": "<one-sentence rule or null>"
+          "action": "<terminal state changes the cascade produces, or null>",
+          "reason": "<one-sentence cascade path explanation, or null>"
         }},
         ...
       ]

@@ -72,38 +72,59 @@ prompt: |
   - `source` — the external system sending this trigger (e.g., `"webhook"`, `"__external__"`). Use the actual system name if known.
   - `text` — the natural language content of the trigger. Include only information that arrives with the external event — not data the objects will look up themselves. Use descriptive names for people and items (e.g., "James Brown, Account Executive" not "User #445").
   - `expect` — what the system produces when run with no modifications:
-    - `action` — the SINGLE, IMMEDIATE observable outcome of THIS trigger Step.
-      Describe ONE concrete thing that happens directly as a result of this
-      trigger arriving — NOT the whole downstream cascade. The cascade
-      (further actions by downstream objects) is captured by object behaviors
-      and graded by per-event expects elsewhere — NOT by this Step's expect.
+    - `action` — an EXHAUSTIVE list of TERMINAL, externally-observable
+      side effects the cascade produces. NOT a first-hop peer dispatch.
 
-      **Right shape (single observable outcome with concrete names):**
-        ✓ "A new row appended to the `customer-intake` Airtable table with
-           name 'Sarah Mitchell', email 'sarah@example.com', phone, address."
-        ✓ "Lead record `LEAD-4821` stored in the `crm.leads` Snowflake table
-           with status 'new'."
+      Trace the object graph from the trigger object through peer
+      declarations to the boundary of the system. List every effect
+      across these categories:
+        1. State changes in named storage (rows inserted/updated,
+           status fields flipped, counters incremented).
+        2. Outbound messages / notifications (emails, Slack DMs/posts,
+           SMS) — always include recipient + content summary.
+        3. Tool / API invocations (Stripe charge, DocuSign create,
+           OpenAI completion, Bitly shorten…) — include tool name + key args.
+        4. File / artifact writes (uploads to Drive, S3, etc.).
+        5. Any other externally observable effect named by the behaviors.
 
-      **Wrong (bundles cascade outcomes):**
-        ✗ "A new row appended; a Google Contact created; a Slack notification
-           sent; a Canvas log entry written." (four downstream outcomes in one)
-        ✗ "Lead stored, scored, routed to the assigned rep, and confirmation
-           email sent." (cascade enumerated)
+      If the cascade writes to two systems, list both. If it sends a
+      notification AND updates a status AND invokes a tool, list all three.
 
-      Use **concrete names and destinations from the step `text`** —
-      "notification sent to #channel mentioning Alex Rivera" not "notification
-      sent to the designated channel". The judge verifies exact facts;
-      abstract references cause false failures.
+      **Right shape (terminal outcomes with named destinations & data):**
+        ✓ "A new row is appended to the `New Submissions` tab of the
+           `Contact Intake` Google Sheet with Sarah Mitchell's name,
+           email, phone, address; AND a new Google Contact for Sarah
+           Mitchell is created with the same fields."
+        ✓ "A Slack DM is sent to Maya Patel containing the KB article
+           link; AND a row is appended to the helpdesk-events ClickUp
+           table with the request payload and timestamp."
 
-      Describe only natural-language messages and data writes — NOT interactive
-      UI elements (buttons, dropdowns, forms, widgets). LNL objects communicate
-      via natural language; they cannot produce interactive UI components.
+      **Wrong (first-hop peer dispatch — trivially passes):**
+        ✗ "Submission data forwarded to the contact-verification peer."
+        ✗ "Lead payload forwarded to lead-routing object for processing."
+        ✗ "Full ticket payload forwarded to the sales-opportunity-qualifier."
 
-      Use the SAME product/vendor names that the template uses. If the
+      **Wrong (vague, no named destinations):**
+        ✗ "A notification is sent to the team."
+        ✗ "The data is stored in the database."
+
+      Use **concrete names and destinations from the step `text` and
+      grounded scenario** — "notification sent to #channel mentioning
+      Alex Rivera" not "notification sent to the designated channel".
+      The judge verifies exact facts; abstract references cause false
+      failures.
+
+      Describe only natural-language messages and data writes — NOT
+      interactive UI elements (buttons, dropdowns, forms, widgets). LNL
+      objects communicate via natural language; they cannot produce
+      interactive UI components.
+
+      Use the SAME product/vendor names that the scenario uses. If the
       grounded scenario mentions Databricks, do NOT substitute BigQuery;
       if it mentions LinkedIn, do NOT substitute Meta or "online marketing
       platform" — keep the source vendor consistent with the scenario text.
-    - `reason` — the rule or peer relationship that causes it
+    - `reason` — the rule(s) or peer-relationship path that drives the
+      terminal outputs (one sentence)
 
   ### Rules
 
