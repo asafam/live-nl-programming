@@ -365,6 +365,39 @@ class Workflow(BaseModel):
 class Workflows(BaseModel):
     samples: list[Workflow]
 
+
+# ── Workflow-step validation schemas ──────────────────────────────────────────
+
+
+class StepJudgement(BaseModel):
+    """LLM judge output for one workflow step."""
+    verdict: Literal["FAITHFUL", "DRIFTED", "WRONG"]
+    reasoning: str
+
+
+class StepVerdict(BaseModel):
+    """Per-step grounding verdict (one entry per workflow step)."""
+    workflow_id: str
+    step_index: int
+    raw_step: str
+    grounded_step: str
+    expect_action: Optional[str] = None
+    target: str = ""
+    verdict: Literal["FAITHFUL", "DRIFTED", "WRONG", "UNALIGNED"]
+    reasoning: str
+    judge_input_tokens: int = 0
+    judge_output_tokens: int = 0
+
+
+class WorkflowValidation(BaseModel):
+    """Aggregate validation result for one workflow."""
+    workflow_id: str
+    n_template_steps: int
+    n_workflow_steps: int
+    count_mismatch: bool
+    step_verdicts: list[StepVerdict] = Field(default_factory=list)
+    aggregate: Literal["CLEAN", "MILD_DRIFT", "NOTABLE_DRIFT", "WRONG"]
+
 # Scenario generation schemas (LLM output before merging with instance metadata)
 class Scenario(BaseModel):
     id: str

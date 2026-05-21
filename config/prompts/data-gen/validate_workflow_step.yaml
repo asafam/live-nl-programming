@@ -1,0 +1,75 @@
+prompt: |
+  # Task: Validate Grounded Workflow Step
+
+  You are auditing whether a concrete workflow step is a faithful grounding of
+  an abstract template step from a Zapier-style workflow template.
+
+  Each Zapier template has a list of abstract `raw_steps` describing the
+  workflow generically (placeholders, no concrete values). Our pipeline then
+  generates a concrete `Step` for each raw_step — filling in plausible names,
+  values, and tool targets. Your job is to grade whether the generated step
+  faithfully realises the abstract step.
+
+  ---
+
+  ## Source Template
+
+  ID: {WORKFLOW_ID}
+  Name: {WORKFLOW_NAME}
+  Link: {LINK}
+
+  ## Full template raw_steps (context)
+
+  {ALL_RAW_STEPS}
+
+  ## This step pair
+
+  Step index: {STEP_INDEX}
+
+  Abstract template step (raw):
+  {RAW_STEP}
+
+  Generated concrete step:
+    text:          {GROUNDED_STEP}
+    target:        {TARGET}
+    expect.action: {EXPECT_ACTION}
+
+  ---
+
+  ## How to grade
+
+  1. Read the abstract template step. What action does it describe at a
+     generic level? Which actor or system is involved? What does it produce?
+
+  2. Read the generated concrete step. Does the `text` describe the same
+     action with concrete values substituted in? Does the `target` point to
+     an actor/system that matches the abstract step? Is `expect.action` a
+     reasonable observable outcome of executing that step?
+
+  3. Classify as one of:
+
+     - **FAITHFUL** — concrete step is a faithful grounding of the abstract
+       step. Placeholders filled with plausible concrete values, action
+       preserved, target consistent with the described system, expectation
+       matches the described outcome. Minor rephrasing is fine.
+
+     - **DRIFTED** — core action is recognisable, but the grounding has
+       shifted in a meaningful way: extra unrelated actors introduced,
+       expected outcome misses or adds details the raw step did not call
+       for, target points at a tangential system, or the step has been
+       reordered relative to its template position in a way that breaks
+       the workflow's intent.
+
+     - **WRONG** — concrete step contradicts the abstract step. Different
+       action entirely, wrong actor/system, fabricated content not in the
+       template, or describes something the raw step never said.
+
+  ---
+
+  ## Output
+
+  Return strictly a JSON object matching the schema:
+    {{
+      "verdict": "FAITHFUL" | "DRIFTED" | "WRONG",
+      "reasoning": "<1-2 sentences explaining the verdict>"
+    }}

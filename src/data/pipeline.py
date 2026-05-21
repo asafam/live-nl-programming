@@ -851,6 +851,21 @@ Examples:
         help="Skip all validation (useful when iterating on known-bad samples)",
     )
     shared.add_argument(
+        "--no-validate-workflow-steps",
+        action="store_true",
+        help="Skip Stage 1d (LLM-judge grading of grounded workflow steps vs templates.yaml raw_steps)",
+    )
+    shared.add_argument(
+        "--workflow-step-judge-model",
+        default="gpt-5.4",
+        help="Judge model for Stage 1d workflow-step validation (default: gpt-5.4)",
+    )
+    shared.add_argument(
+        "--workflow-step-judge-provider",
+        default="openai",
+        help="Judge provider for Stage 1d (default: openai)",
+    )
+    shared.add_argument(
         "--no-patch-gaps",
         action="store_true",
         help="Skip Stage 3.5 entity-gap patching (useful for debugging or when patching separately)",
@@ -932,6 +947,26 @@ Examples:
         )
     else:
         modified_ids = set()
+
+    # --- Stage 1d: validate grounded workflow steps vs templates.yaml ---
+    if not args.no_validate_workflow_steps and not skip_stage1:
+        print()
+        print("=" * 60)
+        print("STAGE 1d: Validate Workflow Steps vs Templates")
+        print("=" * 60)
+        from src.data import validate_workflow_steps as _vws
+        vws_args = argparse.Namespace(
+            workflows=samples_path,
+            templates=args.input,
+            provider=args.workflow_step_judge_provider,
+            judge_model=args.workflow_step_judge_model,
+            workers=args.workers,
+            output=None,
+            limit=None,
+            filter=None,
+            no_fail=True,  # don't abort the pipeline; report and continue
+        )
+        _vws.main_with_args(vws_args)
 
     # Any sample explicitly regenerated via --id must have its TCs invalidated,
     # even if the validation step made no repairs (Stage 2 would otherwise hit
