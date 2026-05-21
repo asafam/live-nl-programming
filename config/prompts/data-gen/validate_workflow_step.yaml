@@ -37,14 +37,44 @@ prompt: |
 
   ## How to classify a raw_step
 
-  - **TRIGGER**: external event that initiates work — a form submission,
-    a webhook delivery, a scheduled timer firing, a user clicking a button,
-    a new lead arriving from an ad platform, a Slack message posted,
-    etc. The defining property: this happens to the workflow from OUTSIDE.
-  - **CASCADE**: an action the workflow performs IN RESPONSE to a trigger
-    — write a row, send an email, post to Slack, call an API, update a
-    status, etc. The defining property: this happens BECAUSE the workflow
-    is running, not the other way around.
+  - **TRIGGER**: an external event that arrives at the workflow from
+    outside — a form submission, a webhook delivery, a scheduled tick,
+    a user clicking a button, a new lead arriving from an ad platform,
+    a Slack message posted, a CRM record changing status, a returning
+    response from an external system (e.g., an ad platform's upload-result
+    callback). The defining property: the workflow doesn't decide when
+    this happens; some external system or user does.
+  - **CASCADE**: an action the workflow performs in response to a
+    trigger — write a row, send an email, post to Slack, call an API,
+    update an internal status. The defining property: this happens
+    BECAUSE the workflow is running.
+
+  ### Recognising implicit triggers
+
+  Many templates describe an artefact ("Create a job posting page",
+  "Set up an HR chatbot", "Maintain a leads database") without an explicit
+  "X submits / clicks / asks" sentence. **Treat such a raw_step as a
+  TRIGGER if its purpose is to receive external input** — the trigger
+  event is implicit in the artefact's role:
+
+  - "Create a form" → TRIGGER (someone fills the form is the trigger).
+  - "Set up the chatbot to respond" → TRIGGER (a user asking is the trigger).
+  - "A capture page for prospects" → TRIGGER (prospect submission).
+  - "Maintain a sales-rep table to assign leads" → CASCADE (this is state,
+    not an external event entering the system).
+  - "Connect to Google Contacts" → CASCADE (outbound action).
+
+  Also classify as TRIGGER:
+  - External responses returning to the workflow (e.g., "Facebook
+    confirms a conversion upload", "DocuSign returns a completed
+    signature event", "Salesforce emits a Closed Won record").
+  - Time-based events ("Every Monday at 9am", "after the configured
+    delay", "weekly cron").
+
+  When a template has zero TRIGGER raw_steps under the strict definition
+  but has an artefact whose purpose is to receive input, classify the
+  most natural artefact raw_step as TRIGGER. A workflow always has at
+  least one external entry.
 
   A single template will typically have 1-3 TRIGGERS and the rest CASCADE.
 
