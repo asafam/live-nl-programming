@@ -487,11 +487,11 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/linkedin-conversion-tracking-for-physical-stores
   raw_steps:
-  - When a new lead is generated through the online marketing platform, capture the lead information and log it in a Zapier
-    Table.
-  - When a lead makes an online purchase in the website, update their status in the Zapier Table.
-  - When a purchase is recorded, send the conversion event back to online marketing platform.
-  - Online marketing platform receives the conversion data and refines future ad campaigns for better targeting.
+  - A new lead arrives from the online marketing platform (via lead-gen ad campaign) with their contact information.
+  - The lead is stored in the leads database.
+  - A sales-in-store event is registered in the database.
+  - The lead's status in the database is updated to "converted" with the purchase details.
+  - A conversion event is sent back to the online marketing platform with the lead's identifier.
 - id: team-operations-portal
   name: Team Call Prep Document Generator
   source_type: Zapier/Workflow Logic
