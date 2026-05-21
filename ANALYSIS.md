@@ -76,9 +76,9 @@ python scripts/plot_experiments.py outputs/data/zapier/runs/experiments/<exp_dir
 ```
 
 Output → `<exp_dir>/plots/`:
-- `concurrency_x_modifications_passrate.png` — 2×3 panel: mean / steps / mod / pre-mod / post-mod / irrelevant pass rate
-- `concurrency_x_modifications_elapsed.png` — mean and P90 elapsed time per TC
-- `concurrency_x_modifications_tokens.png` — mean agent and judge token usage per event
+- `concurrency_x_modifications_passrate.pdf` — 2×3 panel: mean / steps / mod / pre-mod / post-mod / irrelevant pass rate
+- `concurrency_x_modifications_elapsed.pdf` — mean and P90 elapsed time per TC
+- `concurrency_x_modifications_tokens.pdf` — mean agent and judge token usage per event
 
 If results contain rejudge entries, one additional pass-rate plot is emitted per rejudge model.
 
@@ -96,7 +96,7 @@ python scripts/plot_concurrency.py
 python scripts/plot_concurrency.py outputs/data/zapier/runs/experiments/concurrency
 ```
 
-Output → `<exp_dir>/plots/concurrency_passrate.png` — 2×3 panel: same metrics as above.
+Output → `<exp_dir>/plots/concurrency_passrate.pdf` — 2×3 panel: same metrics as above.
 
 Use `--metric` to generate a single panel instead of the full grid:
 ```bash
@@ -129,16 +129,49 @@ python scripts/plot_state_probes.py \
 `--tcs` is optional but enables the conditioned accuracy panel (probes counted only when their `depends_on` events passed).
 
 Output PNGs (in `plots_dir` or next to the LNL results file):
-- `probe_accuracy_vs_depth.png` — raw post-mod pass rate by depth
-- `probe_conditioned_accuracy_vs_depth.png` — conditioned accuracy (requires `--tcs`)
-- `tokens_vs_depth.png` — agent input tokens per event by depth
-- `elapsed_vs_depth.png` — mean elapsed time per TC by depth
+- `probe_accuracy_vs_depth.pdf` — raw post-mod pass rate by depth
+- `probe_conditioned_accuracy_vs_depth.pdf` — conditioned accuracy (requires `--tcs`)
+- `tokens_vs_depth.pdf` — agent input tokens per event by depth
+- `elapsed_vs_depth.pdf` — mean elapsed time per TC by depth
 
 Use `--chart` to generate only one of the above:
 ```bash
 python scripts/plot_state_probes.py lnl.jsonl --chart accuracy
 # choices: accuracy, conditioned, tokens, elapsed
 ```
+
+---
+
+### `scripts/plot_mod_types.py` — Pass rate by modification type
+
+Grouped vertical bar chart comparing Ours (LNL), OpenClaw single-agent, and OpenClaw multi-agent across modification types (temporal, contextual, exception, correction, expansion, removal). Infra and timeout errors are excluded.
+
+```bash
+# Auto-detect files from a directory (naming convention: *eval*.jsonl → LNL, *baseline*single*.jsonl → OC single, *baseline*.jsonl → OC multi):
+python scripts/plot_mod_types.py outputs/data/zapier/runs/experiments/myexp/
+
+# Explicit files:
+python scripts/plot_mod_types.py \
+    --lnl    outputs/.../test_cases_eval.jsonl \
+    --multi  outputs/.../test_cases_baseline_multi.jsonl \
+    --single outputs/.../test_cases_baseline_single.jsonl
+
+# Single metric:
+python scripts/plot_mod_types.py myexp/ --metric post_mod
+# choices: post_mod (default), pre_mod, mean, irrelevant
+```
+
+Output → `<dir>/plots/mod_types_<metric>.pdf`
+
+| Flag | Default | Description |
+|---|---|---|
+| `directory` (positional) | — | Directory to scan for result files |
+| `--lnl` | — | Explicit LNL result JSONL |
+| `--multi` | — | Explicit OC multi-agent result JSONL |
+| `--single` | — | Explicit OC single-agent result JSONL |
+| `--metric` | `post_mod` | Metric: `post_mod`, `pre_mod`, `mean`, `irrelevant` |
+| `--palette` | `okabe` | Color palette: `okabe`, `botanical`, `pastel`, `monochrome`, `riso` |
+| `--output-dir`, `-o` | `<dir>/plots/` | Output directory |
 
 ---
 

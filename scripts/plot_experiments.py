@@ -50,7 +50,7 @@ TOKEN_METRICS = [
 STEP_ID = re.compile(r"^S\d+$")
 
 PARADIGM_LABEL = {"lnl": "Ours",    "baseline": "OpenClaw"}
-PARADIGM_COLOR = {"lnl": "#2196F3", "baseline": "#E64A19"}
+PARADIGM_COLOR = {"lnl": "#005EF5", "baseline": "#D00000"}
 MOD_LINESTYLE  = {1: "-",  2: "--"}
 MOD_MARKER     = {1: "o",  2: "s"}
 MOD_ALPHA      = {1: 1.0,  2: 0.75}

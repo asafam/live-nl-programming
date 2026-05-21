@@ -1,0 +1,17 @@
+system: email
+tools:
+  - method: email_send
+    immediate:
+      template: "message_id: {tool_call_id}, queued for delivery to {to}"
+    callback:
+      delay_seconds: 0.5
+      message_template: "[Email] Message to {to} re: {subject} delivered successfully"
+      source: email
+
+  - method: email_list_inbox
+    immediate:
+      template: "[]"
+
+  - method: email_read
+    immediate:
+      template: '{"id": "{message_id}", "subject": "", "body": "(message not found)", "from": "unknown"}'

@@ -67,7 +67,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-18: nested memory backend is now the default; pass --memory flat for legacy behavior / historical comparisons
+_VERSION: str = _build_version()  # bumped 2026-05-20 (v8): _collect_planner_plans now walks all objects' _active_plans + _completed_plans filtered by event trace_ids (was missing pre-mod plans that completed mid-cascade)
 
 from src.data.schema import (
     EvalSummary,
@@ -397,6 +397,7 @@ def _execute_test_case_inner(
     mock_server_url: "str | None" = None,
     mock_slot_id: str = "default",
     memory_backend: str = "nested",
+    log_planner_output: bool = False,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase and return event + modification results."""
     from src.lnl.gateway import EventGateway
@@ -510,6 +511,7 @@ def _execute_test_case_inner(
             concurrency_seed=concurrency_seed,
             max_modifications=max_modifications,
             tracked_harness=tracked_harness,
+            log_planner_output=log_planner_output,
         )
     finally:
         rt._pool.shutdown(wait=False)
@@ -594,6 +596,111 @@ def _new_tool_calls(mock_executors: list, snapshots: list[int]) -> list[list[dic
     return [ex.call_log[s:] for ex, s in zip(mock_executors, snapshots)]
 
 
+# ── Diagnostic logging helpers — enabled by --verbose DEBUG ────────────────────
+def _serialize_plan(obj_id: str, plan, source: str) -> dict:
+    return {
+        "object_id": obj_id,
+        "trace_id": plan.trace_id,
+        "source": source,  # "active" or "completed"
+        "goal": plan.goal,
+        "status": plan.status,
+        "steps": [{
+            "id": s.id, "kind": s.kind, "target": s.target,
+            "description": s.description, "status": s.status,
+            "depends_on": list(s.depends_on or []),
+            "result_kind": getattr(s, "result_kind", None),
+            "wait_predicate": getattr(s, "wait_predicate", None),
+            "wait_source": getattr(s, "wait_source", None),
+        } for s in (plan.steps or [])],
+    }
+
+
+def _collect_planner_plans(rt, processing_results) -> list[dict]:
+    """Snapshot all plans (active + completed) for traces this event touched.
+
+    Walks every object in the runtime — not just those in processing_results —
+    and includes both `_active_plans` and `_completed_plans`. Filters to plans
+    whose trace_id matches the source_trace_id of any processing_result in this
+    event (so we capture each event's plans without polluting across events).
+
+    Empty when no planner is enabled or the runtime exposes no objects.
+    """
+    if not hasattr(rt, "_bus"):
+        return []
+    # Trace ids touched in this event
+    event_trace_ids: set = set()
+    for pr in processing_results or []:
+        tid = getattr(pr, "source_trace_id", None)
+        if tid:
+            event_trace_ids.add(tid)
+    if not event_trace_ids:
+        return []
+
+    out: list[dict] = []
+    seen: set = set()  # (object_id, trace_id, source) to dedupe
+    try:
+        objects = rt._bus.objects  # dict[str, LLMObject]
+    except Exception:
+        return []
+    for oid, obj in objects.items():
+        # Active plans
+        try:
+            active = dict(getattr(obj, "_active_plans", {}) or {})
+        except Exception:
+            active = {}
+        for tid, plan in active.items():
+            if tid not in event_trace_ids:
+                continue
+            key = (oid, tid, "active")
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                out.append(_serialize_plan(oid, plan, "active"))
+            except Exception:
+                pass
+        # Completed plans (deque)
+        try:
+            completed = list(getattr(obj, "_completed_plans", []) or [])
+        except Exception:
+            completed = []
+        for plan in completed:
+            tid = getattr(plan, "trace_id", None)
+            if not tid or tid not in event_trace_ids:
+                continue
+            key = (oid, tid, "completed")
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                out.append(_serialize_plan(oid, plan, "completed"))
+            except Exception:
+                pass
+    return out
+
+
+def _serialize_bus_messages(bus_msgs) -> list[dict]:
+    """Convert bus_msgs (list of MessageLog) to dicts. Truncates content to 4000 chars/message."""
+    out: list[dict] = []
+    for ml in (bus_msgs or []):
+        # bus_msgs are MessageLog objects; the actual Message is on .message
+        m = getattr(ml, "message", ml)
+        try:
+            mt = m.type.value if hasattr(m.type, "value") else str(m.type)
+        except Exception:
+            mt = "?"
+        out.append({
+            "id":          getattr(m, "id", "") or "",
+            "sender":      getattr(m, "sender", "") or "",
+            "recipient":   getattr(m, "recipient", "") or "",
+            "type":        mt,
+            "trace_id":    getattr(m, "trace_id", None),
+            "in_reply_to": getattr(m, "in_reply_to", None),
+            "content":     ((getattr(m, "content", "") or "")[:4000]),
+        })
+    return out
+
+
 
 def _run_test_case_timeline(
     tc: TestCase,
@@ -611,6 +718,7 @@ def _run_test_case_timeline(
     concurrency_seed: int = 42, # seed for sampling concurrent events from each group
     max_modifications: Optional[int] = None,  # limit to first N modifications (None = all)
     tracked_harness=None,
+    log_planner_output: bool = False,  # persist per-event planner plans + outgoing messages
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Execute steps and timeline events against a live runtime."""
     event_results: list[EventResult] = []
@@ -701,6 +809,8 @@ def _run_test_case_timeline(
                     judge_votes=votes,
                     infra_error=infra_error,
                     mock_tool_calls=sum(len(per_ex) for per_ex in new_calls),
+                    planner_plans=(_collect_planner_plans(rt, results) if log_planner_output else []),
+                    outgoing_messages=(_serialize_bus_messages(bus_msgs) if log_planner_output else []),
                 ))
                 if on_event_result:
                     on_event_result(event_results[-1], True)
@@ -842,6 +952,8 @@ def _run_test_case_timeline(
                 mock_tool_calls=sum(len(per_ex) for per_ex in new_calls),
                 trace=trace_spans,
                 trace_root_id=trace_root,
+                planner_plans=(_collect_planner_plans(rt, res) if log_planner_output else []),
+                outgoing_messages=(_serialize_bus_messages(bus_msgs) if log_planner_output else []),
             ))
 
     def _dispatch_concurrent_group(group: list, ctx: str, group_key: str = "") -> None:
@@ -1004,6 +1116,7 @@ def execute_test_case(
     mock_server_url: "str | None" = None,
     mock_slot_id: str = "default",
     memory_backend: str = "nested",
+    log_planner_output: bool = False,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single TestCase with a per-event timeout (seconds).
 
@@ -1051,6 +1164,7 @@ def execute_test_case(
         mock_server_url=mock_server_url,
         mock_slot_id=mock_slot_id,
         memory_backend=memory_backend,
+        log_planner_output=log_planner_output,
     )
 
 
@@ -1529,8 +1643,8 @@ def run(args: argparse.Namespace) -> Path:
                     steps_snapshot = _snapshots.get(key)
 
         tc_log: list[str] = []  # buffered per-TC output, flushed atomically at end
-        # In verbose single-worker mode, stream results live instead of buffering.
-        _live = workers == 1 and getattr(args, "verbose", False)
+        # At INFO/DEBUG with a single worker, stream results live instead of buffering.
+        _live = workers == 1 and getattr(args, "verbose", "ERROR") in ("INFO", "DEBUG")
 
         def _emit(line: str) -> None:
             if _live:
@@ -1589,6 +1703,7 @@ def run(args: argparse.Namespace) -> Path:
                 evaluator_brain=evaluator_brain,
                 mock_server_url=mock_server_url,
                 mock_slot_id=f"tc{tc_idx}-r{run_idx}",
+                log_planner_output=(getattr(args, "verbose", None) == "DEBUG"),
             )
         finally:
             # Always store snapshot and signal waiting workers — even on failure —
@@ -1629,7 +1744,8 @@ def run(args: argparse.Namespace) -> Path:
         rate_str = f"{pass_rate:.0%}" if pass_rate is not None else "N/A"
         elapsed_str = f"{int(elapsed_s) // 60:02d}:{int(elapsed_s) % 60:02d}.{int((elapsed_s % 1) * 1000):03d}"
 
-        parts = [f"\n  → pass={passed_n}/{total_n} ({rate_str})  elapsed={elapsed_str}"]
+        avg_evt_s = elapsed_s / total_n if total_n else 0.0
+        parts = [f"\n  → pass={passed_n}/{total_n} ({rate_str})  elapsed={elapsed_str}  avg/evt={avg_evt_s:.1f}s"]
         detail = format_tc_event_detail(event_results)
         if detail:
             parts.append(f"     {detail}")
@@ -2066,9 +2182,16 @@ Examples:
     )
     parser.add_argument(
         "--verbose", "-v",
-        action="store_true",
-        default=False,
-        help="Print passing events inline (failures always shown); add --debug-messages for full message traces",
+        nargs="?",
+        const="INFO",
+        default="ERROR",
+        choices=["ERROR", "INFO", "DEBUG"],
+        help=(
+            "Verbosity level (default: ERROR — failures only). "
+            "-v / --verbose INFO: also stream passing TC events inline. "
+            "--verbose DEBUG: INFO + capture per-event planner plans and outgoing "
+            "bus messages on each EventResult (bloats output — use with --tc filter)."
+        ),
     )
     parser.add_argument(
         "--debug-messages",

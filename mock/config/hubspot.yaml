@@ -1,0 +1,21 @@
+system: hubspot
+tools:
+  - method: hubspot_create_contact
+    immediate:
+      template: "id: {tool_call_id}, email: '{email}', created: true"
+
+  - method: hubspot_update_contact
+    immediate:
+      template: "id: {contact_id}, updated: true"
+
+  - method: hubspot_create_deal
+    immediate:
+      template: "id: deal_{tool_call_id}, name: '{deal_name}', created: true"
+
+  - method: hubspot_update_deal
+    immediate:
+      template: "id: {deal_id}, updated: true"
+
+  - method: hubspot_get_deal
+    immediate:
+      template: "id: {deal_id}, name: 'Deal', stage: 'Open', amount: 0"

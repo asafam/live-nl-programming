@@ -1,0 +1,17 @@
+system: google_sheets
+tools:
+  - method: sheets_create_row
+    immediate:
+      template: "row appended to spreadsheet '{spreadsheet_id}', updated_range: A{tool_call_id}"
+
+  - method: sheets_update_row
+    immediate:
+      template: "row {row} updated in spreadsheet '{spreadsheet_id}'"
+
+  - method: sheets_get_row
+    immediate:
+      template: "row {row}: []"
+
+  - method: sheets_list_rows
+    immediate:
+      template: "[]"

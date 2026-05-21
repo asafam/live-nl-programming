@@ -293,7 +293,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-18: --peer-message-timeout runtime param (fire-and-forget for OC peer messages)
+_VERSION: str = _build_version()  # bumped 2026-05-20 (v8): companion bump — schema gained EventResult.planner_plans / outgoing_messages (LNL-only fields; baseline emits empty lists)
 
 # ── Infrastructure failure detection ─────────────────────────────────────────
 
@@ -320,6 +320,98 @@ def _classify_error_type(reasoning_texts: list[str]) -> Optional[str]:
     if any(p in combined for p in _INFRA_ERROR_PATTERNS):
         return "infra"
     return None
+
+
+# --- Per-event 3-way failure classification ----------------------------------
+
+# Substrings that indicate Azure/LLM-provider failures (NOT our integration's fault).
+# Sourced from observed error_message texts, judge reasoning patterns, and known
+# Azure error codes. Pattern match is case-insensitive.
+_INFRA_PROVIDER_PATTERNS: list[str] = [
+    # Rate-limiting / throttling
+    "rate-limit", "rate limit", "rate-limited", "rate limited", "throttle", "429",
+    # SDK's standard "no response" message — explicitly says rate-limit or unavailable
+    "the llm may be rate-limited or unavailable",
+    "agent completed with no response",
+    # Azure content filter / responsible-AI policy
+    "content_filter", "content filter", "jailbreak", "responsibleaipolicy",
+    "responsible ai policy", "responsibleaiservice",
+    # Provider schema rejection (the agent's tool list / payload made Azure 400)
+    # — these are baseline-OC fault in spirit, but Azure is the one rejecting,
+    # and the rejection happens BEFORE the LLM runs, so we can't measure agent
+    # reasoning. Classified as infra_provider so it doesn't pollute behavioral.
+    "rejected the request schema", "provider rejected the request",
+    "llm request failed: provider rejected",
+    # Azure HTTP 5xx
+    "http 500", "http 503", "internal server error", "5xx", "azure openai response truncated",
+    # OpenAI/Azure-specific error envelopes
+    "openai_error", "azureopenai", "api error", "service unavailable",
+]
+
+# Substrings that indicate OpenClaw integration / our framework failures.
+# These are things WE could fix (gateway setup, timeouts, session management).
+_OC_EVAL_PATTERNS: list[str] = [
+    # Gateway lifecycle / connection
+    "gateway did not become ready", "openclaw gateway",
+    "not connected", "call await gw.connect", "gateway became unstable",
+    "websocket disconnected", "gatewaydisconnected", "keepalive ping timeout",
+    "timed out connecting to ws://", "network connection error", ": terminated",
+    # Session / pairing
+    "pairing required", "pairing-required", "session not found", "session expired",
+    # Timeouts (our 90s sessions_send / 180s event / 900-2400s TC settings)
+    "timeout after", "timed out after", "wall-clock timeout", "deadline exceeded",
+    # Generic "timed out" — but only here, after we've ruled out provider rate-limits
+    # (which would have matched _INFRA_PROVIDER_PATTERNS already).
+    "timed out", "timeout",
+    # OpenClaw container / runtime aborts (our infra)
+    "container restarted", "container died", "worker restart",
+]
+
+
+def _classify_failure(
+    success: bool,
+    passed: bool,
+    error_message: str = "",
+    stop_reason: str = "",
+    reasoning: str = "",
+) -> Optional[str]:
+    """Three-way classify a failed event.
+
+    Returns one of:
+      None              — event passed (no failure to classify)
+      'infra_provider'  — Azure/LLM-provider failure (rate-limit, content filter,
+                          schema reject, HTTP 5xx). Not on us. Factored out of pass-rate.
+      'oc_eval'         — OpenClaw integration / our framework failure (gateway not
+                          ready, sessions_send timeout, TC wall-clock timeout, runtime
+                          aborted, pairing errors). On us to fix. Factored out of pass-rate.
+      'behavioral'      — Agent's reasoning produced a real failure (wrong tool args,
+                          missing field, missing dispatch, wrong value, wrong branch,
+                          lied about completion). Kept IN pass-rate.
+
+    Heuristics (applied in priority order, infra first to avoid behavioral over-counting):
+      1. If passed → None
+      2. If error_message / reasoning matches a known PROVIDER pattern → 'infra_provider'
+      3. If error_message / reasoning matches a known OC pattern → 'oc_eval'
+      4. If stop_reason == 'aborted' → 'oc_eval' (runtime aborted execution)
+      5. If success=False with no recognized signal → 'oc_eval' (SDK reported
+         failure but didn't surface a provider error, so likely OC plumbing).
+      6. Otherwise (success=True but judge graded failure) → 'behavioral'.
+    """
+    if passed:
+        return None
+    haystack = " ".join([error_message or "", stop_reason or "", reasoning or ""]).lower()
+    # Provider first (priority over generic 'timed out' that OC also matches)
+    if any(p in haystack for p in _INFRA_PROVIDER_PATTERNS):
+        return "infra_provider"
+    if any(p in haystack for p in _OC_EVAL_PATTERNS):
+        return "oc_eval"
+    if (stop_reason or "").lower() == "aborted":
+        return "oc_eval"
+    if not success:
+        # SDK reported failure but no recognized signal — conservatively call it OC
+        # (better than mis-tagging as behavioral).
+        return "oc_eval"
+    return "behavioral"
 
 
 # ── OpenClaw agent configuration ─────────────────────────────────────────────
@@ -1266,6 +1358,83 @@ async def _execute_tc_async(
     _oc_thinking = {"disabled": "off", "enabled": "enabled"}.get(thinking, thinking) if thinking else None
     _exec_opts = ExecutionOptions(thinking=_oc_thinking) if _oc_thinking is not None else None
 
+    async def _extract_tool_calls_from_session(
+        gateway: Any,
+        session_key: str,
+        timeout: float = 5.0,
+    ) -> list[str]:
+        """Return the ordered list of tool names invoked in this session.
+
+        Source of truth: `sessions.get` returns the full message history;
+        each assistant turn's content blocks include `{"type": "toolCall",
+        "name": "<tool>", "arguments": {...}}` for every tool the LLM
+        called. This is the only reliable inventory:
+
+        - ExecutionResult.tool_calls misses sessions_send (the SDK pairs
+          TOOL_CALL/TOOL_RESULT events, and sessions_send results are
+          delivered via the peer session, not the entry's stream).
+        - Callback handlers (on_tool_call, on_stream_event) similarly
+          don't receive tool-call events from the real gateway path —
+          verified empirically against a live worker: the gateway emits
+          `agent` (assistant deltas) and `chat` events only, no
+          `stream="tool"` payloads for sessions_send or file ops.
+
+        The session-history API is the authoritative record (it's what
+        the LLM provider returned), so we read from there.
+        """
+        try:
+            sess = await asyncio.wait_for(
+                gateway.call("sessions.get", {"key": session_key}),
+                timeout=timeout,
+            )
+        except (asyncio.TimeoutError, _OcGatewayError, Exception):
+            return []
+        names: list[str] = []
+        for msg in (sess.get("messages") or []):
+            if msg.get("role") != "assistant":
+                continue
+            for block in (msg.get("content") or []):
+                if isinstance(block, dict) and block.get("type") == "toolCall":
+                    name = block.get("name") or ""
+                    if name:
+                        names.append(name)
+        return names
+
+    async def _extract_peer_tool_calls(
+        gateway: Any,
+        tc_objects: list,
+        entry_object_id: str,
+        slot_suffix: str,
+        per_call_timeout: float = 3.0,
+    ) -> dict[str, list[str]]:
+        """Return {peer_object_id: [tool, tool, ...]} for every non-entry agent.
+
+        Peers use `:main` session names (the gateway's mainKey, reset at the
+        start of each event by _make_event_handles). Extraction happens after
+        the entry's execute() returns and any cascade has settled. An empty
+        list means the peer's :main session has no assistant tool-calls for
+        this event — either it was never reached or it processed without
+        emitting any tool calls.
+
+        Skipped sessions (peer never existed, gateway error, timeout) are
+        absent from the returned dict — distinguishable from "session existed
+        but no tool calls" (present with empty list).
+        """
+        if not tc_objects:
+            return {}
+        peers = [o for o in tc_objects if o.object_id != entry_object_id]
+        # Issue all sessions.get() calls concurrently — each is cheap (~5ms)
+        # but doing them serially adds up across 5-10 peers per event.
+        async def _one(peer):
+            key = f"agent:{peer.object_id}{slot_suffix}:main"
+            try:
+                tools = await _extract_tool_calls_from_session(gateway, key, timeout=per_call_timeout)
+                return peer.object_id, tools
+            except Exception:
+                return peer.object_id, None
+        results = await asyncio.gather(*[_one(p) for p in peers], return_exceptions=False)
+        return {pid: tools for pid, tools in results if tools is not None}
+
     # Reset state before run.
     if single_agent_id:
         reset_single_agent_state(tc.objects, openclaw_home, single_agent_id)
@@ -1560,15 +1729,59 @@ async def _execute_tc_async(
             t0 = time.time()
             result = await handle.execute(msg["content"], options=_exec_opts)
             latency_ms = (time.time() - t0) * 1000
-            if not result.success:
-                tqdm.write(f"  [AGENT ERROR] {target_id}: {result.content}", file=sys.stderr)
-            content = result.content if result.success else f"(error: {result.content})"
+            # Distinguish infra failure (SDK returned success=False — rate-limit,
+            # aborted, no response) from real agent reasoning failure. The SDK's
+            # error_message has the diagnostic text (e.g. "Agent completed with no
+            # response — the LLM may be rate-limited"); stop_reason is one of
+            # "complete" / "aborted" / "error" / "timeout". Both were previously
+            # dropped, masking infra failures as regular pass-rate failures.
+            _result_err_message = getattr(result, "error_message", None) or ""
+            _result_stop_reason = getattr(result, "stop_reason", None) or ""
+            _peer_infra_error = not result.success
+            if _peer_infra_error:
+                _err_label = (
+                    _result_err_message
+                    or f"agent execution failed (stop_reason={_result_stop_reason or 'unknown'})"
+                )
+                tqdm.write(f"  [AGENT INFRA ERROR] {target_id}: {_err_label}", file=sys.stderr)
+                content = f"(infra_error: {_err_label})"
+            else:
+                content = result.content
 
-            # Entry-agent chattiness metrics
-            _oc_tool_calls = result.tool_calls  # list[ToolCall] from ExecutionResult
-            _agent_tool_calls = len(_oc_tool_calls)
-            _a2a_calls = sum(1 for c in _oc_tool_calls if c.tool == "sessions_send")
+            # Entry-agent chattiness metrics — sourced from sessions.get because
+            # both ExecutionResult.tool_calls and SDK callbacks fail to surface
+            # tool calls on the real-gateway path (verified empirically against a
+            # live worker). The session-history API returns the complete
+            # assistant-turn content blocks, including {type: "toolCall", name,
+            # arguments} entries for every tool the LLM invoked. This is the
+            # authoritative record.
+            _entry_session_key = (
+                f"agent:{single_agent_id}:{session_names[lookup_id]}"
+                if single_agent_id else
+                f"agent:{lookup_id}{slot_suffix}:{session_names[lookup_id]}"
+            )
+            _entry_tool_names = await _extract_tool_calls_from_session(
+                client.gateway, _entry_session_key,
+            )
+            _agent_tool_calls = len(_entry_tool_names)
+            _a2a_calls = sum(1 for name in _entry_tool_names if name == "sessions_send")
+            # Per-peer tool capture: lets us see what each peer in the cascade
+            # actually did (none, simple write, further sessions_send to deeper
+            # peer, errored, etc). Skipped in single-agent mode (no peers).
+            if single_agent_id:
+                _peer_tool_names: dict[str, list[str]] = {}
+            else:
+                _peer_tool_names = await _extract_peer_tool_calls(
+                    client.gateway, tc.objects, lookup_id, slot_suffix,
+                )
             _mock_tool_calls = 0  # updated below if mock_server is active
+            if verbose and _entry_tool_names:
+                tqdm.write(f"  [tool-calls] {target_id}: {_entry_tool_names[:6]}{'...' if len(_entry_tool_names)>6 else ''}")
+                if _peer_tool_names:
+                    non_empty_peers = {k: v for k, v in _peer_tool_names.items() if v}
+                    tqdm.write(f"  [peer-calls] {len(non_empty_peers)}/{len(_peer_tool_names)} peers acted: {dict(list(non_empty_peers.items())[:3])}")
+            elif verbose and result.success:
+                tqdm.write(f"  [tool-calls] {target_id}: (none captured — session history empty)")
 
             # Collect tool calls for this event only
             event_tool_calls: list[dict] = []
@@ -1630,10 +1843,18 @@ async def _execute_tc_async(
                     )
                     passed, reasoning, _votes, _in_tok, _out_tok = harness.evaluate_assertion(
                         expect.action, evidence, prior_context)
+                    _failure_class = _classify_failure(
+                        success=result.success, passed=passed,
+                        error_message=_result_err_message,
+                        stop_reason=_result_stop_reason,
+                        reasoning=reasoning,
+                    )
                     tqdm.write(f"    {step_id} {'✓' if passed else '✗'} {latency_ms/1000:.1f}s  {reasoning[:120]}")
                     if verbose:
                         tqdm.write(f"  Expected: {expect.action}")
                         tqdm.write(f"  {'✓ PASS' if passed else '✗ FAIL'}: {reasoning[:200]}")
+                        if _failure_class:
+                            tqdm.write(f"  [failure_class] {_failure_class}")
                     event_results.append(EventResult(
                         event_id=step_id,
                         passed=passed, reasoning=reasoning,
@@ -1644,7 +1865,11 @@ async def _execute_tc_async(
                         judge_votes=_votes,
                         agent_tool_calls=_agent_tool_calls,
                         a2a_calls=_a2a_calls,
+                        entry_tool_names=_entry_tool_names,
+                        peer_tool_names=_peer_tool_names,
                         mock_tool_calls=_mock_tool_calls,
+                        infra_error=_failure_class in ("oc_eval", "infra_provider"),
+                        failure_class=_failure_class,
                     ))
                 prior_context = _read_prior_context(tc, openclaw_home, single_agent_id)
 
@@ -1677,10 +1902,18 @@ async def _execute_tc_async(
                         )
                     passed, reasoning, _votes, _in_tok, _out_tok = _active_harness.evaluate_assertion(
                         item.expect.action, evidence, prior_context)
+                    _failure_class = _classify_failure(
+                        success=result.success, passed=passed,
+                        error_message=_result_err_message,
+                        stop_reason=_result_stop_reason,
+                        reasoning=reasoning,
+                    )
                     tqdm.write(f"    {item.id} {'✓' if passed else '✗'} {latency_ms/1000:.1f}s  {reasoning[:120]}")
                     if verbose:
                         tqdm.write(f"  Expected: {item.expect.action}")
                         tqdm.write(f"  {'✓ PASS' if passed else '✗ FAIL'}: {reasoning[:200]}")
+                        if _failure_class:
+                            tqdm.write(f"  [failure_class] {_failure_class}")
                     event_results.append(EventResult(
                         event_id=item.id, passed=passed, reasoning=reasoning,
                         expected=item.expect.action, evidence=evidence,
@@ -1691,7 +1924,11 @@ async def _execute_tc_async(
                         judge_votes=_votes,
                         agent_tool_calls=_agent_tool_calls,
                         a2a_calls=_a2a_calls,
+                        entry_tool_names=_entry_tool_names,
+                        peer_tool_names=_peer_tool_names,
                         mock_tool_calls=_mock_tool_calls,
+                        infra_error=_failure_class in ("oc_eval", "infra_provider"),
+                        failure_class=_failure_class,
                     ))
                 prior_context = _read_prior_context(tc, openclaw_home, single_agent_id)
 
@@ -1791,12 +2028,15 @@ def execute_test_case(
             # deduplicate keeping the last occurrence of each event_id so real
             # results (appended later by the thread) win over placeholders.
             collected_event_ids = {e.event_id for e in partial_events}
+            # TC wall-clock timeout is OUR setting (--timeout, default 900s) so
+            # classify these placeholders as oc_eval (factor out of pass-rate).
             for i, step in enumerate(tc.steps):
                 eid = f"S{i+1:03d}"
                 if eid not in collected_event_ids and step.expect is not None:
                     partial_events.append(EventResult(
                         event_id=eid, passed=False,
                         reasoning=f"Timeout after {timeout_s}s",
+                        infra_error=True, failure_class="oc_eval",
                     ))
             _active_mod_ids = {m.id for m in (tc.modifications[:max_modifications] if max_modifications else tc.modifications)}
             for evt in tc.events:
@@ -1806,6 +2046,7 @@ def execute_test_case(
                             event_id=evt.id, passed=False,
                             reasoning=f"Timeout after {timeout_s}s",
                             role=getattr(evt, "role", None),
+                            infra_error=True, failure_class="oc_eval",
                         ))
             collected_mod_ids = {m.mod_id for m in partial_mods}
             for mod in (tc.modifications[:max_modifications] if max_modifications else tc.modifications):
@@ -1929,13 +2170,22 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
             first_tc_per_sample[sid] = r.tc_id
     base_tc_ids = set(first_tc_per_sample.values())
 
+    # TCs where every event hit an infra failure — excluded from all scoring.
+    infra_error_tc_ids: set[str] = {
+        r.tc_id for r in results
+        if r.events and all(e.infra_error for e in r.events)
+    }
+
     all_events: list[EventResult] = []
     pass_rates: list[float] = []
     for r in results:
+        if r.tc_id in infra_error_tc_ids:
+            continue
         is_base = r.tc_id in base_tc_ids
         effective = [
             e for e in r.events
-            if is_base or not _STEP_EVENT_ID.match(e.event_id)
+            if (is_base or not _STEP_EVENT_ID.match(e.event_id))
+            and not e.infra_error
         ]
         all_events.extend(effective)
         if effective:
@@ -1960,9 +2210,9 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     # Samples completion + std (fraction of TCs where ALL step events passed)
     by_tc_completion: dict[str, list[float]] = defaultdict(list)
     for r in results:
-        if r.tc_id not in base_tc_ids:
+        if r.tc_id not in base_tc_ids or r.tc_id in infra_error_tc_ids:
             continue
-        step_evts = [e for e in r.events if _STEP_EVENT_ID.match(e.event_id)]
+        step_evts = [e for e in r.events if _STEP_EVENT_ID.match(e.event_id) and not e.infra_error]
         if step_evts:
             by_tc_step[r.tc_id].append(sum(1 for e in step_evts if e.passed) / len(step_evts))
             by_tc_completion[r.tc_id].append(1.0 if all(e.passed for e in step_evts) else 0.0)
@@ -1975,35 +2225,37 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
     tcs_with_pre_mod = {r.tc_id for r in results if any(e.role == "pre_mod" for e in r.events)}
     inconclusive_tc_ids: set[str] = set()
     for r in results:
-        if r.tc_id not in tcs_with_pre_mod:
+        if r.tc_id not in tcs_with_pre_mod or r.tc_id in infra_error_tc_ids:
             continue
-        if any(_STEP_EVENT_ID.match(e.event_id) and not e.passed for e in r.events):
+        if any(_STEP_EVENT_ID.match(e.event_id) and not e.passed and not e.infra_error for e in r.events):
             inconclusive_tc_ids.add(r.tc_id)
 
     # Role-based pass rates + std: exclude inconclusive TCs, grouped by TC across runs
     def _role_pass_rate_and_std(role_val, exclude_inconclusive=True) -> tuple[Optional[float], Optional[float]]:
         by_tc: dict[str, list[float]] = defaultdict(list)
         for r in results:
+            if r.tc_id in infra_error_tc_ids:
+                continue
             if exclude_inconclusive and r.tc_id in inconclusive_tc_ids:
                 continue
-            evts = [e for e in r.events if e.role == role_val]
+            evts = [e for e in r.events if e.role == role_val and not e.infra_error]
             if evts:
                 by_tc[r.tc_id].append(sum(1 for e in evts if e.passed) / len(evts))
         rate = mean([mean(v) for v in by_tc.values()]) if by_tc else None
         return rate, _per_tc_std(by_tc)
 
     conclusive_events = [
-        e for r in results if r.tc_id not in inconclusive_tc_ids
-        for e in r.events
+        e for r in results if r.tc_id not in inconclusive_tc_ids and r.tc_id not in infra_error_tc_ids
+        for e in r.events if not e.infra_error
     ]
     mod_events = [e for e in conclusive_events if e.role in ("pre_mod", "post_mod", "irrelevant")]
     mod_pass_rate = (sum(1 for e in mod_events if e.passed) / len(mod_events)) if mod_events else None
 
     by_tc_mod: dict[str, list[float]] = defaultdict(list)
     for r in results:
-        if r.tc_id in inconclusive_tc_ids:
+        if r.tc_id in inconclusive_tc_ids or r.tc_id in infra_error_tc_ids:
             continue
-        evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant")]
+        evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant") and not e.infra_error]
         if evts:
             by_tc_mod[r.tc_id].append(sum(1 for e in evts if e.passed) / len(evts))
     mod_pass_rate_std = _per_tc_std(by_tc_mod)
@@ -2014,14 +2266,17 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
 
     # Role-based pass rates including inconclusive TCs (indicative)
     all_mod_events = [
-        e for r in results for e in r.events
-        if e.role in ("pre_mod", "post_mod", "irrelevant")
+        e for r in results if r.tc_id not in infra_error_tc_ids
+        for e in r.events
+        if e.role in ("pre_mod", "post_mod", "irrelevant") and not e.infra_error
     ]
     mod_pass_rate_all = (sum(1 for e in all_mod_events if e.passed) / len(all_mod_events)) if all_mod_events else None
 
     by_tc_mod_all: dict[str, list[float]] = defaultdict(list)
     for r in results:
-        evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant")]
+        if r.tc_id in infra_error_tc_ids:
+            continue
+        evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant") and not e.infra_error]
         if evts:
             by_tc_mod_all[r.tc_id].append(sum(1 for e in evts if e.passed) / len(evts))
     mod_pass_rate_all_std = _per_tc_std(by_tc_mod_all)
@@ -2057,6 +2312,7 @@ def _compute_summary(results: list[TestCaseResult]) -> EvalSummary:
         irrelevant_pass_rate_all=irrelevant_pass_rate_all,
         irrelevant_pass_rate_all_std=irrelevant_pass_rate_all_std,
         inconclusive_tcs=len(inconclusive_tc_ids),
+        infra_error_tcs=len(infra_error_tc_ids),
         mean_event_input_tokens=mean([e.input_tokens for e in all_events]),
         mean_event_output_tokens=mean([e.output_tokens for e in all_events]),
         mean_event_latency_ms=mean([e.latency_ms for e in all_events]),
@@ -2280,12 +2536,17 @@ async def _run_all_tcs_concurrent(
                                 _timeout_label = str(_timeout_exc) or f"Timeout after {tc_timeout}s"
                                 tc_elapsed_ms = (time.time() - tc_t0) * 1000
                                 collected_ev_ids = {e.event_id for e in _partial_ev}
+                                # TC wall-clock timeout = OUR --timeout setting; OcTimeoutError =
+                                # OpenClaw SDK-level peer timeout (also our integration's 90s
+                                # sessions_send setting). Both classify as oc_eval and are
+                                # factored out of pass-rate.
                                 for i, step in enumerate(tc.steps):
                                     eid = f"S{i+1:03d}"
                                     if eid not in collected_ev_ids and step.expect is not None:
                                         _partial_ev.append(EventResult(
                                             event_id=eid, passed=False,
                                             reasoning=_timeout_label,
+                                            infra_error=True, failure_class="oc_eval",
                                         ))
                                 _max_mods = getattr(args, "modifications", None)
                                 _active_mod_ids = {m.id for m in (tc.modifications[:_max_mods] if _max_mods else tc.modifications)}
@@ -2296,6 +2557,7 @@ async def _run_all_tcs_concurrent(
                                                 event_id=evt.id, passed=False,
                                                 reasoning=_timeout_label,
                                                 role=getattr(evt, "role", None),
+                                                infra_error=True, failure_class="oc_eval",
                                             ))
                                 collected_mod_ids = {m.mod_id for m in _partial_mod}
                                 for mod in (tc.modifications[:_max_mods] if _max_mods else tc.modifications):
@@ -2725,34 +2987,64 @@ def run(args: argparse.Namespace) -> Path:
     effective_provider = agent_provider or "openai"
 
     # Continuation: if output file already exists, load completed runs and skip them.
-    # Infrastructure failures (pairing required, network error, terminated) are NOT
-    # added to completed — they will be automatically re-run on resume.
+    # When infra/timeout TCs are found, the user is prompted to choose whether to
+    # skip them (continue with remaining TCs only) or retry them in order.
     completed: set[tuple[int, int]] = set()  # (tc_index, run_index)
-    infra_rerun_count = 0
+    infra_results:   list[TestCaseResult] = []  # TCs with error_type=="infra"
+    timeout_results: list[TestCaseResult] = []  # TCs with error_type=="timeout"
     if args.output.exists():
-        timeout_rerun_count = 0
         for r in _load_tc_results(args.output):
-            if r.error_type == "infra":
-                infra_rerun_count += 1
-                continue  # exclude from completed → will be re-run
-            if r.error_type == "timeout":
-                timeout_rerun_count += 1
-                continue  # exclude from completed → will be re-run with higher timeout
             # Re-classify TCs saved with error_type=None but infra-matching reasoning.
             # Handles results written before the current _INFRA_ERROR_PATTERNS were in place.
             if r.error_type is None:
                 _re = _classify_error_type([e.reasoning or "" for e in (r.events or [])])
                 if _re == "infra":
-                    infra_rerun_count += 1
-                    continue
-            completed.add((r.tc_index, r.run_index))
-            all_tc_results.append(r)
+                    r = r.model_copy(update={"error_type": "infra"})
+            if r.error_type == "infra":
+                infra_results.append(r)
+            elif r.error_type == "timeout":
+                timeout_results.append(r)
+            else:
+                # Behaviorally-complete results go straight into completed.
+                completed.add((r.tc_index, r.run_index))
+                all_tc_results.append(r)
+
+        n_infra   = len(infra_results)
+        n_timeout = len(timeout_results)
+
         if completed:
             print(f"Resuming: {len(completed)} run(s) already done, skipping.")
-        if infra_rerun_count:
-            print(f"Re-running {infra_rerun_count} infra-failed TC(s) (pairing/network/terminated).")
-        if timeout_rerun_count:
-            print(f"Re-running {timeout_rerun_count} timed-out TC(s).")
+
+        if n_infra or n_timeout:
+            parts = []
+            if n_infra:
+                parts.append(f"{n_infra} TC(s) with infra errors (gateway/pairing/network)")
+            if n_timeout:
+                parts.append(f"{n_timeout} TC(s) that timed out")
+            print(f"Found {' and '.join(parts)} from the previous run.")
+
+            # Ask the user what to do — default to skip when not interactive.
+            retry_failed = False
+            if sys.stdin.isatty():
+                print("  [1] Skip them — continue with remaining TCs only  (default)")
+                print("  [2] Retry them — re-run infra/timeout TCs in order")
+                try:
+                    choice = input("Choice [1/2, default=1]: ").strip()
+                except EOFError:
+                    choice = "1"
+                retry_failed = choice == "2"
+            else:
+                print("  (Non-interactive: skipping infra/timeout TCs. Re-run manually to retry.)")
+
+            if retry_failed:
+                # Leave infra/timeout TCs out of completed → they will be re-run.
+                print(f"  → Will retry {n_infra + n_timeout} TC(s).")
+            else:
+                # Mark them completed so they are skipped this run.
+                for r in infra_results + timeout_results:
+                    completed.add((r.tc_index, r.run_index))
+                    all_tc_results.append(r)
+                print(f"  → Skipping {n_infra + n_timeout} TC(s). Re-run on the same output file to retry.")
 
     # Serialize all runtime params (including defaults) for the metadata header
     def _serialize_arg(v: object) -> object:
@@ -3008,6 +3300,23 @@ def run(args: argparse.Namespace) -> Path:
 
     print()
     _print_summary(summary, output_path=args.output, elapsed_s=time.monotonic() - eval_start)
+
+    # Report non-behavioral failures that are excluded from the pass-rate above.
+    # These are NOT re-run automatically — re-run the script to retry them.
+    non_behavioral: list[str] = []
+    if summary.infra_error_tcs:
+        non_behavioral.append(f"{summary.infra_error_tcs} TC(s) with infra errors (gateway/pairing/network)")
+    # Count timeout TCs from all_tc_results (not tracked in EvalSummary directly)
+    n_timeout = sum(1 for r in all_tc_results if r.error_type == "timeout")
+    if n_timeout:
+        non_behavioral.append(f"{n_timeout} TC(s) that timed out")
+    if non_behavioral:
+        print()
+        print("⚠  Non-behavioral failures excluded from pass-rate above:")
+        for msg in non_behavioral:
+            print(f"   • {msg}")
+        print("   Re-run on the same output file to retry these.")
+
     return args.output
 
 

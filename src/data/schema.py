@@ -447,11 +447,66 @@ class EventResult(BaseModel):
     # Chattiness / roundtrip metrics (baseline eval only)
     agent_tool_calls: int = 0   # total tool calls made by the entry agent (file reads, sessions_send, external)
     a2a_calls: int = 0          # sessions_send (agentToAgent) calls made by the entry agent
+    entry_tool_names: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ordered list of tool names invoked by the entry agent for this event "
+            "(includes sessions_send, file ops, external tool calls). Sourced from "
+            "sessions.get() — authoritative LLM message history."
+        ),
+    )
+    peer_tool_names: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Per-peer tool inventory for this event: {peer_object_id: [tool, tool, ...]}. "
+            "Peers are the non-entry agents in the TC. Each value is the ordered list of "
+            "tools that peer's :main session executed during this event's cascade — "
+            "captured via sessions.get() right after the entry's execute() returns. "
+            "Lets us distinguish cascade-stall modes: empty list = peer never received / "
+            "errored before processing; non-empty without sessions_send = peer received but "
+            "didn't propagate further; non-empty with sessions_send = peer cascaded further."
+        ),
+    )
     mock_tool_calls: int = 0    # external tool calls across all agents (from mock server log)
-    infra_error: bool = False   # True when an infra error (e.g. content filter) affected this event — excluded from scores
+    infra_error: bool = False   # True when failure_class in {oc_eval, infra_provider} — excluded from scores (back-compat mirror of failure_class)
+    failure_class: Optional[Literal["oc_eval", "infra_provider", "behavioral"]] = Field(
+        default=None,
+        description=(
+            "Three-way classification of failed events. None = event passed. "
+            "'oc_eval' = OpenClaw integration / our framework failed (gateway not ready, "
+            "sessions_send timeout, TC wall-clock timeout, runtime aborted, pairing errors) — "
+            "factored OUT of pass-rate, on us to fix. "
+            "'infra_provider' = Azure/LLM-provider failed (rate-limit, content filter, "
+            "schema reject, HTTP 5xx, 'agent completed with no response') — factored OUT "
+            "of pass-rate, not our responsibility. "
+            "'behavioral' = agent's reasoning produced a real failure (wrong tool args, "
+            "missing field, wrong value, missing dispatch, lied about completion, wrong "
+            "branch). Kept IN pass-rate as the true measure of agent quality."
+        ),
+    )
     # Transaction trace (LNL eval only) — structured per-hop cascade of the triggering event
     trace: list[dict] = Field(default_factory=list)
     trace_root_id: Optional[str] = None  # msg.id of the root trigger; shared as trace_id by every hop
+    # ── Diagnostic logging (LNL eval only — opt-in via --log-planner-output) ──
+    planner_plans: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Per-object planner output snapshot taken at the end of this event. "
+            "Each entry: {object_id, trace_id, goal, status, steps:[{id, kind, target, "
+            "description, status, depends_on}]}. Lets us see whether the planner emitted "
+            "the steps the modification required. Empty unless --log-planner-output is set."
+        ),
+    )
+    outgoing_messages: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Bus messages emitted during this event's cascade. Each entry: "
+            "{sender, recipient, type, content, trace_id, in_reply_to}. Lets us inspect "
+            "the actual content of peer dispatches (whether the executor included the "
+            "modification's new directive in the outgoing message text). Empty unless "
+            "--log-planner-output is set."
+        ),
+    )
 
 class ModificationResult(BaseModel):
     """Cost of applying a single modification."""

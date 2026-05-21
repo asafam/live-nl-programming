@@ -1,0 +1,17 @@
+system: salesforce
+tools:
+  - method: salesforce_create_record
+    immediate:
+      template: "id: {tool_call_id}, object_type: '{object_type}', created: true"
+
+  - method: salesforce_update_record
+    immediate:
+      template: "id: {record_id}, object_type: '{object_type}', updated: true"
+
+  - method: salesforce_get_record
+    immediate:
+      template: "id: {record_id}, object_type: '{object_type}', fields: {{}}"
+
+  - method: salesforce_list_records
+    immediate:
+      template: "[]"

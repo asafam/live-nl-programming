@@ -1,0 +1,21 @@
+system: slack
+tools:
+  - method: slack_send_message
+    immediate:
+      template: "message_id: {tool_call_id}, delivered to {channel}"
+    callback:
+      delay_seconds: 0.3
+      message_template: "[Slack] Message delivered to {channel}: {message}"
+      source: slack
+
+  - method: slack_list_channels
+    immediate:
+      template: '["#general", "#deal-desk", "#engineering", "#alerts", "#approvals"]'
+
+  - method: slack_add_reaction
+    immediate:
+      template: "reaction :{emoji}: added to message {message_id}"
+
+  - method: slack_get_user
+    immediate:
+      template: '{"id": "{user}", "name": "{user}", "status": "active"}'

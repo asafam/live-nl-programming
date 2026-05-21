@@ -1,0 +1,9 @@
+system: twilio
+tools:
+  - method: twilio_send_sms
+    immediate:
+      template: "sid: SM{tool_call_id}, to: '{to}', status: sent"
+
+  - method: twilio_send_message
+    immediate:
+      template: "sid: SM{tool_call_id}, to: '{to}', status: sent"

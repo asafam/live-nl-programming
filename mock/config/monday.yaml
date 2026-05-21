@@ -1,0 +1,17 @@
+system: monday
+tools:
+  - method: monday_create_item
+    immediate:
+      template: "item_id: {tool_call_id}, name: '{item_name}', board_id: {board_id}"
+
+  - method: monday_update_item
+    immediate:
+      template: "item_id: {item_id}, updated successfully"
+
+  - method: monday_get_item
+    immediate:
+      template: "item_id: {item_id}, name: 'Task', status: 'In Progress'"
+
+  - method: monday_list_items
+    immediate:
+      template: "[]"

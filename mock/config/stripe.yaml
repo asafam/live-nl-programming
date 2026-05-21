@@ -1,0 +1,17 @@
+system: stripe
+tools:
+  - method: stripe_create_charge
+    immediate:
+      template: "charge_id: ch_{tool_call_id}, amount: {amount}, status: succeeded"
+
+  - method: stripe_get_charge
+    immediate:
+      template: "charge_id: {charge_id}, status: succeeded"
+
+  - method: stripe_list_charges
+    immediate:
+      template: "[]"
+
+  - method: stripe_refund_charge
+    immediate:
+      template: "refund_id: re_{tool_call_id}, charge_id: {charge_id}, status: succeeded"

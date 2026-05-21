@@ -44,23 +44,79 @@ PASS_METRICS = [
 
 STEP_ID = re.compile(r"^S\d+$")
 
-# Series: (paradigm, agent_mode) → display label, color
+# Series: (paradigm, agent_mode) → display label
 SERIES_LABEL = {
     ("lnl",      "lnl"):    "Ours",
     ("baseline", "single"): "OpenClaw (single-agent)",
     ("baseline", "multi"):  "OpenClaw (multi-agent)",
 }
-SERIES_COLOR = {
-    ("lnl",      "lnl"):    "#2196F3",  # blue
-    ("baseline", "single"): "#E64A19",  # orange-red
-    ("baseline", "multi"):  "#4CAF50",  # green
-}
-MOD_LINESTYLE = {1: "-",  2: "--"}
+# Series order for palette color assignment (index into palette["colors"])
+SERIES_ORDER = [
+    ("lnl",      "lnl"),
+    ("baseline", "single"),
+    ("baseline", "multi"),
+]
+MOD_LINESTYLE = {1: "-",  2: (0, (8, 4))}
 MOD_MARKER    = {1: "o",  2: "s"}
 MOD_ALPHA     = {1: 1.0,  2: 0.75}
 
-GRADIENT_ALPHA_TOP = 0.28  # opacity at the top of the gradient fill
-GRADIENT_STEPS     = 40   # number of thin slabs for the gradient approximation
+GRADIENT_ALPHA_TOP = 0.28
+GRADIENT_STEPS     = 40
+
+# ── Palettes (ported from make_chart.py) ─────────────────────────────────────
+
+PALETTES = {
+    "default": {
+        # Series order: SERIES_ORDER = [(lnl, lnl), (baseline, single), (baseline, multi)]
+        "bg":       "#FFFFFF",
+        "gridline": "#E5E5E5",
+        "axis":     "#333333",
+        "text":     "#222222",
+        "text_dim": "#666666",
+        "colors":   ["#005EF5", "#FFBA08", "#D00000"],
+    },
+    "botanical": {
+        "bg":       "#F2EDDE",
+        "gridline": "#D4CBB0",
+        "axis":     "#A89A75",
+        "text":     "#5A5040",
+        "text_dim": "#7A6E50",
+        "colors":   ["#2D5A3E", "#A04E2D", "#A8862D"],
+    },
+    "pastel": {
+        "bg":       "#E8E4DD",
+        "gridline": "#CCC6B8",
+        "axis":     "#9E9684",
+        "text":     "#5C5444",
+        "text_dim": "#7A7263",
+        "colors":   ["#C56F89", "#588F92", "#A89668"],
+    },
+    "monochrome": {
+        "bg":       "#FFFFFF",
+        "gridline": "#EEEEEE",
+        "axis":     "#333333",
+        "text":     "#222222",
+        "text_dim": "#666666",
+        "colors":   ["#0066CC", "#666666", "#AAAAAA"],
+    },
+    "okabe": {
+        "bg":       "#FFFFFF",
+        "gridline": "#E5E5E5",
+        "axis":     "#333333",
+        "text":     "#222222",
+        "text_dim": "#666666",
+        "colors":   ["#D55E00", "#009E73", "#56B4E9"],
+    },
+    "riso": {
+        "bg":       "#FFFFFF",
+        "gridline": "#E0DACE",
+        "axis":     "#12123c",
+        "text":     "#333333",
+        "text_dim": "#666666",
+        "colors":   ["#12123c", "#00b4d8", "#e63946"],
+    },
+}
+DEFAULT_PALETTE = "default"
 
 _ORIGINAL = "__original__"
 
@@ -111,7 +167,7 @@ def compute_metrics(path: Path, get_passed=_get_passed_original) -> dict:
             if not line:
                 continue
             d = json.loads(line)
-            if "tc_id" not in d:
+            if "tc_id" not in d or d.get("error_type") in ("infra", "timeout"):
                 continue
             results.append(d)
 
@@ -258,7 +314,9 @@ def _draw_gradient_fill(ax, x, y, color, alpha_top=GRADIENT_ALPHA_TOP,
 
 
 def _draw_lines(ax, data: dict, metric_key: str, all_concs: list,
-                tension: float = 0.0, smooth: int = 200) -> bool:
+                tension: float = 0.0, smooth: int = 200,
+                palette: dict = None) -> bool:
+    p          = palette or PALETTES[DEFAULT_PALETTE]
     plotted    = False
     multi_mods = len({k[2] for k in data}) > 1
     for series_key, series in sorted(data.items()):
@@ -273,7 +331,9 @@ def _draw_lines(ax, data: dict, metric_key: str, all_concs: list,
         y_raw = np.array([v if v is not None else float("nan") for v in values],
                          dtype=float)
 
-        color     = SERIES_COLOR.get((paradigm, agent_mode), "#888888")
+        key       = (paradigm, agent_mode)
+        idx       = SERIES_ORDER.index(key) if key in SERIES_ORDER else 0
+        color     = p["colors"][idx % len(p["colors"])]
         linestyle = MOD_LINESTYLE.get(mods, "-")
         marker    = MOD_MARKER.get(mods, "o")
         line_alpha = MOD_ALPHA.get(mods, 1.0)
@@ -291,15 +351,12 @@ def _draw_lines(ax, data: dict, metric_key: str, all_concs: list,
         else:
             x_dense, y_dense = np.array(xs_fin), ys_fin
 
-        # Smooth curve
         ax.plot(x_dense, y_dense, linestyle=linestyle, color=color,
                 alpha=line_alpha, linewidth=2, label=label,
                 solid_capstyle="round")
-        # Actual data points on top
         ax.scatter(concs, y_raw, marker=marker, s=45,
-                   facecolor="white", edgecolor=color,
+                   facecolor=p["bg"], edgecolor=color,
                    linewidth=2.0, zorder=5)
-        # Gradient fill below the curve
         _draw_gradient_fill(ax, x_dense, y_dense, color,
                             alpha_top=GRADIENT_ALPHA_TOP * line_alpha)
 
@@ -307,21 +364,30 @@ def _draw_lines(ax, data: dict, metric_key: str, all_concs: list,
 
     if all_concs:
         ax.set_xticks(all_concs)
-    ax.set_xlabel("Concurrency level", fontsize=9)
-    ax.grid(axis="y", alpha=0.3, linestyle=":")
+    ax.set_xlabel("Concurrency level", fontsize=9, color=p["text"])
+    ax.tick_params(colors=p["text_dim"], labelsize=9, length=0)
+    ax.grid(axis="y", linestyle=":", linewidth=0.8, color=p["gridline"])
+    ax.set_axisbelow(True)
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+    ax.spines["bottom"].set_color(p["axis"])
     if plotted:
-        ax.legend(fontsize=8, loc="best")
+        leg = ax.legend(fontsize=8, loc="best", frameon=True, framealpha=1.0,
+                        edgecolor=p["gridline"], facecolor=p["bg"],
+                        labelcolor=p["text"])
+        leg.get_frame().set_linewidth(0.8)
     else:
         ax.text(0.5, 0.5, "No data", transform=ax.transAxes,
                 ha="center", va="center", color="gray")
     return plotted
 
 
-def _save(fig, path: Path, title: str) -> None:
-    fig.suptitle(title, fontsize=13, fontweight="bold")
+def _save(fig, path: Path, title: str, palette: dict = None) -> None:
+    p = palette or PALETTES[DEFAULT_PALETTE]
+    fig.suptitle(title, fontsize=13, fontweight="bold", color=p["text"])
     plt.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.savefig(path, facecolor=p["bg"], bbox_inches="tight")
     print(f"  Saved: {path}")
     plt.close(fig)
 
@@ -333,35 +399,40 @@ def _filename_safe(model: str) -> str:
 def plot_passrate(data: dict, plots_dir: Path, judge_label: str,
                   filename_suffix: str = "",
                   tension: float = 0.0, smooth: int = 200,
-                  metric=None) -> None:
+                  metric=None, palette: dict = None) -> None:
+    p         = palette or PALETTES[DEFAULT_PALETTE]
     all_concs = sorted({c for s in data.values() for c in s})
+    metrics   = [(k, lbl) for k, lbl in PASS_METRICS if metric is None or k == metric]
 
-    metrics = [(k, lbl) for k, lbl in PASS_METRICS if metric is None or k == metric]
+    kw = dict(tension=tension, smooth=smooth, palette=p)
+
     if metric is not None:
-        # Single-panel figure
-        fig, ax = plt.subplots(figsize=(7, 4))
+        fig, ax = plt.subplots(figsize=(7, 4), facecolor=p["bg"])
+        ax.set_facecolor(p["bg"])
         (key, label), = metrics
-        _draw_lines(ax, data, key, all_concs, tension=tension, smooth=smooth)
-        ax.set_title(label, fontsize=11, fontweight="bold")
-        ax.set_ylabel("Pass rate", fontsize=9)
+        _draw_lines(ax, data, key, all_concs, **kw)
+        ax.set_title(label, fontsize=11, fontweight="bold", color=p["text"])
+        ax.set_ylabel("Pass rate", fontsize=9, color=p["text"])
         ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
         ax.set_ylim(-0.02, 1.05)
         fname = f"concurrency_passrate_{metric}"
     else:
-        fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+        fig, axes = plt.subplots(2, 3, figsize=(15, 9), facecolor=p["bg"])
         for ax, (key, label) in zip(axes.flatten(), metrics):
-            _draw_lines(ax, data, key, all_concs, tension=tension, smooth=smooth)
-            ax.set_title(label, fontsize=11, fontweight="bold")
-            ax.set_ylabel("Pass rate", fontsize=9)
+            ax.set_facecolor(p["bg"])
+            _draw_lines(ax, data, key, all_concs, **kw)
+            ax.set_title(label, fontsize=11, fontweight="bold", color=p["text"])
+            ax.set_ylabel("Pass rate", fontsize=9, color=p["text"])
             ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
             ax.set_ylim(-0.02, 1.05)
         fname = "concurrency_passrate"
 
     if filename_suffix:
         fname += f"__{filename_suffix}"
-    fname += ".png"
+    fname += ".pdf"
     _save(fig, plots_dir / fname,
-          f"Ours vs OpenClaw — Concurrency Pass Rates  (judge: {judge_label})")
+          f"Ours vs OpenClaw — Concurrency Pass Rates  (judge: {judge_label})",
+          palette=p)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -382,6 +453,10 @@ def main() -> None:
                         choices=metric_keys,
                         help=f"Plot only one metric panel instead of the full 2×3 grid. "
                              f"Choices: {', '.join(metric_keys)}")
+    parser.add_argument("--palette", default=DEFAULT_PALETTE,
+                        choices=list(PALETTES.keys()),
+                        help=f"Color palette (default: {DEFAULT_PALETTE}). "
+                             f"Choices: {', '.join(PALETTES.keys())}")
     args = parser.parse_args()
 
     exp_dir = Path(args.exp_dir)
@@ -413,7 +488,7 @@ def main() -> None:
         plot_passrate(data, plots_dir, judge_label=display,
                       filename_suffix=suffix,
                       tension=args.tension, smooth=args.smooth,
-                      metric=args.metric)
+                      metric=args.metric, palette=PALETTES[args.palette])
 
     print("Done.")
 

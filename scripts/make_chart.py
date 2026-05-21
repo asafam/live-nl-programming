@@ -50,6 +50,17 @@ SERIES = {
 # ---------- PALETTES ----------
 # Each palette defines: bg, gridline, axis, text, and one color per series in order.
 PALETTES = {
+    'default': {
+        # Series order matches make_chart.SERIES: POLO (ours), OpenClaw single, OpenClaw multi
+        'bg':       '#FFFFFF',
+        'gridline': '#E5E5E5',
+        'axis':     '#333333',
+        'text':     '#222222',
+        'text_dim': '#666666',
+        'colors':   ['#005EF5', '#FFBA08', '#D00000'],   # blue, yellow, red
+        'linestyles': ['solid', (0, (8, 4)), (0, (2, 3))],
+        'markers':    ['o', 's', '^'],
+    },
     'botanical': {
         'bg':       '#F2EDDE',
         'gridline': '#D4CBB0',
@@ -145,7 +156,7 @@ def _load_probe_series(path: Path, label: str) -> tuple[list[int], dict]:
 
 
 # ---------- CHART BUILDER ----------
-def make_chart(palette_name='botanical', output_path='probe_accuracy_by_depth.pdf',
+def make_chart(palette_name='default', output_path='probe_accuracy_by_depth.pdf',
                depths=None, series=None, tension=0.0):
     p = PALETTES[palette_name]
 
@@ -297,35 +308,49 @@ def _draw_gradient_fill(ax, x, y, color, alpha_top=0.28, n_steps=40):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('exp_dir', type=Path, nargs='?',
+                        default=Path('outputs/data/zapier/runs/experiments/probes_v6_corr_prop'),
+                        help='Experiment dir containing probes_lnl.jsonl and probes_baseline_*.jsonl '
+                             '(default: probes_v6_corr_prop). Output PDF goes to <exp_dir>/figures/.')
     parser.add_argument('--lnl-probes',      type=Path, default=None, metavar='JSONL',
-                        help='POLO probe results JSONL')
+                        help='Override POLO probe results JSONL (default: <exp_dir>/probes_lnl.jsonl)')
     parser.add_argument('--baseline-probes', type=Path, default=None, metavar='JSONL',
-                        help='Baseline probe results JSONL')
+                        help='Override baseline JSONL (default: <exp_dir>/probes_baseline_multi.jsonl)')
     parser.add_argument('--baseline-label',  default='OpenClaw (multi-agent)',
                         help='Legend label for the baseline series (default: "OpenClaw (multi-agent)")')
     parser.add_argument('--tension', type=float, default=0.0, metavar='T',
                         help='Curve tension: 0.0 = full cubic (most curved), 1.0 = straight lines (default: 0.0)')
-    parser.add_argument('--palette', default='botanical',
+    parser.add_argument('--palette', default='default',
                         choices=list(PALETTES.keys()),
                         help='Color palette to use.')
-    parser.add_argument('--output', default='probe_accuracy_by_depth.pdf',
-                        help='Output PDF path.')
+    parser.add_argument('--output', default=None,
+                        help='Output PDF path (default: <exp_dir>/figures/probes_depth_chart.pdf)')
     args = parser.parse_args()
+
+    lnl_path      = args.lnl_probes      or (args.exp_dir / 'probes_lnl.jsonl'           if args.exp_dir else None)
+    baseline_path = args.baseline_probes or (args.exp_dir / 'probes_baseline_multi.jsonl' if args.exp_dir else None)
+    if args.output:
+        output_path = args.output
+    elif args.exp_dir:
+        (args.exp_dir / 'figures').mkdir(parents=True, exist_ok=True)
+        output_path = str(args.exp_dir / 'figures' / 'probes_depth_chart.pdf')
+    else:
+        output_path = 'probe_accuracy_by_depth.pdf'
 
     # Load from files if provided, otherwise fall back to hardcoded constants.
     depths, series = None, None
-    if args.lnl_probes or args.baseline_probes:
+    if (lnl_path and Path(lnl_path).exists()) or (baseline_path and Path(baseline_path).exists()):
         series = {}
         all_depths = set()
-        if args.lnl_probes:
-            d, s = _load_probe_series(args.lnl_probes, 'POLO (ours)')
+        if lnl_path and Path(lnl_path).exists():
+            d, s = _load_probe_series(Path(lnl_path), 'POLO (ours)')
             series['POLO (ours)'] = s
             all_depths.update(d)
-        if args.baseline_probes:
-            d, s = _load_probe_series(args.baseline_probes, args.baseline_label)
+        if baseline_path and Path(baseline_path).exists():
+            d, s = _load_probe_series(Path(baseline_path), args.baseline_label)
             series[args.baseline_label] = s
             all_depths.update(d)
         depths = sorted(all_depths)
 
-    make_chart(palette_name=args.palette, output_path=args.output,
+    make_chart(palette_name=args.palette, output_path=output_path,
                depths=depths, series=series, tension=args.tension)

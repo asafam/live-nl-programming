@@ -1,0 +1,17 @@
+system: github
+tools:
+  - method: github_create_issue
+    immediate:
+      template: "issue_number: {tool_call_id}, repo: '{repo}', title: '{title}', url: https://github.com/{repo}/issues/{tool_call_id}"
+
+  - method: github_update_issue
+    immediate:
+      template: "issue_number: {issue_number}, repo: '{repo}', updated: true"
+
+  - method: github_get_issue
+    immediate:
+      template: "issue_number: {issue_number}, repo: '{repo}', title: 'Issue', state: open"
+
+  - method: github_list_issues
+    immediate:
+      template: "[]"

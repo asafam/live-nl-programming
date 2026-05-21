@@ -1,0 +1,17 @@
+system: asana
+tools:
+  - method: asana_create_task
+    immediate:
+      template: "gid: {tool_call_id}, name: '{name}', project_id: '{project_id}', created: true"
+
+  - method: asana_update_task
+    immediate:
+      template: "gid: {task_id}, updated: true"
+
+  - method: asana_get_task
+    immediate:
+      template: "gid: {task_id}, name: 'Task', completed: false"
+
+  - method: asana_list_tasks
+    immediate:
+      template: "[]"

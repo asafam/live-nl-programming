@@ -1,0 +1,31 @@
+name: quote-approval-workflow
+# time_scale: compress simulated time for evaluation runs.
+# 0.01 means 1 simulated minute = 0.6 real seconds.
+# Set to 1.0 for real-time delays (or when testing timing behaviour).
+time_scale: 0.01
+
+triggers:
+  # When the agent sends an approval email, a Slack reply arrives after 2 simulated minutes
+  - tool: email_send
+    match:
+      subject: ".*[Aa]pproval.*"
+    reactions:
+      - after_minutes: 2
+        source: slack
+        message: "[Slack → quote-approvals] @manager replied: Got your email re: {subject}. Approved — go ahead."
+
+  # When the agent sends any email, a delivery receipt arrives after 30 simulated seconds
+  - tool: email_send
+    match: {}
+    reactions:
+      - after_seconds: 30
+        source: email
+        message: "[Email] Delivery confirmed: message to {to} re: {subject} delivered successfully."
+
+  # When the agent creates a Jira ticket, it gets auto-assigned after 1 simulated minute
+  - tool: jira_create_issue
+    match: {}
+    reactions:
+      - after_minutes: 1
+        source: jira
+        message: "[Jira] Issue PROJ-{tool_call_id} in {project} was auto-assigned to the on-call team."

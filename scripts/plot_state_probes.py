@@ -32,13 +32,38 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
+import numpy as np
 
-PARADIGM_LABEL = {"lnl": "Ours", "baseline": "OpenClaw"}
-PARADIGM_COLOR = {"lnl": "#2196F3",    "baseline": "#E64A19"}
-PARADIGM_MARKER = {"lnl": "o",         "baseline": "s"}
-PARADIGM_LINESTYLE = {"lnl": "-",      "baseline": "--"}
+PARADIGM_LABEL = {
+    "lnl":             "Ours",
+    "baseline_single": "OpenClaw (single-agent)",
+    "baseline_multi":  "OpenClaw (multi-agent)",
+    # legacy alias used by fidelity-mode plots (single baseline)
+    "baseline":        "OpenClaw",
+}
+PARADIGM_COLOR = {
+    "lnl":             "#005EF5",
+    "baseline_single": "#FFBA08",
+    "baseline_multi":  "#D00000",
+    "baseline":        "#D00000",
+}
+PARADIGM_MARKER = {
+    "lnl":             "o",
+    "baseline_single": "s",
+    "baseline_multi":  "^",
+    "baseline":        "s",
+}
+PARADIGM_LINESTYLE = {
+    "lnl":             "-",
+    "baseline_single": "--",
+    "baseline_multi":  "-.",
+    "baseline":        "--",
+}
 
-DEPTH_RE    = re.compile(r"-probe-D(\d+)-TC")
+# Probe-mode draw order (controls legend + z-order)
+PROBE_PARADIGM_ORDER = ["lnl", "baseline_single", "baseline_multi"]
+
+DEPTH_RE    = re.compile(r"-probe\d*-D(\d+)-")
 FIDELITY_RE = re.compile(r"-sfid-D(\d+)-C(\d+)-TC")
 STEP_ID     = re.compile(r"^S\d+$")
 
@@ -92,7 +117,7 @@ def load_results(path: Path) -> dict[int, list[dict]]:
             if not line:
                 continue
             d = json.loads(line)
-            if "tc_id" not in d:
+            if "tc_id" not in d or d.get("error_type") in ("infra", "timeout"):
                 continue
             depth = _extract_depth(d["tc_id"])
             if depth is None:
@@ -118,7 +143,7 @@ def load_fidelity_results(path: Path) -> dict[int, dict[int, list[dict]]]:
             if not line:
                 continue
             d = json.loads(line)
-            if "tc_id" not in d:
+            if "tc_id" not in d or d.get("error_type") == "infra":
                 continue
             if not FIDELITY_RE.search(d["tc_id"]):
                 continue
@@ -276,13 +301,44 @@ def build_conditioned_series(
 
 # ── Plotting helpers ──────────────────────────────────────────────────────────
 
-def _save(fig, path: Path, title: str) -> None:
-    fig.suptitle(title, fontsize=13, fontweight="bold")
+def _save(fig, path: Path, title: str = "") -> None:
     plt.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.savefig(path, bbox_inches="tight")
     print(f"  Saved: {path}")
     plt.close(fig)
+
+
+# Module-level tension; set from --tension in main(). 0.0 = full spline, 1.0 = linear.
+TENSION: float = 0.0
+
+
+def _smooth_xy(xs: list[float], ys: list[float], n: int = 200,
+               tension: float | None = None):
+    """Return (x_dense, y_dense) interpolated between sample points.
+
+    tension=0.0 → cubic spline (curved); 1.0 → straight segments.
+    Falls back gracefully when scipy is missing or too few points.
+    """
+    if tension is None:
+        tension = TENSION
+    xs_arr = np.asarray(xs, dtype=float)
+    ys_arr = np.asarray(ys, dtype=float)
+    if len(xs_arr) < 2:
+        return xs_arr, ys_arr
+    x_dense = np.linspace(xs_arr.min(), xs_arr.max(), n)
+    linear = np.interp(x_dense, xs_arr, ys_arr)
+    if tension >= 1.0 or len(xs_arr) < 3:
+        return x_dense, linear
+    try:
+        from scipy.interpolate import make_interp_spline
+        curved = make_interp_spline(xs_arr, ys_arr, k=min(3, len(xs_arr) - 1))(x_dense)
+    except ImportError:
+        deg = min(3, len(xs_arr) - 1)
+        curved = np.polyval(np.polyfit(xs_arr, ys_arr, deg), x_dense)
+    if tension <= 0.0:
+        return x_dense, curved
+    return x_dense, tension * linear + (1.0 - tension) * curved
 
 
 def _draw_depth_line(
@@ -294,61 +350,76 @@ def _draw_depth_line(
     error_key: str | None = None,
     linestyle: str | None = None,
     alpha: float = 1.0,
-    markersize: int = 7,
+    markersize: int = 6,
 ) -> bool:
     depths = sorted(series)
     values = [series[d].get(metric_key) for d in depths]
-    if all(v is None for v in values):
+    valid = [(d, v) for d, v in zip(depths, values) if v is not None]
+    if not valid:
         return False
-    y = [v if v is not None else float("nan") for v in values]
+    xs, ys = zip(*valid)
 
-    ax.plot(
-        depths, y,
-        linestyle=linestyle or PARADIGM_LINESTYLE[paradigm],
-        marker=PARADIGM_MARKER[paradigm],
-        color=PARADIGM_COLOR[paradigm],
-        label=label or PARADIGM_LABEL[paradigm],
-        linewidth=2,
-        markersize=markersize,
-        alpha=alpha,
-    )
+    color = PARADIGM_COLOR[paradigm]
+    ls    = linestyle or PARADIGM_LINESTYLE[paradigm]
+    lbl   = label or PARADIGM_LABEL[paradigm]
 
+    # Confidence band (±95% CI) via fill_between, matching plot_mod_types style.
     if error_key:
         try:
             from scipy import stats as _stats
             _use_scipy = True
         except ImportError:
             _use_scipy = False
-
-        for depth, yval in zip(depths, y):
-            vals = series[depth].get(error_key, [])
+        import statistics
+        lo, hi = [], []
+        for d, yval in zip(xs, ys):
+            vals = series[d].get(error_key, [])
             n = len(vals)
             if n > 1:
-                import statistics
                 std = statistics.stdev(vals)
                 t_crit = _stats.t.ppf(0.975, df=n - 1) if _use_scipy else 1.96
                 ci = t_crit * std / (n ** 0.5)
-                ax.errorbar(
-                    depth, yval, yerr=ci,
-                    fmt="none", color=PARADIGM_COLOR[paradigm],
-                    capsize=4, linewidth=1.2, alpha=0.6,
-                )
+                lo.append(yval - ci); hi.append(yval + ci)
+            else:
+                lo.append(yval); hi.append(yval)
+        xd, lo_d = _smooth_xy(list(xs), lo)
+        _,  hi_d = _smooth_xy(list(xs), hi)
+        ax.fill_between(xd, lo_d, hi_d,
+                        color=color, alpha=0.12, linewidth=0, zorder=2)
+
+    # Smooth line through the means.
+    xd, yd = _smooth_xy(list(xs), list(ys))
+    ax.plot(xd, yd, linestyle=ls, color=color, linewidth=2.0,
+            alpha=alpha, zorder=3, label=lbl)
+    # Markers stay at the data points (not on the dense spline).
+    ax.plot(xs, ys, linestyle="none", marker=PARADIGM_MARKER[paradigm],
+            color=color, markersize=markersize, alpha=alpha, zorder=4)
     return True
 
 
 # ── Plot functions ────────────────────────────────────────────────────────────
 
+def _ordered_probe_series(
+    lnl_series: dict[int, dict],
+    baselines: dict[str, dict[int, dict]],
+) -> list[tuple[str, dict[int, dict]]]:
+    """Return [(paradigm_key, series)] in canonical draw order, skipping empties."""
+    pool = {"lnl": lnl_series, **baselines}
+    return [(k, pool[k]) for k in PROBE_PARADIGM_ORDER if pool.get(k)]
+
+
 def plot_probe_accuracy(
     lnl_series: dict[int, dict],
-    baseline_series: dict[int, dict],
+    baselines: dict[str, dict[int, dict]],
     plots_dir: Path,
     judge_label: str = "",
 ) -> None:
-    all_depths = sorted(set(lnl_series) | set(baseline_series))
+    series_list = _ordered_probe_series(lnl_series, baselines)
+    all_depths  = sorted({d for _, s in series_list for d in s})
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    for paradigm, series in [("lnl", lnl_series), ("baseline", baseline_series)]:
+    for paradigm, series in series_list:
         _draw_depth_line(ax, series, "probe_accuracy", paradigm,
                          error_key="probe_accuracy_per_tc")
 
@@ -361,25 +432,21 @@ def plot_probe_accuracy(
     ax.grid(True, alpha=0.3, linestyle=":")
     ax.legend(fontsize=10, loc="best")
 
-    for depth in all_depths:
-        n = (lnl_series.get(depth) or baseline_series.get(depth) or {}).get("n_tcs", 0)
-        ax.annotate(f"n={n}", xy=(depth, -0.02), xycoords=("data", "axes fraction"),
-                    ha="center", va="top", fontsize=7, color="gray")
-
-    title = "State Probe: Accuracy vs Event Depth  (error bars: 95% CI)"
+    title = "State Probe: Accuracy vs Event Depth  (band: 95% CI)"
     if judge_label:
         title += f"  —  judge: {judge_label}"
-    _save(fig, plots_dir / "probe_accuracy_vs_depth.png", title)
+    _save(fig, plots_dir / "probe_accuracy_vs_depth.pdf", title)
 
 
 def plot_conditioned_accuracy(
     lnl_cond: dict[int, dict],
-    base_cond: dict[int, dict],
+    baseline_conds: dict[str, dict[int, dict]],
     plots_dir: Path,
     judge_label: str = "",
     lnl_series: dict[int, dict] | None = None,
 ) -> None:
-    all_depths = sorted(set(lnl_cond) | set(base_cond))
+    cond_series = _ordered_probe_series(lnl_cond, baseline_conds)
+    all_depths  = sorted({d for _, s in cond_series for d in s})
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -391,7 +458,7 @@ def plot_conditioned_accuracy(
          "Conditioned: Probes whose depends_on events all passed",
          "n_conditioned_probes"),
     ]):
-        for paradigm, series in [("lnl", lnl_cond), ("baseline", base_cond)]:
+        for paradigm, series in cond_series:
             _draw_depth_line(ax, series, metric_key, paradigm)
 
         # State-event pass rate as a ceiling reference for LNL
@@ -429,25 +496,20 @@ def plot_conditioned_accuracy(
         ax.set_ylim(-0.02, 1.05)
         ax.grid(True, alpha=0.3, linestyle=":")
         ax.legend(fontsize=10, loc="best")
-        ax.set_title(panel_title, fontsize=10)
-
-        for depth in all_depths:
-            n = (lnl_cond.get(depth) or base_cond.get(depth) or {}).get(n_key, 0)
-            ax.annotate(f"n={n}", xy=(depth, -0.02), xycoords=("data", "axes fraction"),
-                        ha="center", va="top", fontsize=7, color="gray")
 
     title = "State Probe: Conditioned Accuracy vs Event Depth"
     if judge_label:
         title += f"  —  judge: {judge_label}"
-    _save(fig, plots_dir / "probe_conditioned_accuracy_vs_depth.png", title)
+    _save(fig, plots_dir / "probe_conditioned_accuracy_vs_depth.pdf", title)
 
 
 def plot_tokens(
     lnl_series: dict[int, dict],
-    baseline_series: dict[int, dict],
+    baselines: dict[str, dict[int, dict]],
     plots_dir: Path,
 ) -> None:
-    all_depths = sorted(set(lnl_series) | set(baseline_series))
+    series_list = _ordered_probe_series(lnl_series, baselines)
+    all_depths  = sorted({d for _, s in series_list for d in s})
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -455,7 +517,7 @@ def plot_tokens(
         ("mean_in_tok",  "Mean agent input tokens / event"),
         ("mean_out_tok", "Mean agent output tokens / event"),
     ]):
-        for paradigm, series in [("lnl", lnl_series), ("baseline", baseline_series)]:
+        for paradigm, series in series_list:
             _draw_depth_line(ax, series, metric_key, paradigm)
         ax.set_xticks(all_depths)
         ax.set_xticklabels([f"D={d}" for d in all_depths], fontsize=10)
@@ -464,20 +526,21 @@ def plot_tokens(
         ax.grid(True, alpha=0.3, linestyle=":")
         ax.legend(fontsize=10, loc="best")
 
-    _save(fig, plots_dir / "tokens_vs_depth.png",
+    _save(fig, plots_dir / "tokens_vs_depth.pdf",
           "State Probe: Token Cost vs Event Depth")
 
 
 def plot_elapsed(
     lnl_series: dict[int, dict],
-    baseline_series: dict[int, dict],
+    baselines: dict[str, dict[int, dict]],
     plots_dir: Path,
 ) -> None:
-    all_depths = sorted(set(lnl_series) | set(baseline_series))
+    series_list = _ordered_probe_series(lnl_series, baselines)
+    all_depths  = sorted({d for _, s in series_list for d in s})
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    for paradigm, series in [("lnl", lnl_series), ("baseline", baseline_series)]:
+    for paradigm, series in series_list:
         _draw_depth_line(ax, series, "elapsed_mean_s", paradigm)
 
     ax.set_xticks(all_depths)
@@ -487,7 +550,7 @@ def plot_elapsed(
     ax.grid(True, alpha=0.3, linestyle=":")
     ax.legend(fontsize=10, loc="best")
 
-    _save(fig, plots_dir / "elapsed_vs_depth.png",
+    _save(fig, plots_dir / "elapsed_vs_depth.pdf",
           "State Probe: Elapsed Time vs Event Depth")
 
 
@@ -611,7 +674,6 @@ def plot_fidelity_accuracy(
         ax.set_ylim(-0.02, 1.05)
         ax.grid(True, alpha=0.3, linestyle=":")
         ax.legend(fontsize=10, loc="best")
-        ax.set_title(panel_title, fontsize=10)
 
         for depth in all_depths:
             for cells in (lnl_src, base_src):
@@ -630,7 +692,7 @@ def plot_fidelity_accuracy(
     title = "State Fidelity Under Update Pressure: Probe Accuracy vs Depth"
     if judge_label:
         title += f"  —  judge: {judge_label}"
-    fname = "fidelity_accuracy_vs_depth.png"
+    fname = "fidelity_accuracy_vs_depth.pdf"
     _save(fig, plots_dir / fname, title)
 
 
@@ -671,7 +733,7 @@ def plot_fidelity_tokens(
         ax.set_ylabel(ylabel, fontsize=10)
         ax.grid(True, alpha=0.3, linestyle=":")
         ax.legend(fontsize=10, loc="best")
-    _save(fig, plots_dir / "fidelity_tokens_vs_depth.png",
+    _save(fig, plots_dir / "fidelity_tokens_vs_depth.pdf",
           "State Fidelity: Token Cost vs Depth")
 
 
@@ -700,7 +762,7 @@ def plot_fidelity_elapsed(
     ax.set_ylabel("Mean elapsed time per TC (s)", fontsize=10)
     ax.grid(True, alpha=0.3, linestyle=":")
     ax.legend(fontsize=10, loc="best")
-    _save(fig, plots_dir / "fidelity_elapsed_vs_depth.png",
+    _save(fig, plots_dir / "fidelity_elapsed_vs_depth.pdf",
           "State Fidelity: Elapsed Time vs Depth")
 
 
@@ -708,52 +770,69 @@ def plot_fidelity_elapsed(
 
 def print_summary(
     lnl_series: dict[int, dict],
-    baseline_series: dict[int, dict],
+    baselines: dict[str, dict[int, dict]],
     lnl_cond: dict[int, dict] | None = None,
-    base_cond: dict[int, dict] | None = None,
+    baseline_conds: dict[str, dict[int, dict]] | None = None,
 ) -> None:
-    all_depths = sorted(set(lnl_series) | set(baseline_series))
+    series_list = _ordered_probe_series(lnl_series, baselines)
+    all_depths  = sorted({d for _, s in series_list for d in s})
 
     def fmt_pct(v):   return f"{v:.1%}" if v is not None else "   N/A"
     def fmt_tok(v):   return f"{v:,.0f}" if v is not None else "    N/A"
     def fmt_delta(v): return f"{v:+.1%}" if v is not None else "    N/A"
 
-    has_cond = lnl_cond is not None and base_cond is not None
+    has_cond = lnl_cond is not None and baseline_conds
+
+    # Short labels for column headers
+    short = {"lnl": "LNL", "baseline_single": "Single", "baseline_multi": "Multi"}
+
+    raw_keys  = [k for k, _ in series_list]
+    base_keys = [k for k in raw_keys if k != "lnl"]
 
     # Header
-    hdr = f"\n{'Depth':>6}  {'state%':>7}  {'LNL raw':>8}  {'Base raw':>9}  {'Δ raw':>6}"
+    hdr = f"\n{'Depth':>6}  {'state%':>7}"
+    for k in raw_keys:
+        hdr += f"  {short.get(k, k)+' raw':>10}"
+    for k in base_keys:
+        hdr += f"  {'Δ '+short.get(k, k):>9}"
     if has_cond:
-        hdr += f"  {'LNL cond':>9}  {'Base cond':>10}  {'Δ cond':>7}  {'gap':>8}"
-    hdr += f"  {'LNL tok/evt':>12}  {'Base tok/evt':>13}"
+        for k in raw_keys:
+            hdr += f"  {short.get(k, k)+' cond':>11}"
+        for k in base_keys:
+            hdr += f"  {'Δc '+short.get(k, k):>10}"
+        hdr += f"  {'gap':>8}"
+    for k in raw_keys:
+        hdr += f"  {short.get(k, k)+' tok/evt':>14}"
     print(hdr)
     print("-" * (len(hdr) - 1))
 
     for d in all_depths:
-        lnl_m    = lnl_series.get(d) or {}
-        base_m   = baseline_series.get(d) or {}
-        lnl_acc  = lnl_m.get("probe_accuracy")
-        base_acc = base_m.get("probe_accuracy")
-        # State pass rate: average of LNL and baseline (both should be similar)
-        lnl_state  = lnl_m.get("state_accuracy")
-        base_state = base_m.get("state_accuracy")
-        state_pct  = lnl_state  # show LNL's state event pass rate as the primary signal
-        lnl_tok   = lnl_m.get("mean_in_tok")
-        base_tok  = base_m.get("mean_in_tok")
-        delta_raw = (lnl_acc - base_acc) if (lnl_acc is not None and base_acc is not None) else None
+        lnl_m = lnl_series.get(d) or {}
+        lnl_state = lnl_m.get("state_accuracy")
+        lnl_acc   = lnl_m.get("probe_accuracy")
 
-        row = (f"  D={d:>2}  {fmt_pct(state_pct):>7}  {fmt_pct(lnl_acc):>8}  "
-               f"{fmt_pct(base_acc):>9}  {fmt_delta(delta_raw):>6}")
+        row = f"  D={d:>2}  {fmt_pct(lnl_state):>7}"
+        for k, s in series_list:
+            row += f"  {fmt_pct(s.get(d, {}).get('probe_accuracy')):>10}"
+        for k in base_keys:
+            base_acc = baselines[k].get(d, {}).get("probe_accuracy")
+            delta = (lnl_acc - base_acc) if (lnl_acc is not None and base_acc is not None) else None
+            row += f"  {fmt_delta(delta):>9}"
 
         if has_cond:
-            lnl_c  = (lnl_cond.get(d) or {}).get("conditioned")
-            base_c = (base_cond.get(d) or {}).get("conditioned")
-            delta_c = (lnl_c - base_c) if (lnl_c is not None and base_c is not None) else None
-            # Gap: state% − conditioned probe% (how much state advantage is lost at query time)
+            lnl_c = (lnl_cond.get(d) or {}).get("conditioned")
+            for k, _ in series_list:
+                src = lnl_cond if k == "lnl" else baseline_conds.get(k, {})
+                row += f"  {fmt_pct(src.get(d, {}).get('conditioned')):>11}"
+            for k in base_keys:
+                bc = baseline_conds.get(k, {}).get(d, {}).get("conditioned")
+                delta_c = (lnl_c - bc) if (lnl_c is not None and bc is not None) else None
+                row += f"  {fmt_delta(delta_c):>10}"
             gap = (lnl_state - lnl_c) if (lnl_state is not None and lnl_c is not None) else None
-            row += (f"  {fmt_pct(lnl_c):>9}  {fmt_pct(base_c):>10}  {fmt_delta(delta_c):>7}"
-                    f"  {fmt_delta(-gap) if gap is not None else '    N/A':>8}")
+            row += f"  {fmt_delta(-gap) if gap is not None else '    N/A':>8}"
 
-        row += f"  {fmt_tok(lnl_tok):>12}  {fmt_tok(base_tok):>13}"
+        for k, s in series_list:
+            row += f"  {fmt_tok(s.get(d, {}).get('mean_in_tok')):>14}"
         print(row)
 
     if has_cond:
@@ -828,16 +907,32 @@ def _print_fidelity_summary(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("lnl",      type=Path, help="LNL results JSONL")
-    parser.add_argument("plots_dir", type=Path, nargs="?", default=None,
-                        help="Output directory for PNGs (default: <lnl_dir>/plots/)")
+    parser.add_argument("exp_dir", type=Path, nargs="?",
+                        default=Path("outputs/data/zapier/runs/experiments/probes_v6_corr_prop"),
+                        help="Experiment dir containing probes_lnl.jsonl and probes_baseline_*.jsonl "
+                             "(default: probes_v6_corr_prop). Plots go to <exp_dir>/figures/.")
+    parser.add_argument("--lnl", type=Path, default=None,
+                        help="Override LNL results JSONL (default: <exp_dir>/probes_lnl.jsonl)")
+    parser.add_argument("--baseline-multi", dest="baseline_multi", type=Path, default=None,
+                        help="Override multi-agent baseline JSONL "
+                             "(default: <exp_dir>/probes_baseline_multi.jsonl). "
+                             "Pass an empty string to disable.")
+    parser.add_argument("--baseline-single", dest="baseline_single", type=Path, default=None,
+                        help="Override single-agent baseline JSONL "
+                             "(default: <exp_dir>/probes_baseline_single.jsonl). "
+                             "Pass an empty string to disable.")
     parser.add_argument("--baseline", type=Path, default=None,
-                        help="Baseline results JSONL (optional — omit to plot LNL only)")
+                        help="Legacy alias for --baseline-multi.")
+    parser.add_argument("--plots-dir", dest="plots_dir", type=Path, default=None,
+                        help="Override output dir (default: <exp_dir>/figures/)")
     parser.add_argument("--tcs", type=Path, default=None,
-                        help="TC file; enables conditioned accuracy plot")
+                        help="TC file (default: auto-detect data/zapier/probe_dataset_*.jsonl). "
+                             "Required for the conditioned accuracy chart.")
     parser.add_argument("--mode", choices=["probe", "fidelity"], default="probe",
                         help="'probe' (default): group by depth; "
                              "'fidelity': multi-line by n_c, depth on x-axis")
+    parser.add_argument("--tension", type=float, default=0.0, metavar="T",
+                        help="Line smoothing: 0.0 = full cubic spline (default), 1.0 = straight segments.")
     parser.add_argument("--chart", default=None, metavar="CHART",
                         choices=["accuracy", "conditioned", "tokens", "elapsed"],
                         help="Generate only one chart instead of all. "
@@ -845,16 +940,48 @@ def main() -> None:
                              "fidelity mode: accuracy, tokens, elapsed.")
     args = parser.parse_args()
 
-    lnl_path      = args.lnl
-    baseline_path = args.baseline
-    plots_dir     = args.plots_dir or lnl_path.parent / "plots"
+    global TENSION
+    TENSION = args.tension
+
+    exp_dir = args.exp_dir
+    lnl_path  = args.lnl or exp_dir / "probes_lnl.jsonl"
+    plots_dir = args.plots_dir or exp_dir / "figures"
+
+    # Resolve baseline paths (support legacy --baseline alias for --baseline-multi)
+    multi_arg  = args.baseline_multi if args.baseline_multi is not None else args.baseline
+    single_arg = args.baseline_single
+    baseline_paths: dict[str, Path] = {}
+    if multi_arg is None:
+        cand = exp_dir / "probes_baseline_multi.jsonl"
+        if cand.exists():
+            baseline_paths["baseline_multi"] = cand
+    elif str(multi_arg):
+        baseline_paths["baseline_multi"] = Path(multi_arg)
+    if single_arg is None:
+        cand = exp_dir / "probes_baseline_single.jsonl"
+        if cand.exists():
+            baseline_paths["baseline_single"] = cand
+    elif str(single_arg):
+        baseline_paths["baseline_single"] = Path(single_arg)
 
     if not lnl_path.exists():
         print(f"File not found: {lnl_path}", file=sys.stderr)
         sys.exit(1)
-    if baseline_path and not baseline_path.exists():
-        print(f"File not found: {baseline_path}", file=sys.stderr)
-        sys.exit(1)
+    for key, p in list(baseline_paths.items()):
+        if not p.exists():
+            print(f"Baseline not found ({p}); skipping {key}.", file=sys.stderr)
+            del baseline_paths[key]
+
+    if args.tcs is None:
+        candidates = sorted(Path("data/zapier").glob("probe_dataset_*.jsonl"))
+        if len(candidates) == 1:
+            args.tcs = candidates[0]
+            print(f"Auto-detected TCs file:   {args.tcs}")
+        elif len(candidates) > 1:
+            print(f"Multiple probe_dataset_*.jsonl files found; pass --tcs to pick one:",
+                  file=sys.stderr)
+            for c in candidates:
+                print(f"  {c}", file=sys.stderr)
 
     judge_label = ""
     with open(lnl_path) as f:
@@ -872,13 +999,16 @@ def main() -> None:
         tcs = load_tcs(args.tcs)
         print(f"  {len(tcs)} test cases")
 
+    # Fidelity mode still uses a single baseline (multi preferred over single)
+    fidelity_baseline = baseline_paths.get("baseline_multi") or baseline_paths.get("baseline_single")
+
     if args.mode == "fidelity":
         print(f"Loading LNL results:      {lnl_path}")
         lnl_raw  = load_fidelity_results(lnl_path)
         base_raw = {}
-        if baseline_path:
-            print(f"Loading baseline results: {baseline_path}")
-            base_raw = load_fidelity_results(baseline_path)
+        if fidelity_baseline:
+            print(f"Loading baseline results: {fidelity_baseline}")
+            base_raw = load_fidelity_results(fidelity_baseline)
 
         if not lnl_raw and not base_raw:
             print("No sfid TC results found in either file.", file=sys.stderr)
@@ -914,35 +1044,37 @@ def main() -> None:
         lnl_by_depth = load_results(lnl_path)
         lnl_series   = build_series(lnl_by_depth)
 
-        base_by_depth: dict[int, list[dict]] = {}
-        base_series: dict[int, dict] = {}
-        if baseline_path:
-            print(f"Loading baseline results: {baseline_path}")
-            base_by_depth = load_results(baseline_path)
-            base_series   = build_series(base_by_depth)
+        baseline_by_depth: dict[str, dict[int, list[dict]]] = {}
+        baseline_series:   dict[str, dict[int, dict]]       = {}
+        for key, p in baseline_paths.items():
+            print(f"Loading baseline ({key}): {p}")
+            bd = load_results(p)
+            baseline_by_depth[key] = bd
+            baseline_series[key]   = build_series(bd)
 
-        if not lnl_series and not base_series:
-            print("No state-probe TC results found in either file.", file=sys.stderr)
+        if not lnl_series and not any(baseline_series.values()):
+            print("No state-probe TC results found in any file.", file=sys.stderr)
             sys.exit(1)
 
-        lnl_cond = base_cond = None
+        lnl_cond = None
+        baseline_conds: dict[str, dict[int, dict]] = {}
         if tcs:
-            lnl_cond  = build_conditioned_series(lnl_by_depth, tcs)
-            if base_by_depth:
-                base_cond = build_conditioned_series(base_by_depth, tcs)
+            lnl_cond = build_conditioned_series(lnl_by_depth, tcs)
+            for key, bd in baseline_by_depth.items():
+                baseline_conds[key] = build_conditioned_series(bd, tcs)
 
-        print_summary(lnl_series, base_series, lnl_cond, base_cond)
+        print_summary(lnl_series, baseline_series, lnl_cond, baseline_conds or None)
         print(f"Generating plots → {plots_dir}")
 
         c = args.chart
         if c is None or c == "accuracy":
-            plot_probe_accuracy(lnl_series, base_series, plots_dir, judge_label)
+            plot_probe_accuracy(lnl_series, baseline_series, plots_dir, judge_label)
         if c is None or c == "tokens":
-            plot_tokens(lnl_series, base_series, plots_dir)
+            plot_tokens(lnl_series, baseline_series, plots_dir)
         if c is None or c == "elapsed":
-            plot_elapsed(lnl_series, base_series, plots_dir)
+            plot_elapsed(lnl_series, baseline_series, plots_dir)
         if (c is None or c == "conditioned") and tcs:
-            plot_conditioned_accuracy(lnl_cond, base_cond or {}, plots_dir, judge_label,
+            plot_conditioned_accuracy(lnl_cond, baseline_conds, plots_dir, judge_label,
                                       lnl_series=lnl_series)
 
     print("Done.")

@@ -1,0 +1,17 @@
+system: google_calendar
+tools:
+  - method: calendar_create_event
+    immediate:
+      template: "event_id: evt_{tool_call_id}, created: '{title}' on {start}"
+
+  - method: calendar_update_event
+    immediate:
+      template: "event_id: {event_id}, updated successfully"
+
+  - method: calendar_get_event
+    immediate:
+      template: "event_id: {event_id}, title: 'Meeting', start: '2026-01-01T09:00:00Z', end: '2026-01-01T10:00:00Z'"
+
+  - method: calendar_list_events
+    immediate:
+      template: "[]"
