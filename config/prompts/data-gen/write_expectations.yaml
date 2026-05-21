@@ -55,9 +55,45 @@ prompt: |
   non-conditional base-case outputs. Do not assume the threshold is met just because the event
   involves the relevant field.
 
-  **Step 4 — Apply modifications by timestamp.**
+  **Step 4 — Apply ACTIVE modifications to recompute the expected output.**
+
   A modification is active ONLY if the event occurs at or after the modification's `when` timestamp.
   The `[active modifications: ...]` annotation on each event tells you exactly which apply.
+
+  When an event has `[active modifications: M001, ...]`, the expected `action` is NOT the
+  baseline behavior — it is the MODIFIED behavior. For each active modification:
+
+    1. Read the modification's intent text (in the Modifications section above).
+    2. Determine HOW the intent changes the system's response to THIS event:
+       - Routing change → the message/record goes to a different destination
+       - Behavior suppression → an action that normally fires is now skipped
+       - Threshold change → a conditional path now fires (or no longer fires)
+       - Format change → the output content/structure differs
+       - Time-window → behavior is gated on whether `event.when` is in/out of the window
+       - Expansion → an additional action is now produced alongside baseline
+    3. WRITE THE EXPECTED OUTPUT THAT REFLECTS THE MODIFICATION'S EFFECT.
+
+  **Example — clear modification effect:**
+    Modification: "For Windows 11 23H2 VPN lockout cases, route to Infrastructure"
+    Baseline `action`: "DM sent to user with KB fix instructions"
+    Modified `action`: "Ticket created in Infrastructure team's queue for the Windows 11
+                        23H2 VPN lockout case, with the user's request details"
+    → Use the MODIFIED `action`. Do NOT describe the baseline.
+
+  **Example — modification active but condition not met:**
+    Modification: "For severity P1 only, also notify the on-call channel"
+    Event severity in input: P2
+    → Modification active but doesn't apply (P2 ≠ P1). Use baseline `action`. State in
+      `reason` that the modification's qualifying condition is not met.
+
+  If the modification is VAGUE (e.g., "stop pinging people so much"), commit to a
+  reasonable interpretation, state it in `reason`, and write the `action` under that
+  interpretation. Be specific — vague mods still need a specific test outcome.
+
+  **CRITICAL**: never write the baseline behavior for a `role=post_mod` event without
+  also writing in `reason` why the modification's effect does not change THIS event's
+  outcome. A silent baseline on a post_mod event means the modification is not being
+  tested — the test will pass for the wrong reasons.
 
   **Step 5 — Look up exact names from the Reference Data.**
   Use the Reference Data to find the actual entity that fills each role. Use exact names and identifiers.
