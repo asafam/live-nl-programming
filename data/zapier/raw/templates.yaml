@@ -17,14 +17,18 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/it-helpdesk
   raw_steps:
-  - An employee posts a question in a designated Slack channel
-  - AI automatically searches your FAQ knowledge base (stored in a Zapier table) for relevant answers
-  - If AI finds a suitable answer, an AI chatbot replies to the employee directly in Slack
-  - If AI can't find a good answer—or if the issue requires human attention—the request gets escalated to an IT team member
-  - Employees can mark the urgency of their requests using an emoji that corresponds to predefined priority options
-  - The system automatically creates tickets in Jira or ClickUp and sends status updates back to Slack
-  - After each ticket gets closed out, the system summarizes the Slack thread and adds it to your FAQ database
-  - Next time someone has the same question, AI will have the info to respond automatically
+  - An employee posts a question in a designated Slack channel (optionally marking urgency with an emoji corresponding to
+    a predefined priority).
+  - AI automatically searches the FAQ knowledge base (stored in the database) for relevant answers.
+  - If the AI's confidence in its answer is above a configured threshold, an AI chatbot replies to the employee directly in
+    Slack.
+  - If the AI's confidence is below the threshold — or if the issue requires human attention — the request is automatically
+    escalated to an IT team member.
+  - The system automatically creates a ticket in the IT tracker (Jira or ClickUp) and sends status updates back to the Slack
+    thread.
+  - When an IT team member marks the ticket as closed, the system summarizes the Slack thread and adds the resolution to the
+    FAQ database.
+  - On the next matching question, the AI uses the newly-added FAQ entry to respond automatically.
 - id: deal-desk-manage-hubspot-quote-approvals-slack
   name: HubSpot Automated Quote Approval
   source_type: Zapier/Workflow Logic
@@ -93,15 +97,19 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/automate-hr-support-ai-helpdesk-assistant
   raw_steps:
-  - An employee asks a question in your designated HR help channel in Slack
-  - A Zap triggers the AI chatbot to search your FAQ knowledge base stored in Zapier Tables
-  - The chatbot provides an instant response based on your internal policies and information
-  - If the question is complex or sensitive, it's automatically escalated to your HR team
-  - The employee can mark urgency levels for time-sensitive requests
-  - HR receives notifications about escalated or high-priority issues
-  - Once resolved, the interaction is logged in your Zapier Table for future reference
-  - New answers are added to your knowledge base, making the system smarter over time
-  - Regular reports show which topics generate the most questions to help improve communication
+  - An employee asks a question in the designated HR help channel in Slack (optionally marking urgency with a priority label
+    or emoji).
+  - The AI chatbot searches the FAQ knowledge base stored in the database for relevant answers.
+  - The chatbot provides an instant response based on internal policies and information.
+  - If the chatbot's confidence in its response is below a configured threshold, or if the question is flagged as complex/sensitive,
+    the question is automatically escalated to the HR team.
+  - HR receives a notification about the escalated or high-priority issue.
+  - When an HR team member marks the conversation as resolved (via a Slack reaction or button), the interaction is logged
+    in the database for future reference.
+  - When a resolved interaction contains a new answer not present in the knowledge base, the new answer is added to the knowledge
+    base.
+  - On a weekly schedule, a report is generated showing which topics generate the most questions, and posted to the designated
+    HR ops channel.
 - id: employee-offboarding
   name: Comprehensive Employee Offboarding System
   source_type: Zapier/Workflow Logic
@@ -197,12 +205,9 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/form-zoho-crm
   raw_steps:
-  - Set up a comprehensive form to capture contact details and company information.
-  - Configure a table to store submitted form data as a staging area.
-  - Create a Zap that triggers when a new form submission is received.
-  - Pull the data from the table and map it to corresponding Zoho CRM fields.
-  - Automatically create a new entry in the specified CRM module.
-  - Use Canvas to diagram and optimize the entire workflow.
+  - User submits the comprehensive form capturing contact details and company information.
+  - A new contact entry is created in the specified Zoho CRM module with the submitted form data mapped to the corresponding
+    CRM fields.
 - id: ai-voice-generator
   name: AI Voice Generator to Google Drive
   source_type: Zapier/Workflow Logic
@@ -247,13 +252,12 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/form-jira
   raw_steps:
-  - Design a custom form using Zapier Interfaces to capture issue information such as summary, description, issue type, priority,
-    and assignee.
-  - Store form submissions in a Zapier Table for data manipulation and processing.
-  - Trigger a Zap when a new form submission is received.
-  - Map the form data from the Table to the corresponding fields in Jira Software Cloud.
-  - Create a new issue in Jira Software Cloud with the mapped information.
-  - Optionally notify team members or update other connected apps upon issue creation.
+  - User submits the custom form with issue information (summary, description, issue type, priority, assignee).
+  - Form submission is stored in the database for processing.
+  - Form data is mapped to corresponding fields in Jira Software Cloud.
+  - A new issue is created in Jira Software Cloud with the mapped information.
+  - Upon issue creation in Jira, team members are notified in the designated Slack channel.
+  - Upon issue creation in Jira, the connected project-tracker tool is updated with the new issue link and metadata.
 - id: document-approval
   name: Document Approval Workflow
   source_type: Zapier/Workflow Logic
@@ -269,14 +273,12 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/form-telegram
   raw_steps:
-  - Create a customizable form using Zapier Interfaces to collect Telegram message details including chat ID, message text,
-    and advanced options like scheduled sending and inline keyboard interactions.
-  - Set up a Zap trigger that activates when a new form submission is received from the Interfaces form.
-  - Configure the Telegram Send Message action and map form fields to the corresponding Telegram message parameters such as
-    chat ID and message text.
-  - Optionally configure advanced options including message scheduling, inline keyboard interactions, and custom metadata
-    for tracking.
-  - Test and activate the workflow to automatically send customized Telegram messages whenever the form is submitted.
+  - 'User submits the customizable form with: recipient chat ID, message text, and optional advanced options (scheduling time,
+    inline keyboard buttons, custom metadata).'
+  - Form data is mapped to Telegram Send Message action parameters (recipient chat ID, message content).
+  - If the submission included advanced options, those options (scheduling, inline keyboard, metadata) are applied to the
+    outgoing Telegram message; otherwise this step is skipped.
+  - The customized Telegram message is sent to the recipient chat ID.
 - id: lead-capture
   name: Lead Capture and Email Notification
   source_type: Zapier/Workflow Logic
@@ -291,12 +293,12 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/product-feedback
   raw_steps:
-  - Customer submits feedback through the Feedback Form in the Interface.
+  - Customer submits feedback through the Feedback Form portal.
   - The submitted feedback is automatically added as a new row in the Product Feedback Table.
-  - The 'Send Email Notification' Zap triggers when a new row is added to the table.
-  - An email notification is sent to the team with all feedback information.
-  - Team member reviews the feedback and fills out the email subject, body, and from name fields in the table.
-  - Team member clicks the send email button to send a reply to the customer.
+  - A ticket is created in the support platform (e.g., Zendesk, Intercom) and routed to the appropriate product team based
+    on the feedback's product area.
+  - When a team member replies to the feedback ticket in the support platform, an email is automatically sent as a reply to
+    the customer with the team member's response.
 - id: email-campaign-portal
   name: Email Campaign Drip Sequence Manager
   source_type: Zapier/Workflow Logic
