@@ -24,6 +24,31 @@ user_prompt: |
 
   Do not invent concepts (like dollar thresholds) that are not part of the automation.
 
+  **Do not invent destinations, teams, channels, or queues that the workflow
+  does not have.** A modification like *"route to Infrastructure"* is broken if
+  the object graph has no object that handles "Infrastructure" routing — no
+  post_mod event can demonstrate the new routing because there is no peer to
+  route to. Before writing a modification:
+
+    1. Re-read the object graph and step text.
+    2. Confirm every actor/destination/channel/queue/category the mod
+       mentions is already named in the graph (or is a generic concept like
+       "the team" that grounds back to a named object).
+    3. If the mod's intent requires routing to a new place, EITHER pick an
+       existing object to route to OR change the mod to a behavior that
+       the existing graph can demonstrate (e.g., change priority, suppress
+       a notification, add a field, defer a write).
+
+  Examples for a helpdesk workflow whose graph is `support-triage`,
+  `knowledge-base`, `clickup-tickets`, `support-queue-channel`,
+  `knowledge-base-updater`:
+    ✓ "Stop sending acknowledgement DMs for tickets that already have a KB
+       match" — references only existing actors.
+    ✓ "When a request mentions 'enterprise customer', also notify the
+       #support-escalations channel" — channel can be picked / grounded.
+    ✗ "Route Infrastructure-team cases to the Infrastructure queue first" —
+       no Infrastructure team / queue in this graph. Mod cannot be tested.
+
   ## Object Definitions
 
   The sample includes object definitions with their roles, behaviors, peers, and communication contracts.

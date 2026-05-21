@@ -39,15 +39,28 @@ prompt: |
 
   Per-modification quality:
 
-  - **GOOD** — `intent` is specific and actionable (the agent reading this
-    would know exactly what to do); concrete values where they matter
-    (no "soon", "later", "some channel"); the target object is the right
-    one for the intent.
-  - **ADEQUATE** — minor issues: one underspecified phrase or a target
-    that's almost right.
-  - **POOR** — vague intent, target object can't do what the intent asks,
-    nonsensical timing, contradictory instructions, references to
-    non-existent fields/objects.
+  Grade each modification's quality RELATIVE to its declared `ambiguity`
+  rating. A `precise` mod must be specific; a `vague` mod is allowed and
+  *expected* to be non-specific (its purpose is to test how the agent
+  interprets unclear instructions). Don't penalise a `vague` mod for
+  being vague — that's the entire point of `ambiguity=vague`.
+
+  - **GOOD** — for the ambiguity tier:
+      precise   → fully spelled out, no interpretation needed
+      semantic  → meaning clear but exact threshold/value left implicit
+      vague     → intentionally open-ended but still gestures at a real
+                  behavioral change with at least one testable surface
+      implicit  → relies on shared context; what to change is at least
+                  guessable from the workflow's domain
+    AND target object is reachable AND the intent doesn't fabricate
+    actors / channels / queues that aren't in the workflow.
+  - **ADEQUATE** — one minor issue: a slightly-wrong target, a missing
+    boundary that the ambiguity tier didn't quite excuse, etc.
+  - **POOR** — the mod is not testable at any plausible interpretation
+    (NOT just "vague" — fail only if no reasonable reading makes the
+    behavior observable), OR target can't perform what the intent asks,
+    OR references non-existent actors / channels / queues, OR is
+    contradictory with the existing object behaviors.
 
   Also rate these binary axes:
 
