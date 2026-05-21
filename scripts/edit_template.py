@@ -23,7 +23,8 @@ import yaml
 REPO = Path(__file__).resolve().parent.parent
 TEMPLATES_PATH = REPO / "data/zapier/raw/templates.yaml"
 
-FLAGGED = [
+# Review recommended (1 NO_SECTION + 8 NOTABLE_DRIFT)
+FLAGGED_REVIEW: list[tuple[str, str]] = [
     ("slack-notion-task-manager",                          "NO_SECTION — page lacks workflow section; consider re-scrape"),
     ("linkedin-conversion-tracking-for-physical-stores",   "NOTABLE_DRIFT — YAML adds 4 setup steps"),
     ("lead-router",                                        "NOTABLE_DRIFT — YAML reframes features as runtime steps"),
@@ -33,8 +34,23 @@ FLAGGED = [
     ("ai-email-assistant",                                 "NOTABLE_DRIFT — adds Gmail trigger + connect/test/publish setup"),
     ("contact-list",                                       "NOTABLE_DRIFT — adds CSV import + custom fields"),
     ("inventory",                                          "NOTABLE_DRIFT — adds product-data entry, Need-More checkbox, per-product email"),
+]
+
+# Optional review (13 MILD_DRIFT — 1 added step each, still workflow-accurate)
+FLAGGED_OPTIONAL: list[tuple[str, str]] = [
     ("email-campaign-portal",                              "MILD_DRIFT — YAML focuses on usage flow, page on setup"),
     ("ai-generated-press-mentions",                        "MILD_DRIFT — YAML adds 'email notification to team' step"),
+    ("ai-content-idea-generator",                          "MILD_DRIFT — adds 'Publish the workflow' step"),
+    ("instagram-content-calendar",                         "MILD_DRIFT — adds db-tracking view step"),
+    ("lead-capture",                                       "MILD_DRIFT — adds branding step"),
+    ("employee-onboarding-manager",                        "MILD_DRIFT — adds explicit button-click trigger step"),
+    ("ai-form",                                            "MILD_DRIFT — adds share/embed step"),
+    ("expenses-tracker",                                   "MILD_DRIFT — adds manual data-entry setup step"),
+    ("subscription-tracker",                               "MILD_DRIFT — adds customization step"),
+    ("g2-reviews-product-team",                            "MILD_DRIFT — adds 'track sentiment changes' (not on page)"),
+    ("user-research-customer-interview-signup",            "MILD_DRIFT — adds benefit-statement step"),
+    ("import-account-signals-salesloft-looker",            "MILD_DRIFT — adds explicit 'notify reps' step"),
+    ("ai-image-generator",                                 "MILD_DRIFT — adds optional Google Drive upload"),
 ]
 
 
@@ -85,17 +101,25 @@ def parse_steps(text: str) -> list[str]:
     return steps
 
 
-def cmd_list_flagged() -> None:
+def cmd_list_flagged(include_optional: bool) -> None:
     templates = {t["id"]: t for t in load_templates()}
-    print(f"Flagged for human review ({len(FLAGGED)}):\n")
-    for tid, note in FLAGGED:
-        t = templates.get(tid)
-        if t is None:
-            print(f"  {tid}  [MISSING from templates.yaml]")
-            continue
-        print(f"  {tid}  ({len(t['raw_steps'])} steps)")
-        print(f"    {note}")
-        print(f"    {t['link']}\n")
+
+    def _print_group(title: str, items: list[tuple[str, str]]) -> None:
+        print(f"\n{title} ({len(items)}):\n")
+        for tid, note in items:
+            t = templates.get(tid)
+            if t is None:
+                print(f"  {tid}  [MISSING from templates.yaml]")
+                continue
+            print(f"  {tid}  ({len(t['raw_steps'])} steps)")
+            print(f"    {note}")
+            print(f"    {t['link']}\n")
+
+    _print_group("Review recommended", FLAGGED_REVIEW)
+    if include_optional:
+        _print_group("Optional review (MILD_DRIFT)", FLAGGED_OPTIONAL)
+    else:
+        print(f"+ {len(FLAGGED_OPTIONAL)} MILD_DRIFT templates (pass --all to see).")
 
 
 def cmd_edit(tid: str) -> None:
@@ -143,11 +167,12 @@ def cmd_edit(tid: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("template_id", nargs="?", help="Template id to edit (e.g. 'lead-router').")
-    parser.add_argument("--list-flagged", action="store_true", help="List templates flagged by the audit.")
+    parser.add_argument("--list-flagged", action="store_true", help="List templates flagged by the audit (review-recommended only).")
+    parser.add_argument("--all", action="store_true", help="With --list-flagged: also show MILD_DRIFT (optional review).")
     args = parser.parse_args()
 
     if args.list_flagged:
-        cmd_list_flagged()
+        cmd_list_flagged(include_optional=args.all)
         return
     if not args.template_id:
         parser.print_help()
