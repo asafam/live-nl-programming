@@ -33,9 +33,11 @@ from src.data.llm import create_llm
 
 load_dotenv()
 from src.data.schema import (
-    StepJudgement,
+    MissedTrigger,
+    RawStepClassification,
     StepVerdict,
     Workflow,
+    WorkflowStepsJudgement,
     WorkflowValidation,
 )
 from src.data.utils import generate_with_retries, load_jsonl
@@ -81,96 +83,67 @@ def _health_check_step(workflow: Workflow, step_index: int) -> list[str]:
     return issues
 
 
-def _judge_step(
+def _format_workflow_steps(workflow: Workflow) -> str:
+    if not workflow.steps:
+        return "(no workflow steps)"
+    lines = []
+    for i, st in enumerate(workflow.steps, 1):
+        expect_action = st.expect.action if st.expect else "(none)"
+        lines.append(f"  [{i}] target={st.target}")
+        lines.append(f"      text: {st.text}")
+        lines.append(f"      expect.action: {expect_action}")
+    return "\n".join(lines)
+
+
+def _judge_workflow_steps(
     llm,
     workflow: Workflow,
     template: dict,
-    step_index: int,
     prompt_template: str,
-) -> StepVerdict:
-    """Call the LLM judge on one (raw_step, grounded_step) pair + deterministic health checks."""
-    raw_step = template["raw_steps"][step_index]
-    step = workflow.steps[step_index]
-    expect_action = step.expect.action if step.expect else "(none)"
-
-    health_issues = _health_check_step(workflow, step_index)
-
+) -> Optional[WorkflowStepsJudgement]:
+    """Single LLM call that classifies raw_steps + judges each workflow Step + reports missed triggers."""
     prompt = (
         prompt_template
         .replace("{WORKFLOW_ID}", workflow.id)
         .replace("{WORKFLOW_NAME}", workflow.name)
         .replace("{LINK}", workflow.link or "")
-        .replace("{ALL_RAW_STEPS}", _format_all_raw_steps(template["raw_steps"]))
-        .replace("{STEP_INDEX}", str(step_index + 1))
-        .replace("{RAW_STEP}", raw_step)
-        .replace("{GROUNDED_STEP}", step.text)
-        .replace("{TARGET}", step.target)
-        .replace("{EXPECT_ACTION}", expect_action)
+        .replace("{RAW_STEPS}", _format_all_raw_steps(template["raw_steps"]))
+        .replace("{WORKFLOW_STEPS}", _format_workflow_steps(workflow))
     )
-
-    result = generate_with_retries(
+    return generate_with_retries(
         llm=llm,
         prompt=prompt,
-        response_model=StepJudgement,
-        item_id=f"{workflow.id}-step{step_index+1}",
+        response_model=WorkflowStepsJudgement,
+        item_id=f"{workflow.id}-steps",
         validator=lambda r: (
-            r.verdict in ("FAITHFUL", "DRIFTED", "WRONG")
-            and r.quality in ("GOOD", "ADEQUATE", "POOR")
+            len(r.step_judgements) == len(workflow.steps)
+            and len(r.raw_step_classifications) == len(template["raw_steps"])
+            and all(sj.verdict in ("FAITHFUL", "DRIFTED", "WRONG") for sj in r.step_judgements)
+            and all(sj.quality in ("GOOD", "ADEQUATE", "POOR") for sj in r.step_judgements)
         ),
     )
 
-    if result is None:
-        return StepVerdict(
-            workflow_id=workflow.id,
-            step_index=step_index,
-            raw_step=raw_step,
-            grounded_step=step.text,
-            expect_action=step.expect.action if step.expect else None,
-            target=step.target,
-            verdict="WRONG",
-            reasoning="(judge failed — defaulting to WRONG)",
-            health_issues=health_issues,
-            quality="POOR",
-            quality_issues=["(judge failed; quality not assessed)"],
-        )
 
-    return StepVerdict(
-        workflow_id=workflow.id,
-        step_index=step_index,
-        raw_step=raw_step,
-        grounded_step=step.text,
-        expect_action=step.expect.action if step.expect else None,
-        target=step.target,
-        verdict=result.verdict,
-        reasoning=result.reasoning,
-        health_issues=health_issues,
-        quality=result.quality,
-        quality_issues=list(result.quality_issues or []),
-    )
-
-
-def _aggregate_verdict(step_verdicts: list[StepVerdict], count_mismatch: bool) -> str:
-    """Roll per-step fidelity verdicts up to a workflow-level aggregate."""
+def _aggregate_verdict(step_verdicts: list[StepVerdict], n_missed_triggers: int) -> str:
+    """Roll fidelity up to a workflow-level aggregate (trigger-only framing)."""
     has_wrong = any(v.verdict == "WRONG" for v in step_verdicts)
     n_drifted = sum(1 for v in step_verdicts if v.verdict == "DRIFTED")
-
     if has_wrong:
         return "WRONG"
-    if n_drifted >= 2 or count_mismatch:
+    n_issues = n_drifted + n_missed_triggers
+    if n_issues >= 2:
         return "NOTABLE_DRIFT"
-    if n_drifted == 1:
+    if n_issues == 1:
         return "MILD_DRIFT"
     return "CLEAN"
 
 
 def _aggregate_health(step_verdicts: list[StepVerdict]) -> str:
-    """OK iff no step has any health_issues."""
     return "OK" if all(not v.health_issues for v in step_verdicts) else "ISSUES"
 
 
 def _aggregate_quality(step_verdicts: list[StepVerdict]) -> str:
-    """Worst per-step quality across non-unaligned steps."""
-    scores = [v.quality for v in step_verdicts if v.verdict != "UNALIGNED"]
+    scores = [v.quality for v in step_verdicts]
     if any(q == "POOR" for q in scores):
         return "POOR"
     if any(q == "ADEQUATE" for q in scores):
@@ -184,13 +157,12 @@ def _validate_workflow(
     template: Optional[dict],
     prompt_template: str,
 ) -> WorkflowValidation:
-    """Judge every step of one workflow and return its aggregate validation."""
+    """Validate one workflow's Steps. Single LLM call + deterministic health checks."""
     if template is None:
         return WorkflowValidation(
             workflow_id=workflow.id,
             n_template_steps=0,
             n_workflow_steps=len(workflow.steps),
-            count_mismatch=True,
             step_verdicts=[],
             aggregate="WRONG",
             aggregate_health="ISSUES",
@@ -199,66 +171,108 @@ def _validate_workflow(
 
     n_template = len(template["raw_steps"])
     n_workflow = len(workflow.steps)
-    count_mismatch = n_template != n_workflow
 
-    aligned_n = min(n_template, n_workflow)
+    # Deterministic health pass per Step
+    health_lists = [_health_check_step(workflow, i) for i in range(n_workflow)]
+
+    # Single LLM call: classify raw_steps + judge each Step + report missed triggers
+    judgement = _judge_workflow_steps(llm, workflow, template, prompt_template)
+
+    if judgement is None:
+        # Fall back: all WRONG, mark every TRIGGER raw_step as missed (we don't know which).
+        step_verdicts = [
+            StepVerdict(
+                workflow_id=workflow.id,
+                step_index=i,
+                grounded_step=workflow.steps[i].text,
+                expect_action=workflow.steps[i].expect.action if workflow.steps[i].expect else None,
+                target=workflow.steps[i].target,
+                verdict="WRONG",
+                reasoning="(judge failed)",
+                health_issues=health_lists[i],
+                quality="POOR",
+                quality_issues=["(judge failed; quality not assessed)"],
+            )
+            for i in range(n_workflow)
+        ]
+        return WorkflowValidation(
+            workflow_id=workflow.id,
+            n_template_steps=n_template,
+            n_template_triggers=0,
+            n_workflow_steps=n_workflow,
+            step_verdicts=step_verdicts,
+            missed_triggers=[],
+            raw_step_classifications=[],
+            aggregate="WRONG",
+            aggregate_health=_aggregate_health(step_verdicts),
+            aggregate_quality="POOR",
+        )
+
+    # Build per-Step verdicts using LLM output + deterministic health
+    step_judgements_by_idx = {sj.workflow_step_index: sj for sj in judgement.step_judgements}
     step_verdicts: list[StepVerdict] = []
-
-    for i in range(aligned_n):
-        step_verdicts.append(_judge_step(llm, workflow, template, i, prompt_template))
-
-    # Steps without a counterpart on either side
-    if n_workflow > n_template:
-        for i in range(n_template, n_workflow):
-            step = workflow.steps[i]
+    for i in range(n_workflow):
+        sj = step_judgements_by_idx.get(i + 1)
+        step = workflow.steps[i]
+        if sj is None:
             step_verdicts.append(StepVerdict(
                 workflow_id=workflow.id,
                 step_index=i,
-                raw_step="(no matching template step)",
                 grounded_step=step.text,
                 expect_action=step.expect.action if step.expect else None,
                 target=step.target,
-                verdict="UNALIGNED",
-                reasoning="Workflow has more steps than the template.",
-                quality="UNALIGNED",
+                verdict="WRONG",
+                reasoning="(judge did not produce a verdict for this Step)",
+                health_issues=health_lists[i],
+                quality="POOR",
+                quality_issues=["(no judge verdict)"],
             ))
-    elif n_template > n_workflow:
-        for i in range(n_workflow, n_template):
+        else:
             step_verdicts.append(StepVerdict(
                 workflow_id=workflow.id,
                 step_index=i,
-                raw_step=template["raw_steps"][i],
-                grounded_step="(no matching workflow step)",
-                expect_action=None,
-                target="",
-                verdict="UNALIGNED",
-                reasoning="Template has more raw_steps than the workflow.",
-                quality="UNALIGNED",
+                grounded_step=step.text,
+                expect_action=step.expect.action if step.expect else None,
+                target=step.target,
+                aligned_to=sj.aligned_to,
+                verdict=sj.verdict,
+                reasoning=sj.reasoning,
+                health_issues=health_lists[i],
+                quality=sj.quality,
+                quality_issues=list(sj.quality_issues or []),
             ))
+
+    n_triggers = sum(1 for c in judgement.raw_step_classifications if c.classification == "TRIGGER")
+    n_missed = len(judgement.missed_triggers)
 
     return WorkflowValidation(
         workflow_id=workflow.id,
         n_template_steps=n_template,
+        n_template_triggers=n_triggers,
         n_workflow_steps=n_workflow,
-        count_mismatch=count_mismatch,
         step_verdicts=step_verdicts,
-        aggregate=_aggregate_verdict(step_verdicts, count_mismatch),
+        missed_triggers=list(judgement.missed_triggers),
+        raw_step_classifications=list(judgement.raw_step_classifications),
+        aggregate=_aggregate_verdict(step_verdicts, n_missed),
         aggregate_health=_aggregate_health(step_verdicts),
         aggregate_quality=_aggregate_quality(step_verdicts),
     )
 
 
 def _print_summary(results: list[WorkflowValidation]) -> None:
-    """Print fidelity / health / quality rollups + per-workflow flagged list."""
+    """Print fidelity / health / quality rollups + missed-trigger stats."""
     from collections import Counter
     counts = Counter(r.aggregate for r in results)
     health_counts = Counter(r.aggregate_health for r in results)
     quality_counts = Counter(r.aggregate_quality for r in results)
+    total_missed_triggers = sum(len(r.missed_triggers) for r in results)
+    workflows_with_missed = sum(1 for r in results if r.missed_triggers)
 
     print("\n" + "=" * 70)
     print(f"Workflow step validation — {len(results)} workflows")
     print("=" * 70)
-    print("Fidelity (raw_step → grounded_step faithfulness):")
+    print(f"Missed triggers: {total_missed_triggers} across {workflows_with_missed} workflow(s)")
+    print("Fidelity (workflow Step grounds a TRIGGER template raw_step):")
     print(f"  CLEAN:          {counts.get('CLEAN', 0):3d}")
     print(f"  MILD_DRIFT:     {counts.get('MILD_DRIFT', 0):3d}")
     print(f"  NOTABLE_DRIFT:  {counts.get('NOTABLE_DRIFT', 0):3d}")
@@ -284,15 +298,16 @@ def _print_summary(results: list[WorkflowValidation]) -> None:
         for r in flagged:
             n_drift = sum(1 for v in r.step_verdicts if v.verdict == "DRIFTED")
             n_wrong = sum(1 for v in r.step_verdicts if v.verdict == "WRONG")
-            n_unal  = sum(1 for v in r.step_verdicts if v.verdict == "UNALIGNED")
             n_health = sum(len(v.health_issues) for v in r.step_verdicts)
             n_poor = sum(1 for v in r.step_verdicts if v.quality == "POOR")
+            n_missed = len(r.missed_triggers)
             print(
                 f"  {r.workflow_id:<55} "
                 f"fid={r.aggregate:<13} health={r.aggregate_health:<6} quality={r.aggregate_quality:<8} "
-                f"(drift={n_drift} wrong={n_wrong} unalign={n_unal} "
+                f"(drift={n_drift} wrong={n_wrong} missed_triggers={n_missed} "
                 f"health_issues={n_health} poor_steps={n_poor} "
-                f"steps={r.n_workflow_steps}/{r.n_template_steps})"
+                f"steps={r.n_workflow_steps}/{r.n_template_triggers}trig "
+                f"of {r.n_template_steps}raw)"
             )
         print()
 

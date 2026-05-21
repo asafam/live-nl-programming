@@ -369,63 +369,77 @@ class Workflows(BaseModel):
 # ── Workflow-step validation schemas ──────────────────────────────────────────
 
 
+class RawStepClassification(BaseModel):
+    """LLM classification of a template raw_step as TRIGGER or CASCADE."""
+    index: int  # 1-based
+    classification: Literal["TRIGGER", "CASCADE"]
+
+
 class StepJudgement(BaseModel):
-    """LLM judge output for one workflow step (fidelity + quality)."""
-    # Fidelity: how faithfully is the abstract raw_step grounded?
+    """LLM judge output for one workflow Step (trigger-fidelity + quality)."""
+    workflow_step_index: int  # 1-based
+    # Fidelity: which TRIGGER raw_step (if any) this Step grounds, and how well.
+    aligned_to: Optional[int] = None   # 1-based template raw_step index
     verdict: Literal["FAITHFUL", "DRIFTED", "WRONG"]
     reasoning: str
     # Quality: independent of fidelity, is the grounded text well-written?
     quality: Literal["GOOD", "ADEQUATE", "POOR"] = "ADEQUATE"
-    quality_issues: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Specific quality complaints the judge found, e.g., 'placeholder "
-            "value Company-A not grounded', 'expect.action bundles multiple "
-            "observable outcomes', 'product name FormPlatform is not real'."
-        ),
-    )
+    quality_issues: list[str] = Field(default_factory=list)
+
+
+class MissedTrigger(BaseModel):
+    """A template raw_step classified as TRIGGER that no workflow Step grounds."""
+    index: int  # 1-based
+    raw_step: str
+
+
+class WorkflowStepsJudgement(BaseModel):
+    """LLM output covering one workflow's complete step audit in a single call."""
+    raw_step_classifications: list[RawStepClassification]
+    step_judgements: list[StepJudgement]
+    missed_triggers: list[MissedTrigger] = Field(default_factory=list)
 
 
 class StepVerdict(BaseModel):
-    """Per-step verdict combining deterministic health + LLM fidelity + LLM quality."""
+    """Per-workflow-Step verdict combining deterministic health + LLM fidelity + LLM quality.
+
+    Fidelity is grounded in TRIGGER fidelity: each workflow Step is supposed
+    to be an external trigger, so the validator checks whether it grounds
+    one of the template's TRIGGER raw_steps (cascade raw_steps are NOT the
+    Step's job — they're covered by object behaviors).
+    """
     workflow_id: str
-    step_index: int
-    raw_step: str
+    step_index: int       # 0-based index into Workflow.steps
     grounded_step: str
     expect_action: Optional[str] = None
     target: str = ""
-    # Fidelity: how well the grounded step matches the abstract raw_step (LLM)
-    verdict: Literal["FAITHFUL", "DRIFTED", "WRONG", "UNALIGNED"]
+    # Fidelity (LLM)
+    aligned_to: Optional[int] = None   # 1-based template raw_step index this Step grounds, or None
+    verdict: Literal["FAITHFUL", "DRIFTED", "WRONG"]
     reasoning: str
-    # Health: deterministic structural checks (no LLM)
-    health_issues: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Structural problems detected without an LLM call. Empty list = "
-            "structurally healthy. Examples: 'text is empty', 'target does "
-            "not exist in workflow.objects', 'target has no event_sources', "
-            "'expect.action is missing'."
-        ),
-    )
-    # Quality: subjective LLM judgement on whether the grounded step is well-written
-    quality: Literal["GOOD", "ADEQUATE", "POOR", "UNALIGNED"] = "ADEQUATE"
+    # Health (deterministic, no LLM)
+    health_issues: list[str] = Field(default_factory=list)
+    # Quality (LLM, independent of fidelity)
+    quality: Literal["GOOD", "ADEQUATE", "POOR"] = "ADEQUATE"
     quality_issues: list[str] = Field(default_factory=list)
-    judge_input_tokens: int = 0
-    judge_output_tokens: int = 0
 
 
 class WorkflowValidation(BaseModel):
-    """Aggregate validation result for one workflow."""
+    """Aggregate validation result for one workflow's Steps."""
     workflow_id: str
-    n_template_steps: int
+    n_template_steps: int          # total raw_steps in template
+    n_template_triggers: int = 0   # raw_steps classified as TRIGGER by the LLM
     n_workflow_steps: int
-    count_mismatch: bool
     step_verdicts: list[StepVerdict] = Field(default_factory=list)
-    # Fidelity rollup (existing)
+    # Triggers in the template that no workflow Step grounds.
+    missed_triggers: list[MissedTrigger] = Field(default_factory=list)
+    # Classification of every raw_step (for audit & inspection).
+    raw_step_classifications: list[RawStepClassification] = Field(default_factory=list)
+    # Fidelity rollup (CLEAN / MILD_DRIFT / NOTABLE_DRIFT / WRONG)
     aggregate: Literal["CLEAN", "MILD_DRIFT", "NOTABLE_DRIFT", "WRONG"]
-    # Health rollup: OK if zero health_issues across all steps; otherwise ISSUES.
+    # Health rollup: OK if every workflow Step has zero health_issues
     aggregate_health: Literal["OK", "ISSUES"] = "OK"
-    # Quality rollup: worst per-step quality.
+    # Quality rollup: worst per-step quality
     aggregate_quality: Literal["GOOD", "ADEQUATE", "POOR"] = "ADEQUATE"
 
 
