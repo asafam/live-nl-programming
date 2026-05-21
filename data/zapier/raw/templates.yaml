@@ -4,39 +4,26 @@
   link: https://zapier.com/templates/details/helpdesk-automation-template-slack-clickup
   raw_steps:
   - User submits support request through Slack using a simple command or form
-  - AI chatbot analyzes the request and checks against your knowledge base for instant
-    solutions
-  - Common issues get resolved immediately with step-by-step instructions sent directly
-    to the user
-  - Complex or unrecognized requests automatically create tickets in ClickUp with
-    proper categorization
-  - System assigns priority levels and routes tickets to appropriate team members
-    based on expertise and workload
-  - Team members receive Slack notifications with all relevant context and can update
-    status directly
+  - AI chatbot analyzes the request and checks against your knowledge base for instant solutions
+  - Common issues get resolved immediately with step-by-step instructions sent directly to the user
+  - Complex or unrecognized requests automatically create tickets in ClickUp with proper categorization
+  - System assigns priority levels and routes tickets to appropriate team members based on expertise and workload
+  - Team members receive Slack notifications with all relevant context and can update status directly
   - Automated status updates keep users informed throughout the resolution process
-  - Resolved tickets automatically update the knowledge base with new solutions for
-    future reference
-  - System generates reports on common issues, resolution times, and team performance
-    metrics
+  - Resolved tickets automatically update the knowledge base with new solutions for future reference
+  - System generates reports on common issues, resolution times, and team performance metrics
 - id: it-helpdesk
   name: IT Help Desk with FAQ Loop
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/it-helpdesk
   raw_steps:
   - An employee posts a question in a designated Slack channel
-  - AI automatically searches your FAQ knowledge base (stored in a Zapier table) for
-    relevant answers
-  - If AI finds a suitable answer, an AI chatbot replies to the employee directly
-    in Slack
-  - If AI can't find a good answer—or if the issue requires human attention—the request
-    gets escalated to an IT team member
-  - Employees can mark the urgency of their requests using an emoji that corresponds
-    to predefined priority options
-  - The system automatically creates tickets in Jira or ClickUp and sends status updates
-    back to Slack
-  - After each ticket gets closed out, the system summarizes the Slack thread and
-    adds it to your FAQ database
+  - AI automatically searches your FAQ knowledge base (stored in a Zapier table) for relevant answers
+  - If AI finds a suitable answer, an AI chatbot replies to the employee directly in Slack
+  - If AI can't find a good answer—or if the issue requires human attention—the request gets escalated to an IT team member
+  - Employees can mark the urgency of their requests using an emoji that corresponds to predefined priority options
+  - The system automatically creates tickets in Jira or ClickUp and sends status updates back to Slack
+  - After each ticket gets closed out, the system summarizes the Slack thread and adds it to your FAQ database
   - Next time someone has the same question, AI will have the info to respond automatically
 - id: deal-desk-manage-hubspot-quote-approvals-slack
   name: HubSpot Automated Quote Approval
@@ -44,114 +31,90 @@
   link: https://zapier.com/templates/details/deal-desk-manage-hubspot-quote-approvals-slack
   raw_steps:
   - A sales rep submits a new quote for approval in HubSpot Quotes
-  - The system identifies approvers based on the specific concessions asked for and
-    the rep's reporting chain
+  - The system identifies approvers based on the specific concessions asked for and the rep's reporting chain
   - An email approval request gets sent to the designated approvers
-  - The approver reviews the quote details and takes action—approve, reject, or request
-    changes—in Slack
-  - If approved, the quote is marked as such in HubSpot, and the rep is free to send
-    it
+  - The approver reviews the quote details and takes action—approve, reject, or request changes—in Slack
+  - If approved, the quote is marked as such in HubSpot, and the rep is free to send it
   - If concessions aren't approved, the quote is marked rejected, and reps can resubmit
-  - If quotes aren't approved in 24 hours, stakeholders are tagged in the thread as
-    a reminder
+  - If quotes aren't approved in 24 hours, stakeholders are tagged in the thread as a reminder
 - id: slack-changelog-automation
   name: Slack Reaction Changelog
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/slack-changelog-automation
   raw_steps:
   - Someone on your team shares a process change in Slack that you'd like to record
-  - To kick off the system, you react to the message with whatever you set as your
-    changelog emoji
+  - To kick off the system, you react to the message with whatever you set as your changelog emoji
   - The system checks whether the emoji was used by you or someone on your team
   - The entry gets summarized using AI
-  - To avoid duplicates, the system checks whether the entry already exists in the
-    changelog
-  - If it doesn't, the item gets added, and your team receives a notification in a
-    Slack thread
+  - To avoid duplicates, the system checks whether the entry already exists in the changelog
+  - If it doesn't, the item gets added, and your team receives a notification in a Slack thread
 - id: call-coach-ai-sales-success-coaching
   name: Gong Sales Call AI Coach
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/call-coach-ai-sales-success-coaching
   raw_steps:
   - Gong sends call info to your Zapier account using a webhook
-  - Zapier's built-in AI analyzes the transcript and generates insightful, actionable
-    feedback based on a customizable rubric for sales call effectiveness
+  - Zapier's built-in AI analyzes the transcript and generates insightful, actionable feedback based on a customizable rubric
+    for sales call effectiveness
   - The feedback gets stored in a table for future reference
   - The rep receives a summary of their feedback in Slack
-  - If a call scores below a certain threshold (15 out of 30), the summarized feedback
-    also gets sent to the rep's manager
+  - If a call scores below a certain threshold (15 out of 30), the summarized feedback also gets sent to the rep's manager
 - id: identify-sales-opportunities-support-tickets
   name: Zendesk-HubSpot Sales Opportunity Scout
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/identify-sales-opportunities-support-tickets
   raw_steps:
   - A new support ticket arrives in Zendesk
-  - AI analyzes the ticket tags for explicit signals of sales interest or enterprise
-    inquiries
-  - The system pulls the customer's information from HubSpot to understand their current
-    relationship with your company
-  - AI evaluates if the customer meets your ideal sales prospect criteria by examining
-    company size, account type, email domain, and specific ticket content
-  - If sales interest remains unclear, AI analyzes subtle indicators of sales potential,
-    like mentions of enterprise demos, account consolidation, or high usage patterns
-  - When a sales opportunity is identified, the system creates a detailed record in
-    a Zapier table for handoff and adds an internal note to the Zendesk ticket
+  - AI analyzes the ticket tags for explicit signals of sales interest or enterprise inquiries
+  - The system pulls the customer's information from HubSpot to understand their current relationship with your company
+  - AI evaluates if the customer meets your ideal sales prospect criteria by examining company size, account type, email domain,
+    and specific ticket content
+  - If sales interest remains unclear, AI analyzes subtle indicators of sales potential, like mentions of enterprise demos,
+    account consolidation, or high usage patterns
+  - When a sales opportunity is identified, the system creates a detailed record in a Zapier table for handoff and adds an
+    internal note to the Zendesk ticket
 - id: automate-brand-monitoring-news-mentions-tracker
   name: Brand Media Monitoring & Sentiment Triage
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/automate-brand-monitoring-news-mentions-tracker
   raw_steps:
-  - The system continuously monitors a Google Alerts-based RSS feed for new articles
-    mentioning your brand or specified keywords
-  - When a new mention is detected, AI analyzes the content to extract key information
-    like headlines, summaries, quotes, and sentiment
-  - All extracted data is automatically stored in a Zapier Table, creating a searchable
-    historical database
+  - The system continuously monitors a Google Alerts-based RSS feed for new articles mentioning your brand or specified keywords
+  - When a new mention is detected, AI analyzes the content to extract key information like headlines, summaries, quotes,
+    and sentiment
+  - All extracted data is automatically stored in a Zapier Table, creating a searchable historical database
   - The system routes mentions to Slack and triages according to sentiment
-  - Positive mentions are immediately shared, while negative mentions trigger an approval
-    workflow for proper handling
-  - Every week, the AI generates a comprehensive digest summarizing trends and highlighting
-    key articles, then posts it to Slack
-  - Team members can use a Zapier Chatbot to search the database with natural language
-    questions
-  - The system includes error handling that alerts administrators if any part of the
-    workflow fails
+  - Positive mentions are immediately shared, while negative mentions trigger an approval workflow for proper handling
+  - Every week, the AI generates a comprehensive digest summarizing trends and highlighting key articles, then posts it to
+    Slack
+  - Team members can use a Zapier Chatbot to search the database with natural language questions
+  - The system includes error handling that alerts administrators if any part of the workflow fails
 - id: automate-hr-support-ai-helpdesk-assistant
   name: HR Help Desk & Knowledge Loop
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/automate-hr-support-ai-helpdesk-assistant
   raw_steps:
   - An employee asks a question in your designated HR help channel in Slack
-  - A Zap triggers the AI chatbot to search your FAQ knowledge base stored in Zapier
-    Tables
+  - A Zap triggers the AI chatbot to search your FAQ knowledge base stored in Zapier Tables
   - The chatbot provides an instant response based on your internal policies and information
-  - If the question is complex or sensitive, it's automatically escalated to your
-    HR team
+  - If the question is complex or sensitive, it's automatically escalated to your HR team
   - The employee can mark urgency levels for time-sensitive requests
   - HR receives notifications about escalated or high-priority issues
   - Once resolved, the interaction is logged in your Zapier Table for future reference
   - New answers are added to your knowledge base, making the system smarter over time
-  - Regular reports show which topics generate the most questions to help improve
-    communication
+  - Regular reports show which topics generate the most questions to help improve communication
 - id: employee-offboarding
   name: Comprehensive Employee Offboarding System
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/employee-offboarding
   raw_steps:
-  - Manager or HR submits termination details through a Google Form (name, type, last
-    day)
-  - The workflow immediately sends customized Slack messages to all relevant teams
-    (HR, IT, payroll) with action steps
+  - Manager or HR submits termination details through a Google Form (name, type, last day)
+  - The workflow immediately sends customized Slack messages to all relevant teams (HR, IT, payroll) with action steps
   - The system automatically updates the HRIS (like BambooHR) with termination details
-  - 'For involuntary terminations: Calculate severance based on tenure/location, then
-    use AI to draft a separation agreement'
-  - 'For voluntary departures: Send the employee a Slack DM with an offboarding guide
-    and exit survey link'
-  - 'When exit survey is submitted: Enrich feedback with HRIS data and use AI to generate
-    a TLDR and action steps'
+  - 'For involuntary terminations: Calculate severance based on tenure/location, then use AI to draft a separation agreement'
+  - 'For voluntary departures: Send the employee a Slack DM with an offboarding guide and exit survey link'
+  - 'When exit survey is submitted: Enrich feedback with HRIS data and use AI to generate a TLDR and action steps'
   - 'If employee requests an exit interview: Notify the assigned People Business Partner'
-  - Create a tracking sheet in Zapier Tables for Talent Acquisition to manage backfill
-    needs via Slack emojis
+  - Create a tracking sheet in Zapier Tables for Talent Acquisition to manage backfill needs via Slack emojis
   - 'If receiving severance: Track payment details and update HRIS'
   - 'If farewell message submitted: Route for review/approval before posting to Slack'
 - id: canaries-employee-attrition-risk-prediction-mitigation
@@ -159,30 +122,24 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/canaries-employee-attrition-risk-prediction-mitigation
   raw_steps:
-  - The system automatically aggregates critical employee information (joins, team
-    changes, engagement scores, exits) into a centralized Zapier Table
-  - On a scheduled basis (Weekly), the system analyzes messages from team Slack channels
-    using AI-powered sentiment analysis
-  - Each week, the system runs a comprehensive scan comparing engagement scores, team
-    attrition history, and Slack sentiment patterns
+  - The system automatically aggregates critical employee information (joins, team changes, engagement scores, exits) into
+    a centralized Zapier Table
+  - On a scheduled basis (Weekly), the system analyzes messages from team Slack channels using AI-powered sentiment analysis
+  - Each week, the system runs a comprehensive scan comparing engagement scores, team attrition history, and Slack sentiment
+    patterns
   - It applies a weighted algorithm to identify employees showing multiple risk indicators
-  - When risk thresholds are crossed, the system sends detailed alert messages to
-    HR and managers
-  - The system maintains historical data on sentiment and trends to spot patterns
-    across departments
+  - When risk thresholds are crossed, the system sends detailed alert messages to HR and managers
+  - The system maintains historical data on sentiment and trends to spot patterns across departments
 - id: automated-incident-postmortem-reviews
   name: AI Incident Postmortem Review & Coaching
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/automated-incident-postmortem-reviews
   raw_steps:
-  - Capture closed incidents via Incident.io webhook, API polling, or manual form
-    submission
+  - Capture closed incidents via Incident.io webhook, API polling, or manual form submission
   - When a new retrospective document is detected, AI analyzes the content
-  - AI evaluates the review against best practices (customer impact, root cause, action
-    items) and generates feedback
+  - AI evaluates the review against best practices (customer impact, root cause, action items) and generates feedback
   - 'Smart Routing: If a reviewer email is present, send feedback via Slack DM'
-  - 'Smart Routing: If no reviewer email, post feedback to the designated team Slack
-    channel'
+  - 'Smart Routing: If no reviewer email, post feedback to the designated team Slack channel'
   - 'Weekly Cycle: Compile analytics and create TLDR summaries of all retrospectives'
   - Post a weekly insights digest to Slack with detailed breakdowns in the thread
 - id: web-clipper
@@ -194,8 +151,7 @@
   - User adds a note and clicks 'Send' to automatically tuck it into a Zapier Table
   - Later, the user reviews the note in the Zapier Table and adds a custom Slack message
   - User clicks the 'Send message' button within the table
-  - The system instantly dispatches the content and message to the team's Slack channel
-    (like a digital carrier pigeon)
+  - The system instantly dispatches the content and message to the team's Slack channel (like a digital carrier pigeon)
 - id: ai-content-idea-generator
   name: AI Content Idea Generator
   source_type: Zapier/Workflow Logic
@@ -211,48 +167,33 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/lead-router
   raw_steps:
-  - Prospects submit information through a customizable lead capture form embedded
-    on the website.
-  - The system routes leads to qualified sales reps based on criteria such as region
-    and company size.
+  - Prospects submit information through a customizable lead capture form embedded on the website.
+  - The system routes leads to qualified sales reps based on criteria such as region and company size.
   - Qualified sales representatives are alerted when a new lead matches their criteria.
   - An alerted sales rep claims the lead through the agent claim page.
   - The system updates lead details when a rep claims it.
-  - The system tracks sales team events (meetings booked and closed won deals) to
-    calculate agent ranking scores.
-  - Weights for metrics (Meetings booked and Closed Won) are adjusted via the weighted
-    control to refine agent ranking.
-  - Agents and sales reps are added to the agent roster table with region, company
-    size, and active status.
-  - The CRM is connected to record agent events (meetings booked and closed won deals)
-    into the agent events table.
+  - The system tracks sales team events (meetings booked and closed won deals) to calculate agent ranking scores.
 - id: marketing-intake-form
   name: Marketing Intake Form Integration
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/marketing-intake-form
   raw_steps:
-  - Clients or team members submit the form with project details including objectives,
-    target audience, budget, and timeline.
-  - Form data is automatically integrated with connected tools such as CRM systems,
-    project management software, or email marketing platforms.
-  - Any changes or updates to the form data are instantly reflected across all connected
-    applications to keep stakeholders informed.
+  - Clients or team members submit the form with project details including objectives, target audience, budget, and timeline.
+  - Form data is automatically integrated with connected tools such as CRM systems, project management software, or email
+    marketing platforms.
+  - Any changes or updates to the form data are instantly reflected across all connected applications to keep stakeholders
+    informed.
 - id: instagram-content-calendar
   name: Instagram Content Calendar Automation
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/instagram-content-calendar
   raw_steps:
-  - User enters Instagram post details including content description, scheduled date/time,
-    and image URL into the Zapier interface.
-  - Post details are automatically stored in Zapier Tables as a central content calendar
-    database.
-  - A Zap monitors the database for scheduled posts and identifies when the correct
-    posting time has arrived.
+  - User enters Instagram post details including content description, scheduled date/time, and image URL into the Zapier interface.
+  - Post details are automatically stored in Zapier Tables as a central content calendar database.
+  - A Zap monitors the database for scheduled posts and identifies when the correct posting time has arrived.
   - The Zap executes the post on Instagram at the scheduled time.
-  - After successful publication, the Zap updates the corresponding database record
-    with a confirmation ID.
-  - User can track which posts have been published and when by viewing the updated
-    database records.
+  - After successful publication, the Zap updates the corresponding database record with a confirmation ID.
+  - User can track which posts have been published and when by viewing the updated database records.
 - id: form-zoho-crm
   name: Form to Zoho CRM Integration
   source_type: Zapier/Workflow Logic
@@ -279,15 +220,11 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/utm-builder
   raw_steps:
-  - User submits a form in Zapier Interfaces with UTM parameters including website
-    URL, campaign ID, source, medium, name, term, and content.
-  - Zapier automatically encodes the submitted content using all UTM tags to generate
-    a custom UTM-tagged URL.
+  - User submits a form in Zapier Interfaces with UTM parameters including website URL, campaign ID, source, medium, name,
+    term, and content.
+  - Zapier automatically encodes the submitted content using all UTM tags to generate a custom UTM-tagged URL.
   - Zapier generates a shortened version of the UTM-tagged URL.
-  - Zapier stores both the full UTM-tagged URL and shortened version in a Zapier Table.
-  - The table is displayed directly beneath the form for easy access and reference.
-  - Users can create additional Zaps to automate downstream workflows, such as sending
-    the generated UTM links to Slack or other integrated systems.
+  - The full UTM-tagged URL and shortened version are stored in a Zapier Table displayed beneath the form for easy access.
 - id: landing-page
   name: Landing Page Form to CRM Pipeline
   source_type: Zapier/Workflow Logic
@@ -297,34 +234,27 @@
   - Their information is automatically stored in a Zapier table.
   - An automated workflow sends a notification to review the new submission.
   - You can click a button to add the submitter to your CRM directly from the table.
-  - Optionally, a workflow sends an email or grants access to the offering to each
-    form submitter.
+  - Optionally, a workflow sends an email or grants access to the offering to each form submitter.
 - id: order-request-form
   name: Order Request Form Workflow
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/order-request-form
   raw_steps:
-  - User fills out the Column Order Request Form with details such as the current
-    column order, desired order, and any additional notes or instructions.
-  - Upon submission, responses are instantly captured and stored in a secure, cloud-based
-    database, organized into a structured table format.
-  - The table updates in real-time, allowing team members to view and manage responses
-    as soon as they are submitted.
-  - Optionally, Zaps can be configured to send automated email or Slack notifications
-    to relevant team members when a new form submission is received.
-  - The form can be integrated with applications such as Google Sheets, Excel, or
-    project management tools to further streamline workflows.
+  - 'Submission: Users fill out the form with details such as the current column order, desired order, and any additional
+    notes or instructions.'
+  - 'Review: Once submitted, the request is automatically sent to the designated team member or department for review.'
+  - 'Approval: The request is either approved or sent back for further clarification, with automated updates sent to the requester.'
+  - 'Implementation: Upon approval, the changes are implemented, and the requester is notified of the completion.'
 - id: form-jira
   name: Jira Issue Creation From Form
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/form-jira
   raw_steps:
-  - Design a custom form using Zapier Interfaces to capture issue information such
-    as summary, description, issue type, priority, and assignee.
+  - Design a custom form using Zapier Interfaces to capture issue information such as summary, description, issue type, priority,
+    and assignee.
   - Store form submissions in a Zapier Table for data manipulation and processing.
   - Trigger a Zap when a new form submission is received.
-  - Map the form data from the Table to the corresponding fields in Jira Software
-    Cloud.
+  - Map the form data from the Table to the corresponding fields in Jira Software Cloud.
   - Create a new issue in Jira Software Cloud with the mapped information.
   - Optionally notify team members or update other connected apps upon issue creation.
 - id: document-approval
@@ -342,53 +272,46 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/form-telegram
   raw_steps:
-  - Create a customizable form using Zapier Interfaces to collect Telegram message
-    details including chat ID, message text, and advanced options like scheduled sending
-    and inline keyboard interactions.
-  - Set up a Zap trigger that activates when a new form submission is received from
-    the Interfaces form.
-  - Configure the Telegram Send Message action and map form fields to the corresponding
-    Telegram message parameters such as chat ID and message text.
-  - Optionally configure advanced options including message scheduling, inline keyboard
-    interactions, and custom metadata for tracking.
-  - Test and activate the workflow to automatically send customized Telegram messages
-    whenever the form is submitted.
+  - Create a customizable form using Zapier Interfaces to collect Telegram message details including chat ID, message text,
+    and advanced options like scheduled sending and inline keyboard interactions.
+  - Set up a Zap trigger that activates when a new form submission is received from the Interfaces form.
+  - Configure the Telegram Send Message action and map form fields to the corresponding Telegram message parameters such as
+    chat ID and message text.
+  - Optionally configure advanced options including message scheduling, inline keyboard interactions, and custom metadata
+    for tracking.
+  - Test and activate the workflow to automatically send customized Telegram messages whenever the form is submitted.
 - id: lead-capture
   name: Lead Capture and Email Notification
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/lead-capture
   raw_steps:
-  - Create a customizable Contact Us form page using Zapier Interfaces with configurable
-    fields such as text, date pickers, and file uploads.
+  - Create a customizable Contact Us form page using Zapier Interfaces with configurable fields such as text, date pickers,
+    and file uploads.
   - Add custom branding to the Contact Us page to match your website.
   - Share the form URL or embed the form code on your website.
-  - When a user submits the form, automatically store the lead information in a Zapier
-    table.
+  - When a user submits the form, automatically store the lead information in a Zapier table.
   - Automatically redirect the user to a customizable Thank You page after form submission.
-  - Automatically send an email notification to you containing the new lead's contact
-    information and a link to the Zapier table.
-  - Enable the ability to send emails directly to new leads by clicking a button within
-    the Zapier table.
+  - Automatically send an email notification to you containing the new lead's contact information and a link to the Zapier
+    table.
+  - Enable the ability to send emails directly to new leads by clicking a button within the Zapier table.
 - id: product-feedback
   name: Product Feedback Collection and Response
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/product-feedback
   raw_steps:
   - Customer submits feedback through the Feedback Form in the Interface.
-  - The submitted feedback is automatically added as a new row in the Product Feedback
-    Table.
+  - The submitted feedback is automatically added as a new row in the Product Feedback Table.
   - The 'Send Email Notification' Zap triggers when a new row is added to the table.
   - An email notification is sent to the team with all feedback information.
-  - Team member reviews the feedback and fills out the email subject, body, and from
-    name fields in the table.
+  - Team member reviews the feedback and fills out the email subject, body, and from name fields in the table.
   - Team member clicks the send email button to send a reply to the customer.
 - id: email-campaign-portal
   name: Email Campaign Drip Sequence Manager
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/email-campaign-portal
   raw_steps:
-  - Add four emails and their content to the Email Campaign Portal Template table,
-    specifying the sequence number for each email.
+  - Add four emails and their content to the Email Campaign Portal Template table, specifying the sequence number for each
+    email.
   - Navigate to the connected Workflows (Zaps) and configure each step of the automation.
   - Test each workflow to ensure proper functionality.
   - Publish each workflow.
@@ -402,20 +325,17 @@
   - Send an email notification to the hiring manager when a new application is received.
   - Record an updated date in the applicant tracker when a candidate's status changes.
   - Share the job posting URL or embed it on a website to receive applications.
-  - Manage applicants, materials, and statuses in the centralized Applicant Tracker
-    interface.
+  - Manage applicants, materials, and statuses in the centralized Applicant Tracker interface.
 - id: leave-tracker
   name: Leave Request Approval Workflow
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/leave-tracker
   raw_steps:
   - Admins configure leave types and assign balances per employee in Zapier Interfaces.
-  - Employees log in to view their leave balances and submit leave requests through
-    Zapier Interfaces.
+  - Employees log in to view their leave balances and submit leave requests through Zapier Interfaces.
   - Leave requests are stored in Zapier Tables for manager review.
   - Managers approve or reject leave requests in Zapier Tables.
-  - Automated notifications are sent upon submission, approval, or rejection of leave
-    requests.
+  - Automated notifications are sent upon submission, approval, or rejection of leave requests.
   - Leave balances are automatically updated based on request status.
 - id: round-robin-lead-assignment
   name: Round Robin Lead Assignment
@@ -424,37 +344,29 @@
   raw_steps:
   - Capture lead information through a customizable form on a lead capture page.
   - Maintain a sales reps table with current representatives and their assigned positions.
-  - Automatically update positions in the sales reps table when a new rep is added
-    or an existing rep is removed.
+  - Automatically update positions in the sales reps table when a new rep is added or an existing rep is removed.
   - Retrieve the sales rep currently in position 1 when a new lead is submitted.
   - Assign the new lead to the sales rep in position 1.
   - Move the assigned sales rep to the back of the line to rotate positions.
-  - Send a notification alert to the assigned sales rep via the chosen app.
-  - Accept leads from third-party sources such as Facebook Lead Ads or CRM systems.
-  - Repeat the assignment and rotation process for each new lead received.
 - id: marketplace
   name: Two-Sided Marketplace Email Connection
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/marketplace
   raw_steps:
-  - Store service and vendor information in a Table when a new service is created
-    through a form.
-  - Display the submitted services in an Interface with a table layout for clients
-    to browse.
-  - When a potential client selects a service from a dropdown form, automatically
-    send an email to the client while BCC'ing the vendor.
-  - Keep the vendor's email hidden from the client unless the vendor replies to establish
-    direct contact.
+  - Store service and vendor information in a Table when a new service is created through a form.
+  - Display the submitted services in an Interface with a table layout for clients to browse.
+  - When a potential client selects a service from a dropdown form, automatically send an email to the client while BCC'ing
+    the vendor.
+  - Keep the vendor's email hidden from the client unless the vendor replies to establish direct contact.
 - id: form-pipedrive
   name: Form to Pipedrive Deal Creation
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/form-pipedrive
   raw_steps:
-  - User submits a custom form with deal information including title, value, currency,
-    stage, status, person, organization, close date, and owner.
+  - User submits a custom form with deal information including title, value, currency, stage, status, person, organization,
+    close date, and owner.
   - Form submission data is stored in Zapier Tables for review and modification.
-  - The form submission triggers a Zap that automatically creates a new deal in Pipedrive
-    with the captured information.
+  - The form submission triggers a Zap that automatically creates a new deal in Pipedrive with the captured information.
   - Team members can visualize and manage the entire workflow using Canvas.
 - id: ai-agent-marketing-campaign-tracker
   name: AI Agent Marketing Campaign Tracker
@@ -472,8 +384,7 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/unified-lead-capture
   raw_steps:
-  - Trigger a capture Zap when a new lead arrives from an advertising platform, contact
-    form, or other source.
+  - Trigger a capture Zap when a new lead arrives from an advertising platform, contact form, or other source.
   - Send the lead data from the capture Zap to a centralized catchall Sub-Zap.
   - Standardize the lead data in the catchall Sub-Zap to ensure consistency.
   - Add the standardized leads to your CRM.
@@ -485,8 +396,7 @@
   - A deal is marked as Closed Won in HubSpot.
   - AI creates a summary of key details from the deal.
   - The summary and extended version are shared in Slack.
-  - If the deal amount exceeds the specified threshold, the update is also shared
-    to an executive-specific channel.
+  - If the deal amount exceeds the specified threshold, the update is also shared to an executive-specific channel.
 - id: employee-onboarding-manager
   name: Employee Onboarding Manager
   source_type: Zapier/Workflow Logic
@@ -506,28 +416,22 @@
   link: https://zapier.com/templates/details/automate-sales-follow-up-emails-gong-hubspot
   raw_steps:
   - Trigger automation when a Gong call transcript is processed.
-  - Use AI by Zapier to analyze the call summary and transcript and generate a personalized
-    email subject line and HTML body.
-  - Create a draft email in Gmail addressed to the first external participant with
-    other attendees CC'd and the sales rep as sender.
-  - Create a new task in HubSpot containing the call summary, Gmail draft link, and
-    a 24-hour deadline.
-  - Send a Slack direct message to the assigned sales rep with the email preview and
-    direct links to the Gmail draft and HubSpot task.
+  - Use AI by Zapier to analyze the call summary and transcript and generate a personalized email subject line and HTML body.
+  - Create a draft email in Gmail addressed to the first external participant with other attendees CC'd and the sales rep
+    as sender.
+  - Create a new task in HubSpot containing the call summary, Gmail draft link, and a 24-hour deadline.
+  - Send a Slack direct message to the assigned sales rep with the email preview and direct links to the Gmail draft and HubSpot
+    task.
   - Sales rep reviews the AI-generated content and sends the email when ready.
 - id: employee-onboarding-custom-ai-chatbot
   name: Employee Onboarding AI Chatbot
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/employee-onboarding-custom-ai-chatbot
   raw_steps:
-  - Configure data sources (files, tables, or web pages) as the chatbot's knowledge
-    base for accurate responses.
-  - Set up the OpenAI-powered chatbot to respond to employee questions using the configured
-    data sources.
-  - Add actions to chatbot buttons that allow employees to copy responses or trigger
-    Zaps when clicked.
-  - Deploy the chatbot as a standalone experience or embed it in another location
-    via a premium plan.
+  - Configure data sources (files, tables, or web pages) as the chatbot's knowledge base for accurate responses.
+  - Set up the OpenAI-powered chatbot to respond to employee questions using the configured data sources.
+  - Add actions to chatbot buttons that allow employees to copy responses or trigger Zaps when clicked.
+  - Deploy the chatbot as a standalone experience or embed it in another location via a premium plan.
   - Share the HR chatbot with employees for onboarding support.
 - id: automate-github-issues-from-slack
   name: Slack to GitHub Issue Creator
@@ -562,36 +466,31 @@
   raw_steps:
   - Trigger the workflow when a Granola meeting ends.
   - Use AI to extract actionable tasks from the meeting notes.
-  - Create tasks in Asana with context, priorities, and assignments based on the extracted
-    action items.
+  - Create tasks in Asana with context, priorities, and assignments based on the extracted action items.
 - id: out-of-office-plan
   name: Out-of-Office Task Tracking System
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/out-of-office-plan
   raw_steps:
-  - Set your OOO status using the custom interface to trigger a Zap that notifies
-    your team and activates the task-tracking system.
+  - Set your OOO status using the custom interface to trigger a Zap that notifies your team and activates the task-tracking
+    system.
   - Monitor Slack for Reacjis (emoji reactions) on messages during your absence.
-  - Connect Reacjis to Tables to create a database of tasks and requests submitted
-    while you are away.
-  - Access the interface upon your return to view the accumulated tasks stored in
-    the database.
+  - Connect Reacjis to Tables to create a database of tasks and requests submitted while you are away.
+  - Access the interface upon your return to view the accumulated tasks stored in the database.
   - Update task status directly in the interface as you work through them.
   - Trigger notifications to original requesters via Slack when you update task status.
-  - View a visual representation of the entire workflow in Canvas to see how each
-    component works together.
+  - View a visual representation of the entire workflow in Canvas to see how each component works together.
 - id: automated-blog-content-generator-claude-ai
   name: Keyword-to-Blog Automated Publishing Pipeline
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/automated-blog-content-generator-claude-ai
   raw_steps:
   - Input target keywords into the system to trigger the automated workflow.
-  - Claude AI (Claude 3.5 Sonnet) generates SEO-optimized blog content including titles,
-    meta descriptions, and expert-level written content based on the keywords.
-  - DALL-E generates relevant featured images and supporting visuals to complement
-    the written content.
-  - Publish the completed blog post (content and images) to a Supabase database, which
-    connects to your Lovable site or other compatible CMS.
+  - Claude AI (Claude 3.5 Sonnet) generates SEO-optimized blog content including titles, meta descriptions, and expert-level
+    written content based on the keywords.
+  - DALL-E generates relevant featured images and supporting visuals to complement the written content.
+  - Publish the completed blog post (content and images) to a Supabase database, which connects to your Lovable site or other
+    compatible CMS.
 - id: linkedin-conversion-tracking-for-physical-stores
   name: LinkedIn Lead to Store Conversion Tracking
   source_type: Zapier/Workflow Logic
@@ -600,23 +499,16 @@
   - When a new lead is generated through a LinkedIn lead ad campaign, trigger a Zap.
   - Capture the lead information and log it in Zapier Tables as a central database.
   - Set up an interface to provide a user-friendly view of the lead database.
-  - When a lead makes a purchase in the physical store, update their status in Zapier
-    Tables through the interface.
-  - When a purchase is recorded, trigger another Zap to send the conversion event
-    back to LinkedIn.
-  - LinkedIn receives the conversion data and refines future ad campaigns for better
-    targeting.
-  - Connect your LinkedIn account to Zapier.
-  - Select your lead ad campaign in the Zap setup.
-  - Customize the database and interface to match your business needs.
-  - Train staff on updating purchase information in the interface.
+  - When a lead makes a purchase in the physical store, update their status in Zapier Tables through the interface.
+  - When a purchase is recorded, trigger another Zap to send the conversion event back to LinkedIn.
+  - LinkedIn receives the conversion data and refines future ad campaigns for better targeting.
 - id: team-operations-portal
   name: Team Call Prep Document Generator
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/team-operations-portal
   raw_steps:
-  - When a team member clicks the 'Generate call prep' button on the Customers page
-    in the Team Dashboard Interface, trigger the automation.
+  - When a team member clicks the 'Generate call prep' button on the Customers page in the Team Dashboard Interface, trigger
+    the automation.
   - Retrieve relevant customer information from the Zapier Customers Table.
   - Use AI by Zapier to analyze the customer data and generate call preparation insights.
   - Create a new document containing the call prep information.
@@ -646,14 +538,10 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/ai-email-assistant
   raw_steps:
-  - When a new email arrives in Gmail, trigger the automation.
-  - 'Use ChatGPT to categorize the email into one of: App Notifications, Action Required,
-    Sales Emails, or Newsletters.'
-  - Use ChatGPT to generate a concise summary of the email content.
-  - Store the email record, category, and summary in Zapier Tables.
-  - Connect Gmail and ChatGPT accounts to the Zap.
-  - Test and publish the Zap.
-  - Optionally configure navigation and access controls for managed users.
+  - 'Categorization: As emails arrive, the first ChatGPT step categorizes them into one of the predefined customizable categories
+    (App Notifications, Action Required, Sales Emails, or Newsletters).'
+  - 'Summarization: A second ChatGPT step provides a concise summary of the email.'
+  - 'Record Storage: Each email record, along with its category and summary, is automatically added to Zapier Tables.'
 - id: facebook-lead-tracker
   name: Facebook Lead Tracker and Email
   source_type: Zapier/Workflow Logic
@@ -675,20 +563,16 @@
   - Record a conversion event in the interface when a lead makes an in-store purchase.
   - Trigger the second Zap to send conversion data back to Facebook.
   - Format the conversion data using Zapier's Formatter tool to meet Facebook's requirements.
-  - Send the formatted conversion data to Facebook to update ad campaign metrics and
-    improve targeting.
+  - Send the formatted conversion data to Facebook to update ad campaign metrics and improve targeting.
 - id: simple-project-plan
   name: Table Task Slack Update Automation
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/simple-project-plan
   raw_steps:
-  - Store project tasks in a Zapier Table with details including category, owner,
-    start date, end date, and notes.
+  - Store project tasks in a Zapier Table with details including category, owner, start date, end date, and notes.
   - Click a button within the Table to trigger the Zap.
-  - The Zap automatically sends a Slack message with all task record details to the
-    team.
-  - Configure the Zap by authenticating your Slack account or selecting an alternative
-    app from 6,000+ integrations.
+  - The Zap automatically sends a Slack message with all task record details to the team.
+  - Configure the Zap by authenticating your Slack account or selecting an alternative app from 6,000+ integrations.
   - Publish the Zap and use the Table to manage your project plan.
 - id: ai-generated-press-mentions
   name: AI-Powered Brand Press Monitoring
@@ -701,18 +585,15 @@
   - Use OpenAI to summarize each article and extract key information and sentiment.
   - Store all press mentions and AI-generated summaries in Zapier Tables.
   - Display the stored data in a custom Zapier interface for viewing and analysis.
-  - Send an email notification to relevant team members when new press mentions are
-    discovered.
+  - Send an email notification to relevant team members when new press mentions are discovered.
 - id: ai-form
   name: AI-Powered Form Data Extraction
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/ai-form
   raw_steps:
   - Users submit data through a Zapier Interface form.
-  - The form submission triggers a Zap that sends the combined fields to ChatGPT for
-    processing.
-  - ChatGPT extracts and structures the data into twelve separate fields such as First
-    Name, Last Name, and Company Name.
+  - The form submission triggers a Zap that sends the combined fields to ChatGPT for processing.
+  - ChatGPT extracts and structures the data into twelve separate fields such as First Name, Last Name, and Company Name.
   - The extracted and formatted data is stored in a Zapier Table for access and management.
   - The form URL is shared or embedded on a website to receive ongoing submissions.
 - id: contact-list
@@ -720,51 +601,38 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/contact-list
   raw_steps:
-  - Store contact information including name, email, business details, and communication
-    history in a Zapier Table.
+  - Store contact information including name, email, business details, and communication history in a Zapier Table.
   - Click the Send Email button to trigger a Zap for a selected contact.
-  - Automatically send an email to the contact's email address using the subject and
-    body fields from the table.
+  - Automatically send an email to the contact's email address using the subject and body fields from the table.
   - Automatically update the Last Email Sent column with the current date.
-  - Optionally import contact details from a CSV file or Google Sheets into the table.
-  - Optionally add custom fields to the table for additional contact information like
-    emergency numbers.
 - id: expenses-tracker
   name: Expense Tracking and Team Notification System
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/expenses-tracker
   raw_steps:
-  - Add expense details (Date, Description, Amount, Category) manually as a new row
-    in the Zapier Tables expense tracker
-  - Click the reimbursement button on the expense row to trigger a Zap that sends
-    an email to your finance team notifying them of the new expense
-  - A second Zap automatically updates the expense status to 'pending' after the button
-    is clicked
+  - Add expense details (Date, Description, Amount, Category) manually as a new row in the Zapier Tables expense tracker
+  - Click the reimbursement button on the expense row to trigger a Zap that sends an email to your finance team notifying
+    them of the new expense
+  - A second Zap automatically updates the expense status to 'pending' after the button is clicked
 - id: inventory
   name: Inventory Reorder Automation
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/inventory
   raw_steps:
-  - Enter product data into the inventory table with details including cost and quantity
-    needed.
+  - Enter product data into the inventory table with details including cost and quantity needed.
   - Check the Need More? box when a product's quantity reaches the reorder level.
   - Click the Send Reorder Request button to trigger the automation.
-  - The first Zap sends an email to a designated email address with inventory information
-    from the table.
-  - The second Zap automatically updates the reorder quantity and last reorder date
-    fields in the table.
-  - Optionally configure the Zap to send emails to different addresses by adding an
-    Email to field in the table for product-specific reorder recipients.
+  - The first Zap sends an email to a designated email address with inventory information from the table.
+  - The second Zap automatically updates the reorder quantity and last reorder date fields in the table.
 - id: subscription-tracker
   name: Subscription Renewal Reminder Tracker
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/subscription-tracker
   raw_steps:
-  - Store subscription details in a Zapier Table with columns for Subscription Name,
-    Start Date, Renewal Date, Cost, Status, and Contact Email.
+  - Store subscription details in a Zapier Table with columns for Subscription Name, Start Date, Renewal Date, Cost, Status,
+    and Contact Email.
   - Check the table seven days before each renewal date.
-  - Send a reminder email with subscription details to the configured recipient when
-    the renewal date approaches.
+  - Send a reminder email with subscription details to the configured recipient when the renewal date approaches.
   - Allow customization of the reminder timeframe and recipient email address.
 - id: save-email-attachments
   name: Email Attachment Saver
@@ -774,27 +642,23 @@
   - Monitor Gmail for incoming emails with attachments.
   - Extract attachments from the received email.
   - Upload the extracted attachments to a folder in Google Drive.
-  - Save the attachment link, date, sender, and inbox details as a record in Zapier
-    Tables for easy reference.
+  - Save the attachment link, date, sender, and inbox details as a record in Zapier Tables for easy reference.
 - id: employee-directory
   name: Employee Directory Anniversary Reminder
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/employee-directory
   raw_steps:
-  - Create an employee directory table in Zapier Tables with fields for employee name,
-    phone number, job title, office location, email address, employment status, and
-    custom fields as needed.
+  - Create an employee directory table in Zapier Tables with fields for employee name, phone number, job title, office location,
+    email address, employment status, and custom fields as needed.
   - Add employee records to the directory table with their personal and contact information.
-  - Set up an automated workflow that transforms the work anniversary date field into
-    a month-day format to enable yearly recurring reminders.
-  - Set up an automated workflow that transforms the birthday date field into a month-day
-    format to enable yearly recurring reminders.
-  - Configure the workflows to send a reminder email when an employee's work anniversary
-    date matches the current month and day.
-  - Configure the workflows to send a reminder email when an employee's birthday matches
-    the current month and day.
-  - Enable automatic record processing in the workflow settings to ensure reminders
-    are sent without manual intervention.
+  - Set up an automated workflow that transforms the work anniversary date field into a month-day format to enable yearly
+    recurring reminders.
+  - Set up an automated workflow that transforms the birthday date field into a month-day format to enable yearly recurring
+    reminders.
+  - Configure the workflows to send a reminder email when an employee's work anniversary date matches the current month and
+    day.
+  - Configure the workflows to send a reminder email when an employee's birthday matches the current month and day.
+  - Enable automatic record processing in the workflow settings to ensure reminders are sent without manual intervention.
 - id: automate-google-my-business-review-responses-gemini
   name: GMB Review Triage With AI
   source_type: Zapier/Workflow Logic
@@ -802,17 +666,12 @@
   raw_steps:
   - Monitor Google My Business for new customer reviews.
   - Analyze each review's content and star rating for risk factors.
-  - Assess for indicators such as 1-star ratings, legal language, threats, or safety
-    concerns.
-  - Route normal reviews (positive feedback or constructive criticism) to the standard
-    response path.
-  - Route high-risk reviews (negative ratings with concerning content) to the approval
-    path.
+  - Assess for indicators such as 1-star ratings, legal language, threats, or safety concerns.
+  - Route normal reviews (positive feedback or constructive criticism) to the standard response path.
+  - Route high-risk reviews (negative ratings with concerning content) to the approval path.
   - Create a draft response for high-risk reviews.
-  - Send an email notification to your team with the review details and suggested
-    response draft.
-  - Post automated professional responses directly to Google My Business for standard
-    reviews.
+  - Send an email notification to your team with the review details and suggested response draft.
+  - Post automated professional responses directly to Google My Business for standard reviews.
   - Hold drafted responses for high-risk reviews pending human approval.
 - id: form-google-contacts
   name: Form to Google Contacts Integration
@@ -916,8 +775,8 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/vip-customer-session-monitoring-fullstory-slack
   raw_steps:
-  - Monitor Fullstory for VIP user sessions based on defined triggers (price thresholds,
-    user actions, customer segments, session duration, or behavior signals).
+  - Monitor Fullstory for VIP user sessions based on defined triggers (price thresholds, user actions, customer segments,
+    session duration, or behavior signals).
   - Capture real-time session data when a VIP user interaction is detected.
   - Generate an AI-powered summary of the VIP session.
   - Deliver the AI summary to Slack to alert the support team.
@@ -980,8 +839,7 @@
   raw_steps:
   - 'Trigger: Detect new or updated meeting notes in Granola'
   - Extract meeting notes content from Granola
-  - Process notes through AI-powered summarization to highlight key decisions and
-    action items
+  - Process notes through AI-powered summarization to highlight key decisions and action items
   - Format the summary for Slack
   - Post the formatted summary to designated Slack channels
 - id: g2-reviews-product-team
@@ -999,16 +857,12 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/user-research-customer-interview-signup
   raw_steps:
-  - Customer interviews are scheduled and automatically appear in a centralized Zapier
-    Table database.
-  - Team members across the organization browse upcoming interview sessions in the
-    database.
-  - Team members add themselves as attendees to sessions without requiring coordination
-    from researchers.
+  - Customer interviews are scheduled and automatically appear in a centralized Zapier Table database.
+  - Team members across the organization browse upcoming interview sessions in the database.
+  - Team members add themselves as attendees to sessions without requiring coordination from researchers.
   - Calendar events automatically update to reflect new attendees.
   - Attendance information stays organized in the database.
-  - User researchers can focus on facilitating interviews instead of managing invites
-    and coordination.
+  - User researchers can focus on facilitating interviews instead of managing invites and coordination.
 - id: import-account-signals-salesloft-looker
   name: Looker to Salesloft Account Enrichment
   source_type: Zapier/Workflow Logic
@@ -1017,16 +871,14 @@
   - Monitor for changes in lead or account status in Looker.
   - Retrieve customer signals and engagement metrics from Looker.
   - Push the retrieved data into Salesloft to enrich account records.
-  - Trigger automated task assignments in Salesloft Play based on the updated account
-    data.
+  - Trigger automated task assignments in Salesloft Play based on the updated account data.
   - Notify sales representatives to take action on the enriched account information.
 - id: connect-databricks-engagement-data-salesloft-signals
   name: Databricks to Salesloft Signals Automation
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/connect-databricks-engagement-data-salesloft-signals
   raw_steps:
-  - Extract customer engagement data from Databricks including usage trends, engagement
-    levels, and feature adoption.
+  - Extract customer engagement data from Databricks including usage trends, engagement levels, and feature adoption.
   - Send the extracted analytics data to Salesloft Signals.
   - Monitor for customer usage spikes or drops in the incoming data.
   - Trigger Salesloft Plays automatically when critical signals are detected.
@@ -1036,15 +888,13 @@
   source_type: Zapier/Workflow Logic
   link: https://zapier.com/templates/details/ai-image-generator
   raw_steps:
-  - Create a customizable form in the Zapier Interface to collect user inputs such
-    as image style and art style preferences.
+  - Create a customizable form in the Zapier Interface to collect user inputs such as image style and art style preferences.
   - Submit the form data as a trigger to initiate the automation.
-  - Map the form fields into a prompt and send the prompt to OpenAI's DALL-E API to
-    generate an image.
+  - Map the form fields into a prompt and send the prompt to OpenAI's DALL-E API to generate an image.
   - Receive the generated image and its URL from OpenAI.
   - Store the image link and prompt details in a Table for viewing on the Interface.
-  - Optionally upload the image to an external storage service like Google Drive to
-    preserve it beyond OpenAI's expiration window.
+  - Optionally upload the image to an external storage service like Google Drive to preserve it beyond OpenAI's expiration
+    window.
 - id: email-assistant-turn-starred-emails-into-asana-tasks-with-ai
   name: Email to Asana Tasks with AI
   source_type: Zapier/Workflow Logic
@@ -1063,10 +913,7 @@
   raw_steps:
   - Project manager submits weekly project updates via a Zapier Interfaces form.
   - Submitted updates are stored in Zapier Tables for status tracking.
-  - AI Agent uses a project charter and role mapping stored in Notion to identify
-    the appropriate stakeholders for the update.
-  - AI Agent drafts a tailored status update email based on the project information
-    and stakeholder roles.
+  - AI Agent uses a project charter and role mapping stored in Notion to identify the appropriate stakeholders for the update.
+  - AI Agent drafts a tailored status update email based on the project information and stakeholder roles.
   - Draft email is routed to the PM via Slack for approval before sending.
-  - Once approved, the email is automatically delivered to the identified stakeholders
-    via Gmail.
+  - Once approved, the email is automatically delivered to the identified stakeholders via Gmail.
