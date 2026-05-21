@@ -26,6 +26,27 @@ prompt: |
 
   Once a trigger fires, the objects take over: each object's behavior and peer declarations determine what happens next automatically. Do not write steps for internal actions.
 
+  **Emit ONE Step per distinct external trigger in the scenario.** Many
+  workflows have multiple external triggers — the initial event plus
+  later ones. Don't stop after the first. Concretely:
+
+  - Each **scheduled / time-based** trigger is its own Step
+    (e.g., "after 2 days, the second email in the drip campaign fires"
+    is a Step, separate from the prospect-added Step).
+  - Each **periodic reminder** is its own Step
+    (e.g., "on the employee's birthday each year" is a Step;
+    "on the employee's work anniversary" is a separate Step).
+  - Each **secondary user action** is its own Step
+    (e.g., "a team member clicks Send" is a Step, separate from the
+    customer's initial submission).
+  - Each **external callback / response** is its own Step
+    (e.g., "Facebook returns a conversion-upload result" is a Step,
+    separate from the original Salesforce conversion event).
+
+  If you only emit one Step for a workflow that has multiple distinct
+  triggers, the benchmark cannot test the later triggers. Be explicit:
+  one Step per trigger.
+
   ### Each step has these fields:
 
   - `target` — the `object_id` of the object that receives the external trigger. MUST be an object with a non-empty `event_sources` list.
