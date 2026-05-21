@@ -161,7 +161,6 @@
   - Retrieve the submitted idea from the table.
   - Send the idea to ChatGPT to generate additional and related ideas.
   - Store the AI-generated ideas back into the table or connected system.
-  - Publish the automation workflow.
 - id: lead-router
   name: Lead Router Alert System
   source_type: Zapier/Workflow Logic
@@ -585,7 +584,6 @@
   - Use OpenAI to summarize each article and extract key information and sentiment.
   - Store all press mentions and AI-generated summaries in Zapier Tables.
   - Display the stored data in a custom Zapier interface for viewing and analysis.
-  - Send an email notification to relevant team members when new press mentions are discovered.
 - id: ai-form
   name: AI-Powered Form Data Extraction
   source_type: Zapier/Workflow Logic
