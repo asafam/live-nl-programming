@@ -471,6 +471,61 @@ class ObjectGraphValidation(BaseModel):
     judge_input_tokens: int = 0
     judge_output_tokens: int = 0
 
+
+# ── Sample (modifications + events) validation schemas (Stage 2) ──────────────
+
+
+class SingleModificationJudgement(BaseModel):
+    """LLM judgement for one modification."""
+    mod_id: str
+    quality: Literal["GOOD", "ADEQUATE", "POOR"]
+    quality_issues: list[str] = Field(default_factory=list)
+    type_match: Literal["YES", "NO"]            # mod_type matches intent shape?
+    ambiguity_match: Literal["YES", "NO"]        # ambiguity rating fits the intent style?
+    events_test_mod: Literal["YES", "PARTIAL", "NO"]  # do post_mod events actually test it?
+    reasoning: str
+
+
+class SampleModificationsJudgement(BaseModel):
+    """LLM judge output covering all modifications in one sample."""
+    modifications: list[SingleModificationJudgement]
+    overall_quality: Literal["GOOD", "ADEQUATE", "POOR"]
+    overall_issues: list[str] = Field(default_factory=list)
+    reasoning: str
+
+
+class ModificationVerdict(BaseModel):
+    """Per-modification verdict combining health + quality."""
+    sample_id: str
+    mod_id: str
+    mod_type: str
+    ambiguity: str
+    target: str
+    when: str = ""
+    intent_preview: str = ""
+    health_issues: list[str] = Field(default_factory=list)
+    quality: Literal["GOOD", "ADEQUATE", "POOR"] = "ADEQUATE"
+    quality_issues: list[str] = Field(default_factory=list)
+    type_match: Literal["YES", "NO"] = "YES"
+    ambiguity_match: Literal["YES", "NO"] = "YES"
+    events_test_mod: Literal["YES", "PARTIAL", "NO"] = "YES"
+
+
+class SampleModificationValidation(BaseModel):
+    """Aggregate validation for one Sample's modifications + events linkage."""
+    sample_id: str
+    workflow_id: str = ""          # the underlying workflow (Sample.sample_id)
+    n_modifications: int
+    n_events: int
+    modification_verdicts: list[ModificationVerdict] = Field(default_factory=list)
+    overall_quality: Literal["GOOD", "ADEQUATE", "POOR"] = "ADEQUATE"
+    overall_issues: list[str] = Field(default_factory=list)
+    overall_reasoning: str = ""
+    aggregate_health: Literal["OK", "ISSUES"] = "OK"
+    aggregate_quality: Literal["GOOD", "ADEQUATE", "POOR"] = "ADEQUATE"
+    judge_input_tokens: int = 0
+    judge_output_tokens: int = 0
+
 # Scenario generation schemas (LLM output before merging with instance metadata)
 class Scenario(BaseModel):
     id: str

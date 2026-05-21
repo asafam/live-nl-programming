@@ -1,0 +1,103 @@
+prompt: |
+  # Task: Validate Modifications + Events for a Sample
+
+  You are auditing the modifications and events generated for one Sample
+  (a test case) by our pipeline. Each modification is a user instruction
+  delivered at a specific time, targeting one of the workflow's objects.
+  After a modification fires, the system's behavior is expected to change;
+  post-mod events are the ones that verify the change took effect.
+
+  Your job is to grade EACH modification on its own merits. Structural
+  health is done separately and is not your concern — focus on quality.
+
+  ---
+
+  ## Sample
+
+  ID: {SAMPLE_ID}
+  Name: {SAMPLE_NAME}
+
+  ## Workflow objects (potential modification targets)
+
+  {OBJECTS}
+
+  ## Baseline steps
+
+  {STEPS}
+
+  ## Modifications
+
+  {MODIFICATIONS}
+
+  ## Events
+
+  {EVENTS}
+
+  ---
+
+  ## How to grade EACH modification
+
+  Per-modification quality:
+
+  - **GOOD** — `intent` is specific and actionable (the agent reading this
+    would know exactly what to do); concrete values where they matter
+    (no "soon", "later", "some channel"); the target object is the right
+    one for the intent.
+  - **ADEQUATE** — minor issues: one underspecified phrase or a target
+    that's almost right.
+  - **POOR** — vague intent, target object can't do what the intent asks,
+    nonsensical timing, contradictory instructions, references to
+    non-existent fields/objects.
+
+  Also rate these binary axes:
+
+  - **type_match**: does `mod_type` actually match the intent shape?
+    - temporal: intent describes time-based behavior changes (windows, schedules)
+    - contextual: intent depends on contextual state of the workflow
+    - exception: intent describes an exception case ("normally X, but if Y…")
+    - correction: intent corrects/overrides a prior instruction
+    - expansion: intent adds new behavior alongside existing
+    - removal: intent removes/disables behavior
+  - **ambiguity_match**: does the `ambiguity` rating fit the intent's style?
+    - precise: zero-interpretation needed, all params spelled out
+    - semantic: meaning is clear but exact thresholds/durations need inference
+    - vague: open-ended, multiple reasonable interpretations
+    - implicit: intent relies on context not in the message
+  - **events_test_mod**: do the post_mod events (events whose
+    `after_mod_ids` contains this mod_id) actually exercise the change?
+    YES — at least one post_mod event would behave differently because of this mod.
+    PARTIAL — events are related but don't decisively distinguish modified vs baseline behavior.
+    NO — no post_mod events present, or post_mod events don't depend on this mod.
+
+  In `quality_issues`, list each specific complaint as a short string.
+
+  ## Overall
+
+  Also grade the sample's modifications as a whole:
+  - **GOOD** — all modifications are coherent; events meaningfully test them.
+  - **ADEQUATE** — one mod is weak or one event-coverage gap.
+  - **POOR** — multiple weak mods or systematic failure to test them.
+
+  ## Output
+
+  Return strictly a JSON object matching the schema:
+    {{
+      "modifications": [
+        {{
+          "mod_id": "<id>",
+          "quality": "GOOD" | "ADEQUATE" | "POOR",
+          "quality_issues": ["<short complaint>", ...],
+          "type_match": "YES" | "NO",
+          "ambiguity_match": "YES" | "NO",
+          "events_test_mod": "YES" | "PARTIAL" | "NO",
+          "reasoning": "<1-2 sentences>"
+        }},
+        ...
+      ],
+      "overall_quality": "GOOD" | "ADEQUATE" | "POOR",
+      "overall_issues": ["<short complaint>", ...],
+      "reasoning": "<1-2 sentences>"
+    }}
+
+  Include one entry in `modifications` for every modification listed above,
+  in the same order with the same `mod_id` strings.
