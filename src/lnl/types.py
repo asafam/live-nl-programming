@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 class MessageType(Enum):
@@ -35,6 +35,140 @@ class ObjectDefinition:
     subscriptions: list[str] = field(default_factory=list)
     event_sources: list[str] = field(default_factory=list)
     initial_state: str = ""  # optional ## State section from markdown
+
+
+# ---------------------------------------------------------------------------
+# Admin-modification spec — the single source of truth for which fields of
+# ObjectDefinition can be patched by an ADMIN message, what JSON shape each
+# patch entry takes, and how the runtime coerces the raw dict back into
+# ObjectDefinition's field types.
+#
+# Everything downstream — the LLM-facing JSON schema, the admin prompt's
+# "Patchable Fields" section, and the runtime apply step — is derived from
+# this list. Adding a new patchable field means one new PatchableField entry
+# here and nothing else.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PatchableField:
+    """One patchable field of ObjectDefinition.
+
+    Every downstream artifact that mentions this field — the admin LLM's
+    JSON schema, the admin prompt's "Current Definition" rendering, the
+    "Patchable Fields" spec, the response-format example, and the runtime
+    apply step — is derived from this struct. Adding a new patchable field
+    is one PatchableField entry and nothing else.
+    """
+    name: str
+    title: str                    # display title in the "Current Definition" section
+    json_schema: dict             # JSON schema fragment for this field's value
+    description: str              # human-readable purpose, used in the admin prompt
+    list_semantics_note: str = ""  # extra prompt note for list-typed fields
+    # Coerce the LLM-supplied raw value into the type expected on
+    # ObjectDefinition (e.g. list[PeerDeclaration]).
+    coercer: Callable[[Any], Any] = lambda v: v
+    # Render this field's CURRENT value (read off the ObjectDefinition) as
+    # the body of its "## {title}" block in the admin prompt.
+    renderer: Callable[[Any], str] = lambda v: str(v) if v else "(none)"
+    # Short example value used in the response-format JSON template, e.g.
+    # '"..."' for a string, '[ ... ]' for a list.
+    example_literal: str = '"..."'
+
+
+def _coerce_peers(value: Any) -> list[PeerDeclaration]:
+    if not isinstance(value, list):
+        return []
+    return [
+        PeerDeclaration(object_id=p["object_id"], relationship=p["relationship"])
+        for p in value
+        if isinstance(p, dict) and "object_id" in p and "relationship" in p
+    ]
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [s for s in value if isinstance(s, str)]
+
+
+def _render_peers(value: Any) -> str:
+    if not value:
+        return "(none)"
+    return "\n".join(f"- {p.object_id}: {p.relationship}" for p in value)
+
+
+def _render_str_list(value: Any) -> str:
+    if not value:
+        return "(none)"
+    return "\n".join(f"- {s}" for s in value)
+
+
+def _render_text(value: Any) -> str:
+    return str(value) if value else "(none)"
+
+
+PATCHABLE_FIELDS: list[PatchableField] = [
+    PatchableField(
+        name="role",
+        title="Role",
+        json_schema={"type": "string"},
+        description="your one-line purpose statement.",
+        renderer=_render_text,
+    ),
+    PatchableField(
+        name="behavior",
+        title="Behavior",
+        json_schema={"type": "string"},
+        description=(
+            "the longer description of how you operate, what events you "
+            "react to, and what you produce."
+        ),
+        renderer=_render_text,
+    ),
+    PatchableField(
+        name="peers",
+        title="Peers",
+        json_schema={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "object_id": {"type": "string"},
+                    "relationship": {"type": "string"},
+                },
+                "required": ["object_id", "relationship"],
+                "additionalProperties": False,
+            },
+        },
+        description=(
+            "who you may message and the contract for each relationship."
+        ),
+        list_semantics_note=(
+            "To add a peer, include the full list with the new entry. "
+            "To remove a peer, include the full list without it. "
+            "To change a relationship, include the full list with the edited "
+            "entry. Peers you omit from the list are removed."
+        ),
+        coercer=_coerce_peers,
+        renderer=_render_peers,
+        example_literal='[ {"object_id": "...", "relationship": "..."} ]',
+    ),
+    PatchableField(
+        name="skills",
+        title="Skills",
+        json_schema={"type": "array", "items": {"type": "string"}},
+        description="your tool/skill identifiers.",
+        list_semantics_note=(
+            "Same list-replace semantics as peers — include the full intended list."
+        ),
+        coercer=_coerce_str_list,
+        renderer=_render_str_list,
+        example_literal='[ "..." ]',
+    ),
+]
+
+
+PATCHABLE_FIELD_NAMES: frozenset[str] = frozenset(f.name for f in PATCHABLE_FIELDS)
 
 
 def _utcnow() -> datetime.datetime:

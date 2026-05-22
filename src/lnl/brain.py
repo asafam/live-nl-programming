@@ -17,6 +17,7 @@ import yaml
 
 from .memory import FlatKeyValueMemory, MemoryBackend
 from .types import (
+    PATCHABLE_FIELDS,
     InferenceMetrics,
     KnowledgeGap,
     LLMResponse,
@@ -605,6 +606,57 @@ def build_wait_matcher_prompt(
     )
 
 
+def _type_hint(json_schema: dict) -> str:
+    """Human-readable shorthand for a JSON schema fragment, for the prompt."""
+    t = json_schema.get("type")
+    if t == "string":
+        return "string"
+    if t == "array":
+        items = json_schema.get("items", {})
+        if items.get("type") == "string":
+            return "list of strings"
+        if items.get("type") == "object":
+            props = items.get("properties") or {}
+            return "list of {" + ", ".join(props.keys()) + "}"
+        return "list"
+    return t or "value"
+
+
+def _render_current_definition(definition: ObjectDefinition) -> str:
+    """Render every patchable field's CURRENT value as a section block."""
+    blocks: list[str] = []
+    for spec in PATCHABLE_FIELDS:
+        body = spec.renderer(getattr(definition, spec.name))
+        blocks.append(f"## {spec.title}\n{body}")
+    return "\n\n".join(blocks)
+
+
+def _render_patchable_fields_spec() -> str:
+    """Render the 'Patchable Fields' bulleted list from PATCHABLE_FIELDS."""
+    lines: list[str] = []
+    for spec in PATCHABLE_FIELDS:
+        hint = _type_hint(spec.json_schema)
+        lines.append(f"- `{spec.name}` ({hint}): {spec.description}")
+        if spec.list_semantics_note:
+            for note_line in spec.list_semantics_note.split("\n"):
+                lines.append(f"  {note_line}")
+    return "\n".join(lines)
+
+
+def _render_response_format_fields(indent: str = "        ") -> str:
+    """Render the JSON example body for `updated_definition` from the spec.
+
+    Returns lines pre-prefixed with `indent` so they sit cleanly under the
+    `updated_definition` block in the prompt's response-format example.
+    Leading newline lets callers place the placeholder at end-of-line in
+    the YAML template (avoids column-0 issues with the block scalar).
+    """
+    lines: list[str] = []
+    for spec in PATCHABLE_FIELDS:
+        lines.append(f'{indent}"{spec.name}": {spec.example_literal},  // optional')
+    return "\n" + "\n".join(lines)
+
+
 def build_admin_prompt(
     definition: ObjectDefinition,
     prompt_file: str = "object_admin.yaml",
@@ -615,19 +667,20 @@ def build_admin_prompt(
     definition and the administrator's NL instruction (passed separately as
     the inbound user message), and returns a patch with only the changed
     fields. No history, no tools, no React loop.
+
+    The prompt template carries placeholders ({current_definition},
+    {patchable_fields_spec}, {response_format_fields}) that are rendered
+    from PATCHABLE_FIELDS (types.py) — so the YAML never names a specific
+    patchable field.
     """
     config = _load_prompt_config(prompt_file)
     template = config["system_prompt"]
 
-    peers = "\n".join(f"- {p.object_id}: {p.relationship}" for p in definition.peers) or "(none)"
-    skills = "\n".join(f"- {s}" for s in definition.skills) or "(none)"
-
     return template.format(
         object_id=definition.object_id,
-        role=definition.role,
-        behavior=definition.behavior or "(none)",
-        peers=peers,
-        skills=skills,
+        current_definition=_render_current_definition(definition),
+        patchable_fields_spec=_render_patchable_fields_spec(),
+        response_format_fields=_render_response_format_fields(),
     )
 
 
@@ -929,47 +982,43 @@ PLANNER_RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 
-ADMIN_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "thought": {"type": "string", "description": "Brief reasoning about which fields the admin's instruction changes."},
-        "finish": {
-            "type": "object",
-            "properties": {
-                "reply": {"type": "string", "description": "Short confirmation or clarifying question for the administrator."},
-                "updated_definition": {
-                    "type": "object",
-                    "description": "Patch with ONLY the changed fields. Omit entirely when asking for clarification.",
-                    "properties": {
-                        "role": {"type": "string"},
-                        "behavior": {"type": "string"},
-                        "peers": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "object_id": {"type": "string"},
-                                    "relationship": {"type": "string"},
-                                },
-                                "required": ["object_id", "relationship"],
-                                "additionalProperties": False,
-                            },
-                        },
-                        "skills": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "additionalProperties": False,
-                },
+def _build_admin_response_schema() -> dict[str, Any]:
+    """Build the admin-response JSON schema from PATCHABLE_FIELDS (types.py).
+
+    The patchable set is the single source of truth — adding a new patchable
+    field there updates the schema, the apply step, and the prompt together.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "thought": {
+                "type": "string",
+                "description": "Brief reasoning about which fields the admin's instruction changes.",
             },
-            "required": ["reply"],
-            "additionalProperties": False,
+            "finish": {
+                "type": "object",
+                "properties": {
+                    "reply": {
+                        "type": "string",
+                        "description": "Short confirmation or clarifying question for the administrator.",
+                    },
+                    "updated_definition": {
+                        "type": "object",
+                        "description": "Patch with ONLY the changed fields. Omit entirely when asking for clarification.",
+                        "properties": {f.name: f.json_schema for f in PATCHABLE_FIELDS},
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["reply"],
+                "additionalProperties": False,
+            },
         },
-    },
-    "required": ["thought", "finish"],
-    "additionalProperties": False,
-}
+        "required": ["thought", "finish"],
+        "additionalProperties": False,
+    }
+
+
+ADMIN_RESPONSE_SCHEMA: dict[str, Any] = _build_admin_response_schema()
 
 
 WAIT_MATCHER_RESPONSE_SCHEMA: dict[str, Any] = {

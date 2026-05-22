@@ -892,6 +892,30 @@ class TestAdminEdgeCases:
         finally:
             rt.stop()
 
+    def test_patchable_fields_drive_schema_and_apply(self):
+        """The patchable contract is data-driven: PATCHABLE_FIELDS (types.py)
+        is the single source of truth. The LLM schema, the apply step, and
+        the prompt's field list must all match what's in PATCHABLE_FIELDS."""
+        from src.lnl.brain import ADMIN_RESPONSE_SCHEMA, build_admin_prompt
+        from src.lnl.types import PATCHABLE_FIELDS
+
+        spec_names = {f.name for f in PATCHABLE_FIELDS}
+
+        # 1. The schema's updated_definition properties match the spec.
+        schema_props = set(
+            ADMIN_RESPONSE_SCHEMA["properties"]["finish"]
+            ["properties"]["updated_definition"]["properties"].keys()
+        )
+        assert schema_props == spec_names, (
+            f"schema fields {schema_props} drift from spec {spec_names}"
+        )
+
+        # 2. The rendered prompt names every spec field — backticked in the
+        #    spec block, no extras.
+        rendered = build_admin_prompt(ObjectDefinition(object_id="x", role="r"))
+        for name in spec_names:
+            assert f"`{name}`" in rendered, f"prompt missing field `{name}`"
+
     def test_admin_handles_brain_without_admin_call(self):
         """A brain that doesn't implement admin_call should not crash — the
         path logs and returns a no-op ProcessingResult."""

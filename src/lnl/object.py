@@ -26,6 +26,7 @@ from .brain import (
 from .tools import ToolRegistry
 from .memory import MemoryBackend, _coerce_to_dict, make_backend
 from .types import (
+    PATCHABLE_FIELDS,
     PLAN_TERMINAL_STATUSES,
     STEP_TERMINAL_STATUSES,
     InferenceMetrics,
@@ -34,7 +35,6 @@ from .types import (
     MessageType,
     ObjectDefinition,
     OutgoingMessage,
-    PeerDeclaration,
     Plan,
     PlanStep,
     PlanUpdate,
@@ -2371,19 +2371,18 @@ class LLMObject:
                 raise AttributeError(f"ObjectDefinition has no field '{key}'")
             setattr(self._definition, key, value)
 
-    _PATCHABLE_DEFINITION_FIELDS = {"role", "behavior", "skills"}
-
     def _apply_definition_update(self, patch: dict) -> None:
-        """Apply a definition patch from the LLM (admin-driven self-modification)."""
-        updates = {k: v for k, v in patch.items() if k in self._PATCHABLE_DEFINITION_FIELDS}
-        if "skills" in patch and isinstance(patch["skills"], list):
-            updates["skills"] = [s for s in patch["skills"] if isinstance(s, str)]
-        if "peers" in patch and isinstance(patch["peers"], list):
-            updates["peers"] = [
-                PeerDeclaration(object_id=p["object_id"], relationship=p["relationship"])
-                for p in patch["peers"]
-                if isinstance(p, dict)
-            ]
+        """Apply a definition patch from the LLM (admin-driven self-modification).
+
+        Drives every patchable field through PATCHABLE_FIELDS (types.py) — the
+        single source of truth shared with the LLM-facing schema and the admin
+        prompt. Adding a new patchable field means adding one PatchableField
+        entry; this method needs no change.
+        """
+        updates: dict = {}
+        for spec in PATCHABLE_FIELDS:
+            if spec.name in patch:
+                updates[spec.name] = spec.coercer(patch[spec.name])
         if updates:
             self.modify_definition(**updates)
 
