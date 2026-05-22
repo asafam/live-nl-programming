@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v21): rename planner.yaml -> planner_sequential.yaml; --planner-prompt default updated
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v22): default --tool-dispatch flipped async -> sync (+23pt on Zapier multistep; async loses tool-result context on the continuation turn)
 
 from src.data.schema import (
     EvalSummary,
@@ -400,7 +400,7 @@ def _execute_test_case_inner(
     mock_slot_id: str = "default",
     memory_backend: str = "nested",
     log_planner_output: bool = False,
-    tool_dispatch: str = "async",
+    tool_dispatch: str = "sync",
     planner_mode: str = "sequential",
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample and return event + modification results."""
@@ -1139,7 +1139,7 @@ def execute_test_case(
     mock_slot_id: str = "default",
     memory_backend: str = "nested",
     log_planner_output: bool = False,
-    tool_dispatch: str = "async",
+    tool_dispatch: str = "sync",
     planner_mode: str = "sequential",
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample with a per-event timeout (seconds).
@@ -1768,7 +1768,7 @@ def run(args: argparse.Namespace) -> Path:
                 mock_server_url=mock_server_url,
                 mock_slot_id=f"tc{tc_idx}-r{run_idx}",
                 log_planner_output=(getattr(args, "verbose", None) == "DEBUG"),
-                tool_dispatch=getattr(args, "tool_dispatch", "async"),
+                tool_dispatch=getattr(args, "tool_dispatch", "sync"),
                 planner_mode=getattr(args, "planner_mode", "sequential"),
             )
         finally:
@@ -2509,11 +2509,14 @@ Examples:
     parser.add_argument(
         "--tool-dispatch",
         choices=["async", "sync"],
-        default="async",
+        default="sync",
         help=(
-            "Tool dispatch mode (default: async). "
-            "'async' — tools submit to a thread pool and results arrive via mailbox REPLY (one LLM call per tool batch). "
-            "'sync' — tools execute inline in the ReAct loop (original blocking behavior, single multi-turn LLM call)."
+            "Tool dispatch mode (default: sync). "
+            "'sync' — tools execute inline in the ReAct loop (single multi-turn LLM call); "
+            "the result is fed back as the next user message. Wins +23pt over async on the "
+            "Zapier multistep eval (2026-05-22). "
+            "'async' — tools submit to a per-object pool and the result arrives via mailbox "
+            "REPLY that resumes the conversation on a new process_message turn."
         ),
     )
     parser.add_argument(

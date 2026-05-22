@@ -129,9 +129,16 @@ class SystemConfig:
     # "flat" reverts to the legacy {op, key, value} top-level deltas (kept for
     # A/B comparison and back-compat with pre-refactor runs).
     memory_backend: str = "nested"
-    # Tool dispatch mode: "async" (default) — tools submit to pool, result arrives
-    # via mailbox REPLY; "sync" — tools execute inline in the ReAct loop.
-    tool_dispatch: str = "async"
+    # Tool dispatch mode: "sync" (default) — tools execute inline in the ReAct
+    # loop, result fed back immediately as the next user message; "async" —
+    # tools submit to the per-object pool and the result arrives as a mailbox
+    # REPLY that resumes the conversation on a new process_message turn.
+    # Sync is the default because the async mailbox-round-trip path empirically
+    # loses ~23pt of pass rate (Zapier multistep, 2026-05-22) — the continuation
+    # turn often loses track of the dispatched tool call, the planner produces
+    # over-condensed plans for tool sinks, and timeouts strike when no progress
+    # signal arrives.
+    tool_dispatch: str = "sync"
     # Planner mode: "sequential" (default) — planner emits a step-by-step plan
     # that the executor dispatches one step per turn. "dag" — planner emits a
     # dependency graph; independent steps (empty depends_on or all deps done)
@@ -488,6 +495,35 @@ class Runtime:
             depth_remaining=self._max_chain_depth,
             id=_mid,
             trace_id=_mid,  # root of a new cascade
+        )
+        if self._running.is_set():
+            item = _WorkItem(message=msg)
+            self._work_queue.put(item)
+            item.done.wait()
+            return item.results
+        return self._dispatch([msg])
+
+    def send_admin(
+        self,
+        recipient: str,
+        content: str,
+        sender: str = "__admin__",
+    ) -> list[ProcessingResult]:
+        """Send an ADMIN message to a specific object.
+
+        Admin messages take a dedicated single-shot path on the recipient
+        that may mutate its definition (role / behavior / peers / skills).
+        They bypass the planner, evaluator, React loop, and tool dispatch.
+        """
+        _mid = self._next_msg_id(sender)
+        msg = Message(
+            sender=sender,
+            recipient=recipient,
+            type=MessageType.ADMIN,
+            content=content,
+            depth_remaining=self._max_chain_depth,
+            id=_mid,
+            trace_id=_mid,
         )
         if self._running.is_set():
             item = _WorkItem(message=msg)

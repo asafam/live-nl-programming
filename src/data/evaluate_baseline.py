@@ -298,7 +298,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v25): companion bump for evaluate.py v21 — planner.yaml -> planner_sequential.yaml rename
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v26): companion bump for evaluate.py v22 — LNL default --tool-dispatch flipped to sync (baseline unaffected; bump for run-config provenance)
 
 # ── Infrastructure failure detection ─────────────────────────────────────────
 

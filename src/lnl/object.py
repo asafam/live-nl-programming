@@ -16,6 +16,7 @@ from .brain import (
     LLMBrain,
     _build_chat_messages,
     _normalize_step_kind,
+    build_admin_prompt,
     build_evaluator_prompt,
     build_planner_prompt,
     build_system_prompt,
@@ -62,6 +63,7 @@ class LLMObject:
         pending_timeout_seconds: float = 90.0,
         heartbeat_interval_seconds: float = 30.0,
         prompt_file: str = "executor.yaml",
+        admin_prompt_file: str = "object_admin.yaml",
         auto_track_knowledge_gaps: bool = False,
         auto_ask_peers_on_gap: bool = False,
         enable_sink_completion_shim: bool = False,
@@ -81,7 +83,7 @@ class LLMObject:
         wait_matcher_prompt_file: str = "wait_matcher.yaml",
         default_wait_timeout_seconds: float = 86400.0,  # 24h default for wait steps
         memory_backend: "str | MemoryBackend" = "flat",
-        tool_dispatch: str = "async",
+        tool_dispatch: str = "sync",
     ) -> None:
         self._definition = definition
         self._brain = brain
@@ -116,6 +118,7 @@ class LLMObject:
         self._pending_timeout_seconds = pending_timeout_seconds
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._prompt_file = prompt_file
+        self._admin_prompt_file = admin_prompt_file
         self._auto_track_knowledge_gaps = auto_track_knowledge_gaps
         self._auto_ask_peers_on_gap = auto_ask_peers_on_gap
         self._enable_sink_completion_shim = enable_sink_completion_shim
@@ -754,7 +757,15 @@ class LLMObject:
         self-correction loop that re-runs ReAct with evaluator feedback on
         FAIL verdicts. Outgoings accumulate across cycles; the final
         corrected set is returned in a single ProcessingResult — no partial
-        dispatch through the bus."""
+        dispatch through the bus.
+
+        Admin messages take a dedicated single-shot path that only mutates
+        the object's definition — no planner, no React loop, no tools,
+        no outgoing messages, no evaluator.
+        """
+        if message.type == MessageType.ADMIN:
+            return self._process_admin_message(message)
+
         processing_started_at = datetime.datetime.now(datetime.timezone.utc)
         state_before = self._state  # snapshot — state only committed after successful loop
 
@@ -1046,9 +1057,6 @@ class LLMObject:
             # evaluator could see it — diagnostic on the slim-executor run
             # showed 67 failed events had a plan but eval skipped due to this.
 
-            if finish.updated_definition:
-                self._apply_definition_update(finish.updated_definition)
-
             if cycle_outgoing:
                 accumulated_outgoing.extend(cycle_outgoing)
             final_reply = finish.reply
@@ -1185,6 +1193,75 @@ class LLMObject:
             processing_completed_at=processing_completed_at,
             status=final_status,
             error=final_error,
+        )
+
+    def _process_admin_message(self, message: Message) -> ProcessingResult:
+        """Single-shot admin path: one LLM call against the admin prompt and
+        schema, apply any returned definition patch, return a ProcessingResult.
+
+        Bypasses planner, evaluator, React loop, tools, and outgoing messages
+        — admin messages only mutate definition. State is preserved verbatim.
+        """
+        processing_started_at = datetime.datetime.now(datetime.timezone.utc)
+        state_before = self._state
+
+        sys_prompt = build_admin_prompt(
+            self._definition, prompt_file=self._admin_prompt_file,
+        )
+        try:
+            raw, metrics = self._brain.admin_call(
+                sys_prompt, message.content, object_id=self.object_id,
+            )
+        except NotImplementedError:
+            logger.warning(
+                "Brain does not implement admin_call; ignoring ADMIN message for %s",
+                self.object_id,
+            )
+            processing_completed_at = datetime.datetime.now(datetime.timezone.utc)
+            return ProcessingResult(
+                object_id=self.object_id,
+                reply="",
+                outgoing_messages=[],
+                state_before=_coerce_state(state_before),
+                state_after=_coerce_state(self._state),
+                metrics=InferenceMetrics(model=""),
+                in_reply_to=message.sender,
+                source_message_type=message.type,
+                depth_remaining=message.depth_remaining,
+                source_message_id=message.id,
+                source_plan_step_index=message.plan_step_index,
+                source_trace_id=message.trace_id,
+                processing_started_at=processing_started_at,
+                processing_completed_at=processing_completed_at,
+            )
+
+        finish = (raw or {}).get("finish") or {}
+        reply = finish.get("reply", "") or ""
+        patch = finish.get("updated_definition") or None
+        if isinstance(patch, dict) and patch:
+            self._apply_definition_update(patch)
+
+        self._history.append(message)
+        if len(self._history) > self._max_history:
+            self._history = self._history[-self._max_history:]
+
+        processing_completed_at = datetime.datetime.now(datetime.timezone.utc)
+        return ProcessingResult(
+            object_id=self.object_id,
+            reply=reply,
+            outgoing_messages=[],
+            state_before=_coerce_state(state_before),
+            state_after=_coerce_state(self._state),
+            metrics=metrics,
+            executor_cycles=1,
+            in_reply_to=message.sender,
+            source_message_type=message.type,
+            depth_remaining=message.depth_remaining,
+            source_message_id=message.id,
+            source_plan_step_index=message.plan_step_index,
+            source_trace_id=message.trace_id,
+            processing_started_at=processing_started_at,
+            processing_completed_at=processing_completed_at,
         )
 
     def _run_react_cycle(
@@ -2246,11 +2323,13 @@ class LLMObject:
                 raise AttributeError(f"ObjectDefinition has no field '{key}'")
             setattr(self._definition, key, value)
 
-    _PATCHABLE_DEFINITION_FIELDS = {"role", "behavior"}
+    _PATCHABLE_DEFINITION_FIELDS = {"role", "behavior", "skills"}
 
     def _apply_definition_update(self, patch: dict) -> None:
         """Apply a definition patch from the LLM (admin-driven self-modification)."""
         updates = {k: v for k, v in patch.items() if k in self._PATCHABLE_DEFINITION_FIELDS}
+        if "skills" in patch and isinstance(patch["skills"], list):
+            updates["skills"] = [s for s in patch["skills"] if isinstance(s, str)]
         if "peers" in patch and isinstance(patch["peers"], list):
             updates["peers"] = [
                 PeerDeclaration(object_id=p["object_id"], relationship=p["relationship"])
