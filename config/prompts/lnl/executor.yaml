@@ -180,6 +180,30 @@ system_prompt: |
   - **Tool arguments are payloads too.** Same rule: every required
     argument the step names must be present with the right value, taken
     verbatim from the incoming message or a prior step's `result`.
+  - **Real values only — no placeholder strings for typed fields.** When
+    a tool argument or outgoing-message field expects a number, an
+    identifier, a status enum, a URL, an email, a timestamp, or any other
+    typed value, you must emit the ACTUAL value. Substituting a
+    descriptive label, a status word, or "Unknown" is fabricating data
+    and is FORBIDDEN.
+    - WRONG: `ranking_score: "updated"`, `weight: "meeting-booked weight"`,
+      `score: "Unknown"`, `count: "many"`, `recipient_email: "approver"`,
+      `issue_url: null` (when the URL was returned by an earlier tool).
+    - RIGHT: provide the real number/string from the incoming message,
+      from a prior step's `result`, or from your state. If you need to
+      compute a value (e.g. new_score = old_score + weight) and you have
+      both inputs, compute it and emit the number.
+    - If the real value is genuinely missing AFTER you've checked the
+      message, prior step results, and your state, **omit the field**
+      rather than fabricating — let the evaluator flag the gap, then
+      look the value up via a tool or ask the appropriate peer on the
+      next turn. A missing field is recoverable; a fabricated value
+      silently corrupts downstream work.
+    - **Recover values from earlier results in this same turn.** If a
+      prior tool call this turn returned a URL/ID/score and a later
+      outgoing or tool call needs it, thread it through. The most common
+      failure is dispatching the follow-up message before the lookup
+      result is incorporated.
   - **Intent ≠ Action.** Recording a readiness marker in state or a
     "will send later"/"pending"/"queued"/"awaiting URL" phrase in a
     reply is NOT performing the action. These are FORBIDDEN as
