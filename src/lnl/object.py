@@ -70,7 +70,7 @@ class LLMObject:
         evaluator_max_cycles_per_trace: int = 3,
         planner_brain: "Optional[LLMBrain]" = None,
         evaluator_brain: "Optional[LLMBrain]" = None,
-        planner_prompt_file: str = "planner.yaml",
+        planner_prompt_file: str = "planner_sequential.yaml",
         planner_mode: str = "sequential",
         log_synthetic_message: "Optional[Callable[[Message], None]]" = None,
         stale_plan_seconds: float = 180.0,
@@ -816,7 +816,7 @@ class LLMObject:
                     )
                     plan = plan_dict_to_plan(plan_dict, trace_id=trace_id)
                     # If the planner produced no executable steps, do NOT
-                    # synthesize a fallback — the planner.yaml mandate says
+                    # synthesize a fallback — the planner prompt mandate says
                     # every plan must have ≥1 step; an empty result indicates
                     # a planner bug worth surfacing, not a sink that needs
                     # silent acknowledgement. Without a stored plan, the

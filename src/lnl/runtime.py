@@ -136,7 +136,7 @@ class SystemConfig:
     # that the executor dispatches one step per turn. "dag" — planner emits a
     # dependency graph; independent steps (empty depends_on or all deps done)
     # are fanned out concurrently in a single executor turn. The choice selects
-    # the planner prompt file (planner.yaml vs planner_dag.yaml) and toggles
+    # the planner prompt file (planner_sequential.yaml vs planner_dag.yaml) and toggles
     # ready-set annotation in the executor's active_plan rendering.
     planner_mode: str = "sequential"
 
@@ -223,7 +223,7 @@ class Runtime:
         # rendering knows to surface the ready set for fan-out dispatch.
         self._planner_mode: str = cfg.planner_mode
         self._planner_prompt_file: str = (
-            "planner_dag.yaml" if self._planner_mode == "dag" else "planner.yaml"
+            "planner_dag.yaml" if self._planner_mode == "dag" else "planner_sequential.yaml"
         )
         self._sources: dict[str, Path] = {}  # object_id -> file path
         self._modified: set[str] = set()  # object_ids with unsaved changes
@@ -335,7 +335,7 @@ class Runtime:
         if mode not in ("sequential", "dag"):
             mode = "sequential"
         self._planner_mode = mode
-        self._planner_prompt_file = "planner_dag.yaml" if mode == "dag" else "planner.yaml"
+        self._planner_prompt_file = "planner_dag.yaml" if mode == "dag" else "planner_sequential.yaml"
 
     def set_max_history(self, max_history: int) -> None:
         """Override the conversation history window per object. Must be called before loading objects."""

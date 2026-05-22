@@ -420,9 +420,9 @@ def build_planner_prompt(
     definition: ObjectDefinition,
     current_state,  # str (from LLM) or dict (from mock scripts)
     message,  # Message
-    prompt_file: str = "planner.yaml",
+    prompt_file: str = "planner_sequential.yaml",
 ) -> str:
-    """Build the planner system prompt from `planner.yaml`.
+    """Build the planner system prompt from `planner_sequential.yaml` (the sequential default).
 
     The planner is a separate LLM call (Pre-Act Appendix D-inspired) that
     produces a multi-step plan BEFORE the executor starts dispatching. The

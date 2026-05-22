@@ -1,7 +1,7 @@
 """Tests for the DAG planner mode (concurrent step dispatch).
 
 DAG mode is an opt-in alternative to the default sequential planner. It:
-  - Selects `planner_dag.yaml` instead of `planner.yaml` so the planner prompt
+  - Selects `planner_dag.yaml` instead of `planner_sequential.yaml` so the planner prompt
     encourages independent steps to carry empty `depends_on`.
   - Annotates the executor's `active_plan` rendering with a `ready:` header and
     `READY` tags so the executor fans out all ready steps in one finish.
@@ -205,7 +205,7 @@ class TestRuntimeDagWiring:
     def test_default_runtime_uses_sequential_planner_prompt(self):
         rt = Runtime(MockBrain())
         assert rt._planner_mode == "sequential"
-        assert rt._planner_prompt_file == "planner.yaml"
+        assert rt._planner_prompt_file == "planner_sequential.yaml"
 
     def test_dag_systemconfig_selects_dag_prompt(self):
         cfg = SystemConfig(planner_mode="dag")
@@ -220,7 +220,7 @@ class TestRuntimeDagWiring:
         assert rt._planner_prompt_file == "planner_dag.yaml"
         rt.set_planner_mode("sequential")
         assert rt._planner_mode == "sequential"
-        assert rt._planner_prompt_file == "planner.yaml"
+        assert rt._planner_prompt_file == "planner_sequential.yaml"
 
     def test_set_planner_mode_unknown_value_falls_back(self):
         rt = Runtime(MockBrain())
