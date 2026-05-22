@@ -129,6 +129,9 @@ class SystemConfig:
     # "flat" reverts to the legacy {op, key, value} top-level deltas (kept for
     # A/B comparison and back-compat with pre-refactor runs).
     memory_backend: str = "nested"
+    # Tool dispatch mode: "async" (default) — tools submit to pool, result arrives
+    # via mailbox REPLY; "sync" — tools execute inline in the ReAct loop.
+    tool_dispatch: str = "async"
 
     @staticmethod
     def load(path: Path | None = None) -> "SystemConfig":
@@ -432,6 +435,7 @@ class Runtime:
             stale_plan_seconds=self._heartbeat.stale_plan_seconds,
             max_active_plans=self._heartbeat.max_active_plans_per_object,
             memory_backend=self._memory_backend_name,
+            tool_dispatch=self._heartbeat.tool_dispatch,
         )
         self._bus.register(obj)
         if definition.event_sources:

@@ -322,6 +322,55 @@ class TestToolLoop:
         assert total_output == 15
 
 
+class TestSyncDispatch:
+    """tool_dispatch='sync' — tools execute inline, no mailbox REPLY round-trip."""
+
+    def test_sync_tool_call_then_final_response(self):
+        """Sync mode: tool executes inline, single process_message call returns final result."""
+        brain = MockBrain()
+        brain.script("test-obj", LLMResponse(
+            updated_state={}, reply="",
+            tool_calls=[ToolCall(id="t1", tool="my_tool", arguments={"x": 1})],
+        ))
+        brain.script("test-obj", LLMResponse(
+            updated_state={"status": "sync done"}, reply="finished sync",
+        ))
+
+        mock_exec = MockToolExecutor()
+        mock_exec.script("sync output")
+        reg = ToolRegistry()
+        reg.register("my_tool", mock_exec)
+
+        obj = LLMObject(_make_definition(), brain, tool_registry=reg, tool_dispatch="sync")
+        result = obj.process_message(_user_msg("go"))
+
+        assert result.reply == "finished sync"
+        assert result.state_after == {"status": "sync done"}
+        assert len(mock_exec.call_log) == 1
+        # Sync dispatch never produces a "pending" result — exactly one ProcessingResult
+        assert result.status != "pending"
+
+    def test_sync_max_tool_rounds_respected(self):
+        """Sync mode honours max_tool_rounds cap."""
+        brain = MockBrain()
+        for i in range(10):
+            brain.script("test-obj", LLMResponse(
+                updated_state={}, reply="",
+                tool_calls=[ToolCall(id=f"t{i}", tool="my_tool", arguments={})],
+            ))
+
+        mock_exec = MockToolExecutor()
+        for _ in range(10):
+            mock_exec.script("ok")
+        reg = ToolRegistry()
+        reg.register("my_tool", mock_exec)
+
+        obj = LLMObject(_make_definition(), brain, tool_registry=reg, tool_dispatch="sync")
+        obj.process_message(_user_msg("go"))
+
+        assert len(mock_exec.call_log) == 5  # default max_tool_rounds
+
+
 class TestStateDelta:
     """State delta (state_update) tests — incremental, deliberate state changes."""
 

@@ -400,6 +400,7 @@ def _execute_test_case_inner(
     mock_slot_id: str = "default",
     memory_backend: str = "nested",
     log_planner_output: bool = False,
+    tool_dispatch: str = "async",
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample and return event + modification results."""
     from src.lnl.gateway import EventGateway
@@ -468,6 +469,7 @@ def _execute_test_case_inner(
         enable_planner=enable_planner,
         enable_evaluator=enable_evaluator,
         memory_backend=memory_backend,
+        tool_dispatch=tool_dispatch,
     )
     rt = Runtime(
         brain,
@@ -1135,6 +1137,7 @@ def execute_test_case(
     mock_slot_id: str = "default",
     memory_backend: str = "nested",
     log_planner_output: bool = False,
+    tool_dispatch: str = "async",
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample with a per-event timeout (seconds).
 
@@ -1183,6 +1186,7 @@ def execute_test_case(
         mock_slot_id=mock_slot_id,
         memory_backend=memory_backend,
         log_planner_output=log_planner_output,
+        tool_dispatch=tool_dispatch,
     )
 
 
@@ -1754,6 +1758,7 @@ def run(args: argparse.Namespace) -> Path:
                 mock_server_url=mock_server_url,
                 mock_slot_id=f"tc{tc_idx}-r{run_idx}",
                 log_planner_output=(getattr(args, "verbose", None) == "DEBUG"),
+                tool_dispatch=getattr(args, "tool_dispatch", "async"),
             )
         finally:
             # Always store snapshot and signal waiting workers — even on failure —
@@ -2476,6 +2481,16 @@ Examples:
         type=int,
         default=10,
         help="Max ReAct tool calls per object invocation (default: 10). Increase for objects with many skills/data tools.",
+    )
+    parser.add_argument(
+        "--tool-dispatch",
+        choices=["async", "sync"],
+        default="async",
+        help=(
+            "Tool dispatch mode (default: async). "
+            "'async' — tools submit to a thread pool and results arrive via mailbox REPLY (one LLM call per tool batch). "
+            "'sync' — tools execute inline in the ReAct loop (original blocking behavior, single multi-turn LLM call)."
+        ),
     )
     parser.add_argument(
         "--max-chain-depth",

@@ -80,6 +80,7 @@ class LLMObject:
         wait_matcher_prompt_file: str = "wait_matcher.yaml",
         default_wait_timeout_seconds: float = 86400.0,  # 24h default for wait steps
         memory_backend: "str | MemoryBackend" = "flat",
+        tool_dispatch: str = "async",
     ) -> None:
         self._definition = definition
         self._brain = brain
@@ -184,6 +185,9 @@ class LLMObject:
         self._tool_pool: Optional[ThreadPoolExecutor] = None
         self._tool_pool_size = tool_pool_size
         self._tool_pool_lock = threading.Lock()
+        # "async" (default): tools submitted to pool, result arrives via mailbox REPLY.
+        # "sync": tools executed inline inside _run_react_cycle, loop continues immediately.
+        self._tool_dispatch = tool_dispatch
 
     def _get_tool_pool(self) -> ThreadPoolExecutor:
         """Lazy accessor for the per-object tool-execution pool.
@@ -1249,6 +1253,44 @@ class LLMObject:
                 continue
 
             tool_rounds += 1
+
+            if self._tool_dispatch == "sync":
+                # Inline execution — run tools now, append tool_call + results
+                # to messages, and continue the ReAct loop immediately.
+                messages.append({"role": "assistant", "content": json.dumps({
+                    "thought": step.thought or "",
+                    "action": "tool_call",
+                    "tool_calls": [
+                        {"id": t.id, "tool": t.tool, "arguments": t.arguments}
+                        for t in tcs
+                    ],
+                })})
+                ctx = self._tool_context_factory(self) if self._tool_context_factory else {}
+                result_parts: list[str] = []
+                for tc in tcs:
+                    tools_called.append(tc.tool)
+                    try:
+                        result = self._tool_registry.execute(tc, ctx)
+                    except Exception as exc:
+                        result = ToolResult(id=tc.id, output="", error=f"Tool execution raised: {exc}")
+                    if tc.plan_step_index is not None and trace_id is not None:
+                        try:
+                            self._capture_tool_result_on_step(trace_id, tc.plan_step_index, result)
+                        except Exception:
+                            logger.exception("Failed to capture tool result on plan step for %s", self.object_id)
+                    status_str = "failed" if result.error else "ok"
+                    content = result.error if result.error else result.output
+                    result_parts.append(
+                        f"[Tool result (call {tc.id}) from {tc.tool}] (status={status_str}): {content}"
+                    )
+                messages.append({"role": "user", "content": "\n".join(result_parts)})
+                if plan is not None:
+                    plan.tool_rounds += len(tcs)
+                else:
+                    key = trace_id or ""
+                    self._tool_rounds_per_trace[key] = self._tool_rounds_per_trace.get(key, 0) + len(tcs)
+                continue
+
             # Dispatch all tools in this batch to the per-object pool — async.
             # Each tool posts a REPLY back to our own mailbox when it finishes;
             # read() will unblock when all pending tool counts reach zero.
