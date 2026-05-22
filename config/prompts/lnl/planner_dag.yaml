@@ -105,24 +105,61 @@ system_prompt: |
   Use the id in `depends_on` to make data flow explicit — if step `s3`
   uses `s1`'s output, set `depends_on: ["s1"]`.
 
+  **The order of steps in the JSON list does NOT determine dispatch
+  order.** The runtime dispatches every step whose `depends_on` is
+  empty (or whose listed deps have all completed) in the SAME turn,
+  regardless of position in the list. `s1`, `s2`, `s3` are just stable
+  identifiers — they are not a sequence. A plan with three steps that
+  all have `depends_on: []` will dispatch all three in turn 1. A plan
+  with `s3.depends_on=["s2"]` and `s2.depends_on=["s1"]` is a chain,
+  not because of order in the list but because of the deps. Author
+  `depends_on` deliberately — every dep you add removes a parallelism
+  opportunity.
+
   ## Planning principles (follow ALL of these)
 
   1. **One action per step.** A step dispatches to exactly one peer OR
      describes one state requirement. Never combine actions into a single step.
 
-  2. **`depends_on` encodes data flow, not preference.** Set
-     `depends_on: ["sN"]` only when this step **consumes** sN's reply or
-     tool result (an id, URL, status, payload — something only sN can
-     produce). Do NOT add a dependency to express ordering preference,
-     priority, or "feels safer to wait." The executor uses `depends_on`
-     to decide what fans out in parallel — extra dependencies serialize
-     work needlessly and make the workflow slower.
+  2. **`depends_on` encodes data flow, not preference.** For every
+     candidate dep, apply this concrete test:
 
-  3. **Independent dispatches must be parallel.** If the behavior says
-     "send to A and B simultaneously" or "write the row AND post the
-     notification" where the notification does not need the row's id,
-     emit each as its own step with `depends_on: []`. They will dispatch
-     in the same turn. Never sequence independent dispatches.
+     > Does step `sN`'s payload, arguments, or content reference a
+     > **specific field, id, URL, status, or value that is produced
+     > ONLY by step `sM`'s reply or tool result**?
+
+     - **Yes** → `sN.depends_on` must include `"sM"`.
+     - **No** → `sM` MUST NOT appear in `sN.depends_on`, even if `sM`
+       "logically comes first," "prepares the ground," or "feels safer
+       to do first." The executor will run them in the same turn.
+
+     Extra dependencies serialize work needlessly and add a full LLM
+     turn of latency per false dep. Every `depends_on` entry costs one
+     extra turn of wall time.
+
+  3. **Independent dispatches must be parallel.** Every step that does
+     not pass the test in principle 2 against any earlier step gets
+     `depends_on: []`. Common scenarios that produce `[]`:
+
+     - **Multi-peer fan-out:** "notify peers A, B, C with the event
+       payload" → three `tell` steps with `depends_on: []` each. None
+       of them needs the others' replies.
+     - **Multi-peer ask fan-out:** "ask peers A, B, C for status" →
+       three `ask` steps with `depends_on: []` each, provided the
+       question to A does not embed B's answer. The executor waits for
+       all three replies in parallel, not serially.
+     - **Write + notify with shared input:** if the channel post uses
+       the ORIGINAL event payload (not a tool-returned row_id), the
+       `tool` write and the `tell` notification have `depends_on: []`
+       — they read the same incoming data, not each other's output.
+     - **`reason` does not gate dispatches.** A `reason` step records
+       state. It does NOT have to complete before peer dispatches; do
+       not add it as a dep of `tell`/`ask`/`tool` steps unless those
+       dispatches literally read a value produced by the reason step
+       (almost never the case — reason steps describe state, they
+       don't compute new values dispatches consume).
+
+     Never sequence independent dispatches.
 
   4. **Use only declared peers for tell/ask.** The `target` of every tell/ask
      step must appear in the Declared peers list. Never invent peer IDs.
@@ -171,6 +208,34 @@ system_prompt: |
       "reasoning": "Behavior requires all order fields persisted via the
       write_row tool."}}`
 
+  ## Anti-patterns (do NOT do these)
+
+  These are the most common ways an LLM accidentally serializes a DAG.
+  Before finalizing your plan, scan each `depends_on` you set and check
+  you are not committing one of these:
+
+  - ❌ **"Sequential vibes" deps.** Adding `s3.depends_on: ["s2"]` because
+    `s2` "happens before" `s3` in the narrative, even though `s3` reads
+    only the original event content. → Use `[]`.
+  - ❌ **Same-source serialization.** Two `tell` steps to two peers
+    carry the same event payload, but you chain them `s2 → s1` because
+    one peer is "primary." Both peers receive the *same* input. → Both
+    get `[]`.
+  - ❌ **Reason-as-prerequisite.** Putting a `reason` step (e.g., "mark
+    received in state") as a dep of every dispatch step. State recording
+    is not a value any dispatch step consumes. → `reason` is independent.
+  - ❌ **Acknowledgement chains.** Adding `depends_on` to express "ack
+    that the previous step worked." The runtime closes steps on dispatch
+    (tell) or reply (ask); the executor doesn't need a chain to know.
+  - ❌ **Tool-first ordering.** Always putting `tool` steps before `tell`
+    steps with a dep, even when the `tell` does not use the tool's
+    return value. → Only chain when the `tell`'s payload literally
+    embeds the tool's return.
+  - ❌ **Bundling unrelated work into one ask chain.** Three independent
+    questions to three peers get chained `s3 → s2 → s1` because each
+    one is an `ask`. Independent asks fan out together. → Three asks
+    with `[]` each.
+
 
   ## Example plan: fan-out orchestrator with two independent peer dispatches
 
@@ -217,6 +282,66 @@ system_prompt: |
         "description": "All required actions complete; no further actions.",
         "depends_on": [],
         "reasoning": "Steps s1 + s2 cover the full storage + notification requirement."}}
+    ]
+  }}
+
+  ## Example plan: ask fan-out (multiple independent queries)
+
+  Three independent questions to three peers. None of the questions
+  embeds another peer's answer, so all three asks fan out in turn 1
+  and the executor waits for the three replies in parallel. The notify
+  step depends on all three because its payload combines all replies.
+
+  {{
+    "goal": "Gather status from three services, then notify on-call",
+    "steps": [
+      {{"id": "s1", "step_number": 1, "kind": "ask", "target": "<service-A>",
+        "description": "Query service-A current status",
+        "depends_on": [],
+        "reasoning": "Behavior requires service-A status. Question does not depend on B or C — fans out in turn 1."}},
+      {{"id": "s2", "step_number": 2, "kind": "ask", "target": "<service-B>",
+        "description": "Query service-B current status",
+        "depends_on": [],
+        "reasoning": "Behavior requires service-B status. Independent of A and C — fans out in turn 1."}},
+      {{"id": "s3", "step_number": 3, "kind": "ask", "target": "<service-C>",
+        "description": "Query service-C current status",
+        "depends_on": [],
+        "reasoning": "Behavior requires service-C status. Independent of A and B — fans out in turn 1."}},
+      {{"id": "s4", "step_number": 4, "kind": "tell", "target": "<oncall>",
+        "description": "Notify on-call with combined status (s1+s2+s3.result)",
+        "depends_on": ["s1", "s2", "s3"],
+        "reasoning": "Combined-status payload literally embeds A, B, and C's replies."}},
+      {{"id": "final", "step_number": 5, "kind": "final", "target": "final",
+        "description": "All required actions complete; no further actions.",
+        "depends_on": [],
+        "reasoning": "Three parallel asks + one downstream notify cover the behavior."}}
+    ]
+  }}
+
+  ## Example plan: tool + tell with shared input (NOT a chain)
+
+  The behavior writes the order to a DB AND posts the order summary to
+  a channel. The channel post uses the ORIGINAL order payload, not
+  anything the tool returns. Both steps read the same incoming event
+  — they have `depends_on: []` and run in parallel. (Contrast with
+  the chained example earlier, where the channel post used `row_id`
+  from the tool's return — there the dep is real.)
+
+  {{
+    "goal": "Persist order to DB and post summary to channel in parallel",
+    "steps": [
+      {{"id": "s1", "step_number": 1, "kind": "tool", "target": "write_row",
+        "description": "Persist order_id, customer_name, items to orders table",
+        "depends_on": [],
+        "reasoning": "Behavior requires DB persistence. The channel post does NOT use the row_id, so this is independent of s2."}},
+      {{"id": "s2", "step_number": 2, "kind": "tell", "target": "<channel>",
+        "description": "Post order summary (order_id, customer_name, item list)",
+        "depends_on": [],
+        "reasoning": "Behavior requires channel notification with the order summary. Payload comes from the incoming event — not from s1's tool return — so this fans out alongside s1."}},
+      {{"id": "final", "step_number": 3, "kind": "final", "target": "final",
+        "description": "All required actions complete; no further actions.",
+        "depends_on": [],
+        "reasoning": "Persistence and notification both fire in turn 1."}}
     ]
   }}
 

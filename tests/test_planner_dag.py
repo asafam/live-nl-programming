@@ -174,7 +174,11 @@ class TestExecutorPromptModeNote:
         assert "DAG mode" in note
         assert "ready:" in note
         # The note must tell the executor to dispatch all ready steps at once.
-        assert "ALL ready" in note
+        # Accept either the literal phrase "every READY step" or "ALL ready" —
+        # both express the same fan-out requirement.
+        assert ("every READY step" in note) or ("ALL ready" in note)
+        # And must remind the executor that step-id order is not dispatch order.
+        assert "identifiers" in note or "not an order" in note
 
     def test_build_system_prompt_dag_includes_note(self):
         prompt = build_system_prompt(
