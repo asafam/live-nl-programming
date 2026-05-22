@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import secrets
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -100,8 +101,13 @@ class LLMObject:
         self._mailbox: deque[Message] = deque()
         self._tool_registry = tool_registry
         self._tool_context_factory = tool_context_factory
-        self._lock = threading.Lock()   # guards _mailbox and _active
+        self._lock = threading.Condition(threading.Lock())  # guards _mailbox, _active, and _pending_tool_count
         self._active = False            # True while scheduled or running on pool
+        self._pending_tool_count: int = 0  # number of async tool futures not yet replied
+        # Cross-turn tool-round counter: used when there is no active plan for a
+        # trace (planner off or plan not yet created). When a plan exists,
+        # plan.tool_rounds is authoritative; this dict is a lightweight fallback.
+        self._tool_rounds_per_trace: dict[str, int] = {}
         self._max_tool_rounds = max_tool_rounds
         self._max_history = max_history
         self._react_cross_objects = react_cross_objects
@@ -210,14 +216,15 @@ class LLMObject:
         self,
         tc: ToolCall,
         trace_id: Optional[str],
+        dispatch_id: str = "",
     ) -> ToolResult:
-        """Pool-worker function: execute one tool synchronously.
+        """Pool-worker function: execute one tool synchronously, then deliver
+        a REPLY message back to this object's own mailbox.
 
-        Tool calls are conceptually Asks — always block the orchestrator
-        until the result arrives. The per-object pool exists purely to run
-        multiple tools from the same LLM response in parallel. The caller
-        waits on the future, captures the result on the plan step (if
-        tagged), and feeds the result back into the LLM's next iteration.
+        After the async-tools rewrite, tool results flow through the same
+        path as peer replies: a MessageType.REPLY with sender="__tool__:<name>"
+        is delivered to the mailbox, decrementing _pending_tool_count so
+        read() eventually unblocks and processes the result.
         """
         ctx = self._tool_context_factory(self) if self._tool_context_factory else {}
         try:
@@ -236,6 +243,24 @@ class LLMObject:
                 logger.exception(
                     "Failed to capture tool result on plan step for %s", self.object_id,
                 )
+
+        # Deliver result as a REPLY message to our own mailbox.
+        call_key = f"{tc.id}-{dispatch_id}" if dispatch_id else tc.id
+        reply_msg = Message(
+            sender=f"__tool__:{tc.tool}",
+            recipient=self.object_id,
+            type=MessageType.REPLY,
+            content=result.output if not result.error else result.error,
+            status="failed" if result.error else "ok",
+            error=result.error or None,
+            trace_id=trace_id,
+            plan_step_index=tc.plan_step_index,
+            depth_remaining=0,
+            id=f"tool-reply-{call_key}",
+            in_reply_to=call_key,
+            reference=tc.id,  # original LLM-assigned tool call ID for conversation reconstruction
+        )
+        self.deliver(reply_msg, decrement_pending=True)
         return result
 
     def _get_repl_namespace(self) -> dict:
@@ -295,31 +320,42 @@ class LLMObject:
     def mailbox(self) -> deque[Message]:
         return self._mailbox
 
-    def deliver(self, message: Message, schedule_callback: Optional[Callable] = None) -> None:
+    def deliver(self, message: Message, schedule_callback: Optional[Callable] = None, *, decrement_pending: bool = False) -> None:
         """Put a message in this object's mailbox.
 
         If a schedule_callback is provided and the object is not already active,
         marks the object active and calls the callback to schedule it on the pool.
+        decrement_pending=True is used by async tool replies to decrement
+        _pending_tool_count after posting the reply, then notify any waiter.
         """
         with self._lock:
             self._mailbox.append(message)
+            if decrement_pending and self._pending_tool_count > 0:
+                self._pending_tool_count -= 1
+            self._lock.notify()
             if not self._active:
                 self._active = True
                 if schedule_callback:
                     schedule_callback(self)
 
     def read(self, on_result: Callable[[ProcessingResult], None]) -> None:
-        """Execute pending messages until the mailbox is empty, then yield.
+        """Execute pending messages until the mailbox is empty and no tool
+        futures are pending, then yield.
 
         Designed to run on a thread pool. The object owns its execution:
         it dequeues messages one at a time and calls on_result after each,
-        releasing its active flag only when the mailbox is confirmed empty.
+        releasing its active flag only when the mailbox is confirmed empty
+        and _pending_tool_count is zero. When the mailbox is empty but
+        tools are still pending, waits on the condition variable until a
+        tool REPLY arrives (via deliver(decrement_pending=True)).
         """
         while True:
             with self._lock:
-                if not self._mailbox:
-                    self._active = False
-                    return
+                while not self._mailbox:
+                    if self._pending_tool_count == 0:
+                        self._active = False
+                        return
+                    self._lock.wait()
                 message = self._mailbox.popleft()
             result = self.process_message(message)  # LLM call outside lock
             on_result(result)
@@ -837,16 +873,58 @@ class LLMObject:
         )
         messages = _build_chat_messages(sys_prompt, self._history, message)
 
+        # ── Routing context & tool-REPLY prep ─────────────────────────────────
+        # Must happen BEFORE the self-correction loop because _auto_close_plan_if_complete
+        # inside that loop retires the plan, making plan_for() return None afterward.
+        # Capturing here guarantees we see plan.original_* while the plan is still open.
+        is_tool_reply = (
+            message.type == MessageType.REPLY
+            and isinstance(message.sender, str)
+            and message.sender.startswith("__tool__:")
+        )
+        if is_tool_reply:
+            _plan = self.plan_for(trace_id)
+            if _plan is not None and _plan.original_sender is not None:
+                effective_sender = _plan.original_sender
+                effective_msg_id = _plan.original_source_message_id
+                effective_msg_type = _plan.original_source_message_type or message.type
+                effective_depth = _plan.original_depth_remaining
+                effective_step_index = _plan.original_source_plan_step_index
+                # Don't consume original_sender here — a second async turn (LLM
+                # calls another tool in the continuation) needs it again. It is
+                # only cleared when tools are re-dispatched or the plan closes.
+            else:
+                effective_sender = message.sender
+                effective_msg_id = message.id
+                effective_msg_type = message.type
+                effective_depth = message.depth_remaining
+                effective_step_index = message.plan_step_index
+            # Inject the LLM's prior tool_call step as an assistant message so
+            # the continuation sees its own action alongside the result.
+            if _plan is not None and _plan.pending_tool_call_context:
+                messages.insert(-1, {"role": "assistant", "content": _plan.pending_tool_call_context})
+                _plan.pending_tool_call_context = None  # consumed
+        else:
+            effective_sender = message.sender
+            effective_msg_id = message.id
+            effective_msg_type = message.type
+            effective_depth = message.depth_remaining
+            effective_step_index = message.plan_step_index
+
         # Self-correction loop. Each iteration: one ReAct cycle → evaluate
         # → break on PASS/skip OR on cycle cap, else re-prime messages with
         # evaluator feedback and loop. Outgoings accumulate; final reply is
         # the last cycle's reply.
         accumulated_outgoing: list[OutgoingMessage] = []
         # Cumulative list of tool names dispatched across all cycles within
-        # this process_message invocation. Surfaced to the evaluator so it
-        # can verify plan `tool` steps actually fired (the evaluator only
-        # sees state + outgoings otherwise — it can't see tool execution).
+        # this trace. For tool-REPLY continuations, pre-populate from the plan's
+        # cross-turn accumulator so the evaluator sees tools called in prior turns.
         tools_called_total: list[str] = []
+        if is_tool_reply:
+            _plan = self.plan_for(trace_id)
+            if _plan is not None and _plan.accumulated_tools_called:
+                tools_called_total.extend(_plan.accumulated_tools_called)
+                _plan.accumulated_tools_called.clear()
         final_reply = ""
         final_status: Optional[str] = None
         final_error: Optional[str] = None
@@ -859,6 +937,47 @@ class LLMObject:
             tools_called_total.extend(tools_called)
             total_metrics = _accumulate_metrics(total_metrics, react_metrics)
             executor_total = _accumulate_metrics(executor_total, react_metrics)
+
+            if finish is None:
+                # Tools dispatched async — preserve routing context on plan,
+                # add to history, and return a "pending" result. The final
+                # reply will be produced when tool REPLYs arrive via mailbox.
+                plan = self.plan_for(trace_id)
+                if plan is not None:
+                    if plan.original_sender is None:
+                        plan.original_sender = message.sender
+                        plan.original_source_message_id = message.id
+                        plan.original_source_message_type = message.type
+                        plan.original_depth_remaining = message.depth_remaining
+                        plan.original_source_plan_step_index = message.plan_step_index
+                    # Persist tool names so the evaluator in the continuation
+                    # turn can verify plan tool steps were actually executed.
+                    plan.accumulated_tools_called.extend(tools_called_total)
+                self._history.append(message)
+                if len(self._history) > self._max_history:
+                    self._history = self._history[-self._max_history:]
+                processing_completed_at = datetime.datetime.now(datetime.timezone.utc)
+                return ProcessingResult(
+                    object_id=self.object_id,
+                    reply="",
+                    outgoing_messages=[],
+                    state_before=_coerce_state(state_before),
+                    state_after=_coerce_state(self._state),
+                    metrics=total_metrics,
+                    planner_metrics=planner_metrics,
+                    executor_metrics=None,
+                    evaluator_metrics=None,
+                    executor_cycles=0,
+                    in_reply_to=message.sender,
+                    source_message_type=message.type,
+                    depth_remaining=message.depth_remaining,
+                    source_message_id=message.id,
+                    source_plan_step_index=message.plan_step_index,
+                    source_trace_id=message.trace_id,
+                    processing_started_at=processing_started_at,
+                    processing_completed_at=processing_completed_at,
+                    status="pending",
+                )
 
             if finish.knowledge_gap is not None:
                 extended_outgoing = list(finish.outgoing_messages or [])
@@ -1023,11 +1142,11 @@ class LLMObject:
             executor_metrics=executor_total if (executor_total.input_tokens or executor_total.output_tokens) else None,
             evaluator_metrics=evaluator_total if (evaluator_total.input_tokens or evaluator_total.output_tokens) else None,
             executor_cycles=eval_cycle + 1,  # eval_cycle is 0 on first pass; +1 = total executor invocations
-            in_reply_to=message.sender,
-            source_message_type=message.type,
-            depth_remaining=message.depth_remaining,
-            source_message_id=message.id,
-            source_plan_step_index=message.plan_step_index,
+            in_reply_to=effective_sender,
+            source_message_type=effective_msg_type,
+            depth_remaining=effective_depth,
+            source_message_id=effective_msg_id,
+            source_plan_step_index=effective_step_index,
             source_trace_id=message.trace_id,
             processing_started_at=processing_started_at,
             processing_completed_at=processing_completed_at,
@@ -1040,21 +1159,25 @@ class LLMObject:
         messages: list[dict],
         trace_id: Optional[str] = None,
         origin_msg: "Optional[Message]" = None,
-    ) -> "tuple[ReactFinish, list[StateDelta], InferenceMetrics, list[str]]":
-        """ReAct loop with PARALLEL tool execution.
+    ) -> "tuple[Optional[ReactFinish], list[StateDelta], InferenceMetrics, list[str]]":
+        """ReAct loop with ASYNC tool dispatch.
 
-        Tools are conceptually Asks — the orchestrator always waits for results
-        before continuing. The per-object tool pool exists purely to run
-        multiple tools from the same LLM response IN PARALLEL. The loop blocks
-        on all dispatched tool futures, captures results, and re-runs the LLM
-        with results in context. Loop continues until the LLM emits
-        action="finish" (no more tool_calls).
+        When the LLM requests tools AND a registry is configured, tools are
+        submitted to the per-object pool asynchronously — _execute_tool posts
+        a REPLY back to this object's mailbox when done. The loop returns
+        (None, pending_deltas, metrics, tools_called) to signal that the
+        caller should record the "pending" state and wait for tool REPLYs
+        to arrive via the mailbox before continuing.
+
+        The no-registry path (and empty tool_calls) is UNCHANGED: it loops
+        synchronously with the "tool unavailable" message and finishes inline.
 
         State/plan updates are applied ONLY on action="finish" — they are the
         LLM's commitment, not intermediate reasoning. Updates emitted on
         action="tool_call" steps are discarded.
 
-        Returns (finish, pending_deltas, accumulated_metrics, tools_called):
+        Returns (finish_or_None, pending_deltas, accumulated_metrics, tools_called):
+        finish is None when tools were dispatched async (caller must wait).
         tools_called is the ordered list of tool names actually dispatched
         during this cycle, surfaced to the evaluator so it can verify that
         plan `tool` steps were executed.
@@ -1062,10 +1185,23 @@ class LLMObject:
         metrics = InferenceMetrics(model="")
         pending_deltas: list[StateDelta] = []
         tool_rounds = 0
-        finish: ReactFinish | None = None
+        finish: Optional[ReactFinish] = None
         tools_called: list[str] = []
 
         while True:
+            # Cross-turn cap: check total dispatched tools for this trace.
+            # Primary: plan.tool_rounds when a plan is active.
+            # Fallback: _tool_rounds_per_trace dict when no plan exists
+            #   (planner disabled or trace not yet planned).
+            plan = self.plan_for(trace_id)
+            cross_turn_rounds = (
+                plan.tool_rounds if plan is not None
+                else self._tool_rounds_per_trace.get(trace_id or "", 0)
+            )
+            if cross_turn_rounds >= self._max_tool_rounds:
+                finish = ReactFinish(reply="", updated_state=self._state)
+                break
+
             try:
                 step, m = self._brain.react_call(messages, object_id=self.object_id)
             except RuntimeError as exc:
@@ -1106,46 +1242,55 @@ class LLMObject:
                 continue
 
             tool_rounds += 1
-            # Dispatch all tools in this batch to the per-object pool — they
-            # run in parallel. Block on all of them before re-running the LLM.
+            # Dispatch all tools in this batch to the per-object pool — async.
+            # Each tool posts a REPLY back to our own mailbox when it finishes;
+            # read() will unblock when all pending tool counts reach zero.
+            with self._lock:
+                self._pending_tool_count += len(tcs)
+            if plan is not None:
+                plan.tool_rounds += len(tcs)
+                # Save the LLM's tool_call step as conversation context so the
+                # continuation call can see its own prior action alongside the
+                # tool results. Stored on the plan; consumed in process_message.
+                plan.pending_tool_call_context = json.dumps({
+                    "thought": step.thought or "",
+                    "action": "tool_call",
+                    "tool_calls": [
+                        {"id": t.id, "tool": t.tool, "arguments": t.arguments}
+                        for t in tcs
+                    ],
+                })
+            else:
+                # Fallback cross-turn counter when no plan exists.
+                key = trace_id or ""
+                self._tool_rounds_per_trace[key] = self._tool_rounds_per_trace.get(key, 0) + len(tcs)
             pool = self._get_tool_pool()
-            futures: list[tuple] = []
             for tc in tcs:
                 tools_called.append(tc.tool)
+                dispatch_id = secrets.token_hex(2)  # 4-char suffix for unique call correlation
+                call_key = f"{tc.id}-{dispatch_id}"
                 try:
-                    fut = pool.submit(self._execute_tool, tc, trace_id)
-                    futures.append((tc, fut))
+                    pool.submit(self._execute_tool, tc, trace_id, dispatch_id)
                 except RuntimeError:
-                    # Pool shut down — synthesize an error result for this tc.
-                    futures.append((tc, None))
-
-            # Append the assistant's tool_calls message once (the batch).
-            messages.append({"role": "assistant", "content": json.dumps({
-                "thought": step.thought, "action": "tool_call",
-                "tool_calls": [
-                    {"id": tc.id, "tool": tc.tool, "arguments": tc.arguments}
-                    for tc in tcs
-                ],
-            })})
-
-            # Wait for each tool, append per-tool result for LLM context.
-            for tc, fut in futures:
-                if fut is None:
-                    result = ToolResult(
-                        id=tc.id, output="", error="Tool pool unavailable.",
+                    # Pool shut down — synthesize error reply directly.
+                    with self._lock:
+                        self._pending_tool_count -= 1
+                    err_reply = Message(
+                        sender=f"__tool__:{tc.tool}",
+                        recipient=self.object_id,
+                        type=MessageType.REPLY,
+                        content="",
+                        status="failed",
+                        error="Tool pool unavailable.",
+                        trace_id=trace_id,
+                        plan_step_index=tc.plan_step_index,
+                        depth_remaining=0,
+                        id=f"tool-reply-{call_key}",
+                        in_reply_to=call_key,
                     )
-                else:
-                    try:
-                        result = fut.result()
-                    except Exception as exc:
-                        result = ToolResult(
-                            id=tc.id, output="", error=f"Tool execution raised: {exc}",
-                        )
-                messages.append({
-                    "role": "user",
-                    "content": f"[Tool result for {tc.id}]: {result.output}"
-                               + (f"\nError: {result.error}" if result.error else ""),
-                })
+                    self.deliver(err_reply)  # _pending_tool_count already decremented above
+            # Return pending — no finish yet; tool REPLYs arrive via mailbox.
+            return None, pending_deltas, metrics, tools_called
 
         return finish, pending_deltas, metrics, tools_called
 

@@ -33,6 +33,19 @@ def _user_msg(content: str, recipient: str = "test-obj") -> Message:
     )
 
 
+def _process_with_tools(obj, message):
+    """Deliver message and drain the object synchronously (handles async tool REPLYs).
+
+    Use instead of obj.process_message(msg) when the object has a tool_registry,
+    because process_message returns 'pending' on tool dispatch and the final result
+    arrives via the mailbox (tool REPLY messages).
+    """
+    results = []
+    obj.deliver(message)
+    obj.read(results.append)
+    return results[-1] if results else None
+
+
 class TestLLMObjectBasics:
     def test_single_message_updates_state(self):
         brain = MockBrain()
@@ -221,7 +234,7 @@ class TestToolLoop:
         reg.register("my_tool", mock_exec)
 
         obj = LLMObject(_make_definition(), brain, tool_registry=reg)
-        result = obj.process_message(_user_msg("go"))
+        result = _process_with_tools(obj, _user_msg("go"))
 
         assert result.state_after == {"status": "tool done"}
         assert result.reply == "finished"
@@ -231,7 +244,8 @@ class TestToolLoop:
     def test_max_tool_rounds_respected(self):
         """Tool loop stops after MAX_TOOL_ROUNDS even if LLM keeps requesting tools."""
         brain = MockBrain()
-        # Script more tool-call responses than MAX_TOOL_ROUNDS
+        # Script more tool-call responses than MAX_TOOL_ROUNDS (default=5).
+        # After 5 async dispatches the cross-turn cap fires and forces a finish.
         for i in range(10):
             brain.script("test-obj", LLMResponse(
                 updated_state={"round": i}, reply="",
@@ -245,7 +259,7 @@ class TestToolLoop:
         reg.register("my_tool", mock_exec)
 
         obj = LLMObject(_make_definition(), brain, tool_registry=reg)
-        result = obj.process_message(_user_msg("go"))
+        _process_with_tools(obj, _user_msg("go"))
 
         # Should have stopped at the default max_tool_rounds (5)
         assert len(mock_exec.call_log) == 5
@@ -272,12 +286,12 @@ class TestToolLoop:
             tool_registry=reg,
             tool_context_factory=lambda o: {"push_event": lambda c, s="__code__": events.append((c, s))},
         )
-        obj.process_message(_user_msg("setup"))
+        _process_with_tools(obj, _user_msg("setup"))
 
         assert events == [("hi", "__code__")]
 
     def test_metrics_accumulated(self):
-        """Metrics from tool continuation calls are accumulated."""
+        """Metrics from tool continuation calls are accumulated across async turns."""
         from src.lnl.types import InferenceMetrics
 
         brain = MockBrain()
@@ -295,10 +309,17 @@ class TestToolLoop:
         reg.register("t", mock_exec)
 
         obj = LLMObject(_make_definition(), brain, tool_registry=reg)
-        result = obj.process_message(_user_msg("go"))
+        # With async dispatch, the first process_message returns "pending" (10 tokens)
+        # and the second (after tool REPLY) returns the final result (20 tokens).
+        # Use _process_with_tools to collect all results, then sum metrics.
+        results = []
+        obj.deliver(_user_msg("go"))
+        obj.read(results.append)
 
-        assert result.metrics.input_tokens == 30
-        assert result.metrics.output_tokens == 15
+        total_input = sum(r.metrics.input_tokens for r in results if r.metrics)
+        total_output = sum(r.metrics.output_tokens for r in results if r.metrics)
+        assert total_input == 30
+        assert total_output == 15
 
 
 class TestStateDelta:

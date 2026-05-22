@@ -243,6 +243,20 @@ class Plan:
     # discarded on cancel/abandon.
     state: str = ""
     accumulated_deltas: list["StateDelta"] = field(default_factory=list)
+    tool_rounds: int = 0                          # total tools dispatched for this trace (cross-turn cap)
+    # Original DOMAIN message context, preserved for reply routing after async tool dispatch:
+    original_sender: Optional[str] = None
+    original_source_message_id: str = ""
+    original_source_message_type: Optional["MessageType"] = None
+    original_depth_remaining: int = 10
+    original_source_plan_step_index: Optional[int] = None
+    # Serialized LLM tool_call step JSON, preserved so the continuation LLM call
+    # can see its own prior tool_call action alongside the incoming tool results.
+    pending_tool_call_context: Optional[str] = None
+    # Tool names dispatched across all async turns for this trace. Populated
+    # when a turn ends with status="pending" (tools dispatched async) so the
+    # evaluator in the continuation turn can verify tool steps were executed.
+    accumulated_tools_called: list[str] = field(default_factory=list)
 
 
 @dataclass

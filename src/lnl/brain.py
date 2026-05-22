@@ -298,6 +298,13 @@ def _message_label(msg: Message) -> str:
         return f"Event from {msg.sender}"
     if msg.type == MessageType.ADMIN:
         return "Admin"
+    if msg.type == MessageType.REPLY and isinstance(msg.sender, str) and msg.sender.startswith("__tool__:"):
+        tool_name = msg.sender[len("__tool__:"):]
+        call_id = msg.reference or ""
+        id_part = f" (call {call_id})" if call_id else ""
+        return f"Tool result{id_part} from {tool_name}"
+    if msg.type == MessageType.REPLY:
+        return f"Reply from {msg.sender}"
     if msg.sender == "__user__":
         return "User instruction"
     if msg.expects_reply:

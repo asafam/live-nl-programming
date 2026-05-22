@@ -759,4 +759,7 @@ class TestCodeToolConfig:
 
         results = rt.send("coder", "compute it")
         assert results, "expected a processing result"
-        assert "42" in results[0].reply
+        # With async tool dispatch, intermediate pending results are emitted before
+        # the final reply. The last result carries the completed reply.
+        final_result = max(results, key=lambda r: r.sequence)
+        assert "42" in final_result.reply
