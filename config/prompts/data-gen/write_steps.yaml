@@ -78,14 +78,22 @@ prompt: |
       Trace the object graph from the trigger object through peer
       declarations to the boundary of the system. List every effect
       across these categories:
-        1. State changes in named storage (rows inserted/updated,
-           status fields flipped, counters incremented).
+        1. State changes in EXTERNAL named storage — rows inserted/updated,
+           status fields flipped, counters incremented in a NAMED EXTERNAL
+           system (Postgres table, Google Sheet tab, Airtable base, HubSpot
+           object, Asana record, etc.). NOT internal LNL object NL state.
         2. Outbound messages / notifications (emails, Slack DMs/posts,
            SMS) — always include recipient + content summary.
         3. Tool / API invocations (Stripe charge, DocuSign create,
            OpenAI completion, Bitly shorten…) — include tool name + key args.
         4. File / artifact writes (uploads to Drive, S3, etc.).
         5. Any other externally observable effect named by the behaviors.
+
+      Internal scratchpad state (e.g. "verification-request-processor state
+      contains X", "follow-up-composition records the email preview") is
+      NOT externally observable. Omit it — describe the real external
+      output (Gmail draft created, ticket logged in Jira, row appended to
+      Sheet) instead.
 
       If the cascade writes to two systems, list both. If it sends a
       notification AND updates a status AND invokes a tool, list all three.

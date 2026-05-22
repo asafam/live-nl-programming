@@ -34,10 +34,12 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 
 # Maximum seconds the evaluator waits for the system to finish processing one event
-# before injecting the next. Applied identically to LNL (per-event timeout) and
-# OpenClaw (quiescence max_wait_s). Pinned so both systems are measured under the
-# same conditions.
-INTER_EVENT_TIMEOUT_S: float = 30.0
+# before injecting the next. Used by OpenClaw _wait_mock_quiescence as the fallback
+# cap when the 3s-quiet heuristic never settles. LNL has an authoritative idle signal
+# (rt.send blocks on the transaction barrier) so it relies on --timeout (default 180s)
+# instead. Aligning OC's fallback to 180s keeps both systems on the same ceiling — OC
+# slow cascades no longer get chopped at 30s while LNL gets 180s.
+INTER_EVENT_TIMEOUT_S: float = 180.0
 
 load_dotenv()
 
@@ -67,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-21 (v9): executor_calls + executor_retries per event (and per mod) surfaced from ProcessingResult.executor_cycles; new EvalSummary totals + mean-per-event
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v13): label truncation component (planner/executor/evaluator); abort sample on infra-error; any-event infra-check (was all-events)
 
 from src.data.schema import (
     EvalSummary,
@@ -819,12 +821,14 @@ def _run_test_case_timeline(
                 if on_event_result:
                     on_event_result(event_results[-1], True)
         prior_context = _format_prior_state(rt)
+        if tc_had_infra_error:
+            break
 
     # Capture snapshot after steps complete (first TC in a sample group)
     if snapshot_out is not None and steps_snapshot is None:
         snapshot_out.append(_take_snapshot(rt, execs, list(event_results), prior_context))
 
-    if steps_only:
+    if steps_only or tc_had_infra_error:
         return event_results, mod_results
 
     # Apply --modifications N: limit to first N modifications and filter events.
@@ -1093,6 +1097,8 @@ def _run_test_case_timeline(
                 if on_event_result:
                     on_event_result(event_results[-1], False)
             prior_context = _format_prior_state(rt)
+        if tc_had_infra_error:
+            break
 
     return event_results, mod_results
 
@@ -1240,15 +1246,15 @@ def _print_summary(summary, output_path=None, elapsed_s=None) -> None:
     def _fmt(v) -> str:
         return f"{v:.4f}" if v is not None else "N/A"
 
-    def _fmts(v, s) -> str:
-        return f"{_fmt(v)}  std: {_fmt(s)}"
+    def _fmts(v, me) -> str:
+        return f"{_fmt(v)}  ±ME: {_fmt(me)}"
 
     has_inconclusive = summary.inconclusive_tcs > 0
 
-    def _fmt_mod(conclusive, conclusive_std, all_val, all_std) -> str:
+    def _fmt_mod(conclusive, conclusive_me, all_val, all_me) -> str:
         if not has_inconclusive:
-            return _fmts(conclusive, conclusive_std)
-        return f"{_fmts(conclusive, conclusive_std)}  ({summary.inconclusive_tcs} inconclusive TCs excluded; all: {_fmts(all_val, all_std)})"
+            return _fmts(conclusive, conclusive_me)
+        return f"{_fmts(conclusive, conclusive_me)}  ({summary.inconclusive_tcs} inconclusive TCs excluded; all: {_fmts(all_val, all_me)})"
 
     if output_path:
         print(f"Complete. Output: {output_path}")
@@ -1259,13 +1265,13 @@ def _print_summary(summary, output_path=None, elapsed_s=None) -> None:
         ms = int((elapsed_s % 1) * 1000)
         elapsed_str = f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}" if h else f"{m:02d}:{s:02d}.{ms:03d}"
         print(f"Elapsed:             {elapsed_str}")
-    print(f"Mean pass rate:      {_fmts(summary.mean_pass_rate, summary.pass_rate_std)}")
-    print(f"Steps pass rate:     {_fmts(summary.steps_pass_rate, summary.steps_pass_rate_std)}")
-    print(f"Workflows completion:  {_fmts(summary.samples_completion, summary.samples_completion_std)}")
-    print(f"Mod pass rate:       {_fmt_mod(summary.mod_pass_rate, summary.mod_pass_rate_std, summary.mod_pass_rate_all, summary.mod_pass_rate_all_std)}  (pre+post+irrelevant)")
-    print(f"  Pre-mod:           {_fmt_mod(summary.pre_mod_pass_rate, summary.pre_mod_pass_rate_std, summary.pre_mod_pass_rate_all, summary.pre_mod_pass_rate_all_std)}")
-    print(f"  Post-mod:          {_fmt_mod(summary.post_mod_pass_rate, summary.post_mod_pass_rate_std, summary.post_mod_pass_rate_all, summary.post_mod_pass_rate_all_std)}")
-    print(f"  Irrelevant:        {_fmt_mod(summary.irrelevant_pass_rate, summary.irrelevant_pass_rate_std, summary.irrelevant_pass_rate_all, summary.irrelevant_pass_rate_all_std)}")
+    print(f"Mean pass rate:      {_fmts(summary.mean_pass_rate, summary.pass_rate_ci95)}")
+    print(f"Steps pass rate:     {_fmts(summary.steps_pass_rate, summary.steps_pass_rate_ci95)}")
+    print(f"Workflows completion:  {_fmts(summary.samples_completion, summary.samples_completion_ci95)}")
+    print(f"Mod pass rate:       {_fmt_mod(summary.mod_pass_rate, summary.mod_pass_rate_ci95, summary.mod_pass_rate_all, summary.mod_pass_rate_all_ci95)}  (pre+post+irrelevant)")
+    print(f"  Pre-mod:           {_fmt_mod(summary.pre_mod_pass_rate, summary.pre_mod_pass_rate_ci95, summary.pre_mod_pass_rate_all, summary.pre_mod_pass_rate_all_ci95)}")
+    print(f"  Post-mod:          {_fmt_mod(summary.post_mod_pass_rate, summary.post_mod_pass_rate_ci95, summary.post_mod_pass_rate_all, summary.post_mod_pass_rate_all_ci95)}")
+    print(f"  Irrelevant:        {_fmt_mod(summary.irrelevant_pass_rate, summary.irrelevant_pass_rate_ci95, summary.irrelevant_pass_rate_all, summary.irrelevant_pass_rate_all_ci95)}")
     print(f"Inconclusive TCs:    {summary.inconclusive_tcs}")
     if summary.infra_error_tcs:
         print(f"Infra-error TCs:     {summary.infra_error_tcs}  (excluded from scores — content filter or similar)")
@@ -1979,7 +1985,7 @@ def _compute_summary(results: list[SampleResult]) -> EvalSummary:
     # already computed over the clean events only.
     infra_error_tc_ids: set[str] = {
         r.tc_id for r in results
-        if r.events and all(e.infra_error for e in r.events)
+        if r.events and any(e.infra_error for e in r.events)
     }
 
     # Compute per-result effective events (step events only for the base TC per sample).
@@ -2002,22 +2008,35 @@ def _compute_summary(results: list[SampleResult]) -> EvalSummary:
 
     mean_pass_rate = mean(pass_rates) if pass_rates else 0.0
 
-    # Behavioral consistency: mean of per-TC std devs across runs.
-    # Groups results by tc_id, computes std dev within each group, then averages.
-    # Requires --runs > 1; returns 0.0 when each TC has only one run.
+    # 95% CI half-width on the mean pass rate, from across-TC variance (Student's t).
     by_tc: dict[str, list[float]] = defaultdict(list)
     for r in results:
         if r.pass_rate is not None:
             by_tc[r.tc_id].append(r.pass_rate)
-    per_tc_stds = [
-        statistics.stdev(rates) for rates in by_tc.values() if len(rates) > 1
-    ]
-    pass_rate_std = mean(per_tc_stds) if per_tc_stds else None
+    per_tc_means_pr = [mean(v) for v in by_tc.values() if v]
+    n_pr = len(per_tc_means_pr)
+    if n_pr >= 2:
+        try:
+            from scipy import stats as _scipy_stats
+            _t_crit_pr = float(_scipy_stats.t.ppf(0.975, df=n_pr - 1))
+        except ImportError:
+            _t_crit_pr = 1.96
+        pass_rate_ci95 = _t_crit_pr * statistics.stdev(per_tc_means_pr) / (n_pr ** 0.5)
+    else:
+        pass_rate_ci95 = None
 
-    def _per_tc_std(by_tc_rates: dict) -> Optional[float]:
-        """Mean of per-TC stdevs across runs — same pattern as pass_rate_std."""
-        stdevs = [statistics.stdev(v) for v in by_tc_rates.values() if len(v) > 1]
-        return mean(stdevs) if stdevs else None
+    def _per_tc_ci95(by_tc_rates: dict) -> Optional[float]:
+        """95% CI half-width on the mean, from across-TC variance (Student's t)."""
+        tc_means = [mean(v) for v in by_tc_rates.values() if v]
+        n = len(tc_means)
+        if n < 2:
+            return None
+        try:
+            from scipy import stats as _scipy_stats
+            t_crit = float(_scipy_stats.t.ppf(0.975, df=n - 1))
+        except ImportError:
+            t_crit = 1.96
+        return t_crit * statistics.stdev(tc_means) / (n ** 0.5)
 
     # Steps pass rate + std (base TCs only, mean fraction of steps passed per TC)
     by_tc_step: dict[str, list[float]] = defaultdict(list)
@@ -2031,9 +2050,9 @@ def _compute_summary(results: list[SampleResult]) -> EvalSummary:
             by_tc_step[r.tc_id].append(sum(1 for e in step_evts if e.passed) / len(step_evts))
             by_tc_completion[r.tc_id].append(1.0 if all(e.passed for e in step_evts) else 0.0)
     steps_pass_rate = mean([mean(v) for v in by_tc_step.values()]) if by_tc_step else None
-    steps_pass_rate_std = _per_tc_std(by_tc_step)
+    steps_pass_rate_ci95 = _per_tc_ci95(by_tc_step)
     samples_completion = mean([mean(v) for v in by_tc_completion.values()]) if by_tc_completion else None
-    samples_completion_std = _per_tc_std(by_tc_completion)
+    samples_completion_ci95 = _per_tc_ci95(by_tc_completion)
 
     # Inconclusive TCs: TCs where any run had at least one step failure.
     # Probe TCs (no pre_mod events) are exempt: step failures there are unrelated
@@ -2049,7 +2068,7 @@ def _compute_summary(results: list[SampleResult]) -> EvalSummary:
             inconclusive_tc_ids.add(r.tc_id)
 
     # Role-based pass rates + std: exclude inconclusive + infra-error TCs, grouped by TC across runs
-    def _role_pass_rate_and_std(role_val, exclude_inconclusive=True) -> tuple[Optional[float], Optional[float]]:
+    def _role_pass_rate_and_ci95(role_val, exclude_inconclusive=True) -> tuple[Optional[float], Optional[float]]:
         by_tc: dict[str, list[float]] = defaultdict(list)
         for r in results:
             if r.tc_id in infra_error_tc_ids:
@@ -2060,7 +2079,7 @@ def _compute_summary(results: list[SampleResult]) -> EvalSummary:
             if evts:
                 by_tc[r.tc_id].append(sum(1 for e in evts if e.passed) / len(evts))
         rate = mean([mean(v) for v in by_tc.values()]) if by_tc else None
-        return rate, _per_tc_std(by_tc)
+        return rate, _per_tc_ci95(by_tc)
 
     conclusive_events = [
         e for r in results if r.tc_id not in inconclusive_tc_ids and r.tc_id not in infra_error_tc_ids
@@ -2077,11 +2096,11 @@ def _compute_summary(results: list[SampleResult]) -> EvalSummary:
         evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant") and not e.infra_error]
         if evts:
             by_tc_mod[r.tc_id].append(sum(1 for e in evts if e.passed) / len(evts))
-    mod_pass_rate_std = _per_tc_std(by_tc_mod)
+    mod_pass_rate_ci95 = _per_tc_ci95(by_tc_mod)
 
-    pre_mod_pass_rate, pre_mod_pass_rate_std = _role_pass_rate_and_std("pre_mod")
-    post_mod_pass_rate, post_mod_pass_rate_std = _role_pass_rate_and_std("post_mod")
-    irrelevant_pass_rate, irrelevant_pass_rate_std = _role_pass_rate_and_std("irrelevant")
+    pre_mod_pass_rate, pre_mod_pass_rate_ci95 = _role_pass_rate_and_ci95("pre_mod")
+    post_mod_pass_rate, post_mod_pass_rate_ci95 = _role_pass_rate_and_ci95("post_mod")
+    irrelevant_pass_rate, irrelevant_pass_rate_ci95 = _role_pass_rate_and_ci95("irrelevant")
 
     # Role-based pass rates including inconclusive TCs but still excluding infra-error TCs (indicative)
     all_mod_events = [
@@ -2098,38 +2117,38 @@ def _compute_summary(results: list[SampleResult]) -> EvalSummary:
         evts = [e for e in r.events if e.role in ("pre_mod", "post_mod", "irrelevant")]
         if evts:
             by_tc_mod_all[r.tc_id].append(sum(1 for e in evts if e.passed) / len(evts))
-    mod_pass_rate_all_std = _per_tc_std(by_tc_mod_all)
+    mod_pass_rate_all_ci95 = _per_tc_ci95(by_tc_mod_all)
 
-    pre_mod_pass_rate_all, pre_mod_pass_rate_all_std = _role_pass_rate_and_std("pre_mod", exclude_inconclusive=False)
-    post_mod_pass_rate_all, post_mod_pass_rate_all_std = _role_pass_rate_and_std("post_mod", exclude_inconclusive=False)
-    irrelevant_pass_rate_all, irrelevant_pass_rate_all_std = _role_pass_rate_and_std("irrelevant", exclude_inconclusive=False)
+    pre_mod_pass_rate_all, pre_mod_pass_rate_all_ci95 = _role_pass_rate_and_ci95("pre_mod", exclude_inconclusive=False)
+    post_mod_pass_rate_all, post_mod_pass_rate_all_ci95 = _role_pass_rate_and_ci95("post_mod", exclude_inconclusive=False)
+    irrelevant_pass_rate_all, irrelevant_pass_rate_all_ci95 = _role_pass_rate_and_ci95("irrelevant", exclude_inconclusive=False)
 
     return EvalSummary(
         total_test_cases=total_test_cases,
         total_runs=total_runs,
         total_events=len(all_events),
         mean_pass_rate=mean_pass_rate,
-        pass_rate_std=pass_rate_std,
+        pass_rate_ci95=pass_rate_ci95,
         steps_pass_rate=steps_pass_rate,
-        steps_pass_rate_std=steps_pass_rate_std,
+        steps_pass_rate_ci95=steps_pass_rate_ci95,
         samples_completion=samples_completion,
-        samples_completion_std=samples_completion_std,
+        samples_completion_ci95=samples_completion_ci95,
         mod_pass_rate=mod_pass_rate,
-        mod_pass_rate_std=mod_pass_rate_std,
+        mod_pass_rate_ci95=mod_pass_rate_ci95,
         mod_pass_rate_all=mod_pass_rate_all,
-        mod_pass_rate_all_std=mod_pass_rate_all_std,
+        mod_pass_rate_all_ci95=mod_pass_rate_all_ci95,
         pre_mod_pass_rate=pre_mod_pass_rate,
-        pre_mod_pass_rate_std=pre_mod_pass_rate_std,
+        pre_mod_pass_rate_ci95=pre_mod_pass_rate_ci95,
         pre_mod_pass_rate_all=pre_mod_pass_rate_all,
-        pre_mod_pass_rate_all_std=pre_mod_pass_rate_all_std,
+        pre_mod_pass_rate_all_ci95=pre_mod_pass_rate_all_ci95,
         post_mod_pass_rate=post_mod_pass_rate,
-        post_mod_pass_rate_std=post_mod_pass_rate_std,
+        post_mod_pass_rate_ci95=post_mod_pass_rate_ci95,
         post_mod_pass_rate_all=post_mod_pass_rate_all,
-        post_mod_pass_rate_all_std=post_mod_pass_rate_all_std,
+        post_mod_pass_rate_all_ci95=post_mod_pass_rate_all_ci95,
         irrelevant_pass_rate=irrelevant_pass_rate,
-        irrelevant_pass_rate_std=irrelevant_pass_rate_std,
+        irrelevant_pass_rate_ci95=irrelevant_pass_rate_ci95,
         irrelevant_pass_rate_all=irrelevant_pass_rate_all,
-        irrelevant_pass_rate_all_std=irrelevant_pass_rate_all_std,
+        irrelevant_pass_rate_all_ci95=irrelevant_pass_rate_all_ci95,
         inconclusive_tcs=len(inconclusive_tc_ids),
         infra_error_tcs=len(infra_error_tc_ids),
         mean_event_input_tokens=mean([e.input_tokens for e in all_events]),

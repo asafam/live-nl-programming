@@ -39,3 +39,8 @@ else
 fi
 echo ""
 echo "Log: ${FINAL_LOG}"
+
+# ── Non-determinism report (only meaningful with --runs ≥2) ───────────────────
+if [ -n "${OUTPUT_FILE}" ] && [ -f "${OUTPUT_FILE}" ]; then
+    python scripts/measure_nondeterminism.py "${OUTPUT_FILE}"
+fi

@@ -384,8 +384,9 @@ def compute_table_row(path: Path) -> dict:
     clean_runs  = {len(runs_per_tc[tc]) for tc in eligible_tcs}
     uniform_R   = next(iter(clean_runs)) if len(clean_runs) == 1 else None
 
-    unstable_tcs   = set()
-    entropies: list[float] = []
+    unstable_tcs    = set()
+    entropies_raw: list[float] = []
+    entropies_mm:  list[float] = []
     flipped_groups = 0
     for (tc_id, _eid), outcomes in event_outcomes.items():
         if tc_id not in eligible_tcs or len(outcomes) < 2:
@@ -395,17 +396,16 @@ def compute_table_row(path: Path) -> dict:
             flipped_groups += 1
         R = len(outcomes)
         p = sum(outcomes) / R
-        h = _bern_entropy(p)
-        # Miller-Madow bias correction for binary alphabet (k=2): +1/(2R).
-        # Applied per event group since R may differ if uniform_R is None.
-        h += 1.0 / (2 * R)
-        # Clamp to [0, 1] since binary Bernoulli H ≤ 1 bit.
-        entropies.append(min(h, 1.0))
+        h_raw = _bern_entropy(p)
+        h_mm  = min(h_raw + 1.0 / (2 * R), 1.0)
+        entropies_raw.append(h_raw)
+        entropies_mm.append(h_mm)
 
-    n_multi = len(eligible_tcs)
+    n_multi   = len(eligible_tcs)
     wir       = (len(unstable_tcs) / n_multi) if n_multi else None
-    h_mean    = (sum(entropies) / len(entropies)) if entropies else None
-    flip_frac = (flipped_groups / len(entropies)) if entropies else None
+    h_mean    = (sum(entropies_raw) / len(entropies_raw)) if entropies_raw else None
+    h_mean_mm = (sum(entropies_mm)  / len(entropies_mm))  if entropies_mm  else None
+    flip_frac = (flipped_groups / len(entropies_raw)) if entropies_raw else None
 
     return {
         "base_mean":   base_mean, "base_std":   base_std, "base_ci95":   base_ci, "base_n":   base_n,
@@ -413,13 +413,14 @@ def compute_table_row(path: Path) -> dict:
         "off_mod_mean":off_mean,  "off_mod_std":off_std,  "off_mod_ci95":off_ci,  "off_mod_n":off_n,
         # Non-determinism (None if single-run data)
         "wir":              wir,
-        "step_entropy":     h_mean,
+        "step_entropy":     h_mean,     # uncorrected plug-in Shannon H̄ — used in table
+        "step_entropy_mm":  h_mean_mm,  # Miller-Madow corrected (available, not shown in table)
         "step_flip_frac":   flip_frac,
         "n_multi_run_tcs":  n_multi,
         "max_runs":         max_runs,
         "uniform_runs":     uniform_R,
         "n_infra_tcs":      len(infra_tainted_tcs),
-        "n_step_groups":    len(entropies),
+        "n_step_groups":    len(entropies_raw),
         # Per-TC totals (averaged across all (TC, run) lines). Time is total
         # wall-clock per TC run; tokens are summed across all the TC's events
         # (judge tokens excluded — they're eval cost, not system cost).
@@ -451,7 +452,7 @@ def _bf(s: str, winner: bool) -> str:
 
 
 def load_tc_object_counts(source_path: Path) -> dict[str, int]:
-    """Read source test_cases.jsonl and return {tc_id: n_objects}."""
+    """Read source workflows-mods.jsonl and return {tc_id: n_objects}."""
     out: dict[str, int] = {}
     if not source_path.exists():
         return out
@@ -507,17 +508,22 @@ def compute_table_by_objects(path: Path, tc_objects: dict[str, int]) -> dict[str
                 role = e.get("role")
                 if role is None:
                     by_bin[b][tc_id][ri]["base"].append(e["passed"])
+                elif role == "pre_mod":
+                    by_bin[b][tc_id][ri]["pre_mod"].append(e["passed"])
                 elif role == "post_mod":
                     by_bin[b][tc_id][ri]["on_mod"].append(e["passed"])
                 elif role == "irrelevant":
                     by_bin[b][tc_id][ri]["off_mod"].append(e["passed"])
+                # mean: all non-step events regardless of role
+                if not re.match(r"^S\d+$", e.get("event_id", "")):
+                    by_bin[b][tc_id][ri]["mean"].append(e["passed"])
 
     out: dict[str, dict] = {}
     for b, tcs in by_bin.items():
-        per_tc_means = {"base": [], "on_mod": [], "off_mod": []}
-        per_tc_stds  = {"base": [], "on_mod": [], "off_mod": []}
+        per_tc_means = {"mean": [], "base": [], "pre_mod": [], "on_mod": [], "off_mod": []}
+        per_tc_stds  = {"mean": [], "base": [], "pre_mod": [], "on_mod": [], "off_mod": []}
         for tc_id, runs in tcs.items():
-            for role in ("base", "on_mod", "off_mod"):
+            for role in ("mean", "base", "pre_mod", "on_mod", "off_mod"):
                 rates = []
                 for ri, role_dict in runs.items():
                     bools = role_dict.get(role)
@@ -528,7 +534,7 @@ def compute_table_by_objects(path: Path, tc_objects: dict[str, int]) -> dict[str
                     per_tc_stds[role].append(float(np.std(rates)) if len(rates) > 1 else 0.0)
 
         row = {"n_tcs": len(tcs)}
-        for role in ("base", "on_mod", "off_mod"):
+        for role in ("mean", "base", "pre_mod", "on_mod", "off_mod"):
             tc_means = per_tc_means[role]
             n_role   = len(tc_means)
             if n_role:
@@ -574,11 +580,13 @@ def plot_by_objects(
         print("  No by-object data to plot.")
         return
 
-    metrics = [("base_mean",   "base_ci95",   "Base"),
-               ("on_mod_mean", "on_mod_ci95", "On-Mod"),
-               ("off_mod_mean","off_mod_ci95","Off-Mod")]
+    metrics = [("mean_mean",    "mean_ci95",    "Mean"),
+               ("base_mean",   "base_ci95",    "Base"),
+               ("pre_mod_mean","pre_mod_ci95", "Pre-Mod"),
+               ("on_mod_mean", "on_mod_ci95",  "On-Mod"),
+               ("off_mod_mean","off_mod_ci95", "Off-Mod")]
 
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4.0), sharey=True)
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4.0), sharey=True)
     fig.patch.set_facecolor(p["bg"])
     colors = p["colors"]
 
@@ -622,6 +630,64 @@ def plot_by_objects(
     print(f"  Saved → {out}")
 
 
+def plot_by_objects_single(
+    all_data: dict[str, dict[str, dict]],
+    plots_dir: Path,
+    palette: dict,
+    mean_key: str = "mean_mean",
+    ci_key: str   = "mean_ci95",
+    title: str    = "Mean pass rate",
+    filename: str = "mod_types_by_objects_mean.pdf",
+) -> None:
+    """Single-panel version of plot_by_objects for one metric."""
+    p = palette
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    bins_present = [b for b in _BIN_ORDER
+                    if any(b in d and d[b]["n_tcs"] > 0 for d in all_data.values())]
+    if not bins_present:
+        return
+
+    fig, ax = plt.subplots(figsize=(6.0, 4.0))
+    _apply_style(fig, ax, p)
+    colors = p["colors"]
+    x = np.arange(len(bins_present))
+
+    for s_idx, (system, bins) in enumerate(all_data.items()):
+        color = colors[s_idx % len(colors)]
+        means = [bins[b][mean_key] if b in bins and bins[b]["n_tcs"] > 0 else None for b in bins_present]
+        cis   = [bins[b][ci_key]   if b in bins and bins[b]["n_tcs"] > 0 else 0     for b in bins_present]
+        valid = [(xi, m, s) for xi, m, s in zip(x, means, cis) if m is not None]
+        if not valid:
+            continue
+        xs, ms, ss = zip(*valid)
+        ax.plot(xs, ms, marker="o", color=color, linewidth=2.0,
+                markersize=6, label=system, zorder=3)
+        ax.fill_between(xs, [m - s for m, s in zip(ms, ss)],
+                        [m + s for m, s in zip(ms, ss)],
+                        color=color, alpha=0.12, linewidth=0, zorder=2)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(bins_present, fontsize=10, color=p["text"])
+    ax.set_xlabel("Workflow size (#objects)", fontsize=10, color=p["text"])
+    ax.set_ylabel(title, fontsize=11, color=p["text"])
+    ax.set_ylim(0, 100)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+
+    leg = ax.legend(
+        loc="upper right", fontsize=9,
+        frameon=True, framealpha=1.0,
+        edgecolor=p["gridline"], facecolor=p["bg"],
+        labelcolor=p["text"],
+    )
+    leg.get_frame().set_linewidth(0.8)
+
+    out = plots_dir / filename
+    fig.savefig(out, bbox_inches="tight", facecolor=p["bg"])
+    plt.close(fig)
+    print(f"  Saved → {out}")
+
+
 def write_tex_table_by_objects(
     all_data: dict[str, dict[str, dict]],
     out_path: Path,
@@ -636,13 +702,12 @@ def write_tex_table_by_objects(
         r"% Bins are TCs grouped by number of objects in the workflow.",
         r"% Cells: mean $\pm$ 95\% CI (Student's t, across-TC variance).",
         r"% Infra + wiring failures excluded.",
-        r"\begin{tabular}{l|c|c|c|c}",
+        r"\begin{tabular}{l|c|c|c|c|c|c}",
         r"    \hline",
-        r"    \textbf{System} & \textbf{Objects} & \textbf{Base} & \textbf{On-Mod} & \textbf{Off-Mod} \\",
+        r"    \textbf{System} & \textbf{Objects} & \textbf{Mean} & \textbf{Base} & \textbf{Pre-Mod} & \textbf{On-Mod} & \textbf{Off-Mod} \\",
         r"    \hline",
     ]
     # Per-bin winners (best system within each object-count bin, per role).
-    # Pass rates: higher is better.
     win_by_bin: dict[str, dict[str, set[str]]] = {}
     for b in _BIN_ORDER:
         win_by_bin[b] = {
@@ -652,7 +717,7 @@ def write_tex_table_by_objects(
                  if bins.get(b, {}).get("n_tcs", 0) > 0],
                 "max",
             )
-            for role in ("base", "on_mod", "off_mod")
+            for role in ("mean", "base", "pre_mod", "on_mod", "off_mod")
         }
 
     for system, bins in all_data.items():
@@ -660,13 +725,17 @@ def write_tex_table_by_objects(
         for b in _BIN_ORDER:
             if b not in bins or bins[b]["n_tcs"] == 0: continue
             r = bins[b]
-            sys_cell = system if first else ""
-            base_cell = _bf(_fmt_rate(r['base_mean'],   r['base_ci95']),   system in win_by_bin[b]["base"])
-            on_cell   = _bf(_fmt_rate(r['on_mod_mean'], r['on_mod_ci95']), system in win_by_bin[b]["on_mod"])
-            off_cell  = _bf(_fmt_rate(r['off_mod_mean'],r['off_mod_ci95']),system in win_by_bin[b]["off_mod"])
+            sys_cell  = system if first else ""
+            mean_cell = _bf(_fmt_rate(r['mean_mean'],    r['mean_ci95']),    system in win_by_bin[b]["mean"])
+            base_cell = _bf(_fmt_rate(r['base_mean'],    r['base_ci95']),    system in win_by_bin[b]["base"])
+            pre_cell  = _bf(_fmt_rate(r['pre_mod_mean'], r['pre_mod_ci95']), system in win_by_bin[b]["pre_mod"])
+            on_cell   = _bf(_fmt_rate(r['on_mod_mean'],  r['on_mod_ci95']),  system in win_by_bin[b]["on_mod"])
+            off_cell  = _bf(_fmt_rate(r['off_mod_mean'], r['off_mod_ci95']), system in win_by_bin[b]["off_mod"])
             lines.append(
                 f"    {sys_cell:<24} & {b:<6}  ({r['n_tcs']:>3} TCs)"
+                + f"  & {mean_cell:<15}"
                 + f"  & {base_cell:<15}"
+                + f"  & {pre_cell:<15}"
                 + f"  & {on_cell:<15}"
                 + f"  & {off_cell:<15} \\\\"
             )
@@ -691,7 +760,7 @@ def write_tex_table(
 
     lines = [
         r"% Pass rates: mean across TCs $\pm$ 95\% CI (Student's t, across-TC variance).",
-        r"% $\bar{H}$ = mean step-level Shannon entropy per (TC, event) over runs.",
+        r"% $\bar{H}$ = mean step-level Shannon entropy (uncorrected plug-in estimator) per (TC, event) over runs.",
         r"% Time/Tokens: per-TC mean. Infra + wiring failures excluded.",
         r"\begin{tabular}{l|c|c|c|c|c|c}",
         r"    \hline",
@@ -740,6 +809,46 @@ def write_tex_table(
 
 
 # ── File discovery ────────────────────────────────────────────────────────────
+
+def discover_source_tcs(files: dict[str, Path]) -> Optional[Path]:
+    """Read input_path from the run_config record of any result file.
+
+    If the recorded path no longer exists, falls back to known canonical
+    locations (the file may have been renamed since the run).
+    """
+    _FALLBACKS = [
+        Path("data/zapier/workflows-mods.jsonl"),
+        Path("data/zapier/test_cases.jsonl"),
+    ]
+
+    candidate: Optional[Path] = None
+    for path in files.values():
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    ip = d.get("input_path")
+                    if ip:
+                        candidate = Path(ip)
+                        break
+                    if "tc_id" in d:
+                        break
+        except Exception:
+            continue
+        if candidate:
+            break
+
+    # Return the recorded path if it exists, otherwise try fallbacks.
+    if candidate and candidate.exists():
+        return candidate
+    for fb in _FALLBACKS:
+        if fb.exists():
+            return fb
+    return None
+
 
 def discover_files(directory: Path) -> dict[str, Path]:
     """Auto-detect LNL / single / multi result files from a directory."""
@@ -909,9 +1018,9 @@ def main() -> None:
                              "Infra + wiring failures excluded. Default: ENABLED.")
     parser.add_argument("--tex-name", default="mod_types_summary.tex",
                         help="Filename for the LaTeX table artifact (default: mod_types_summary.tex)")
-    parser.add_argument("--source-tcs", type=Path, default=Path("data/zapier/test_cases.jsonl"),
-                        help="Source test_cases.jsonl (used to count objects per TC for "
-                             "the by-objects breakdown). Default: data/zapier/test_cases.jsonl")
+    parser.add_argument("--source-tcs", type=Path, default=None,
+                        help="Source workflows-mods.jsonl (used to count objects per TC for "
+                             "the by-objects breakdown). Auto-detected from run_config if omitted.")
     parser.add_argument("--by-objects", action=argparse.BooleanOptionalAction, default=True,
                         help="Also emit a per-(system × n_objects bin) LaTeX table "
                              "(mod_types_by_objects.tex). Default: ENABLED.")
@@ -979,11 +1088,15 @@ def main() -> None:
 
     # By-objects-count breakdown — second LaTeX artifact
     if args.by_objects:
-        tc_objects = load_tc_object_counts(args.source_tcs)
+        source_tcs = args.source_tcs or discover_source_tcs(files)
+        if source_tcs is None:
+            print("  [warn] could not determine source TCs path — skipping --by-objects")
+            source_tcs = Path("__missing__")
+        tc_objects = load_tc_object_counts(source_tcs)
         if not tc_objects:
-            print(f"  [warn] could not load TC object counts from {args.source_tcs} — skipping --by-objects")
+            print(f"  [warn] could not load TC object counts from {source_tcs} — skipping --by-objects")
         else:
-            print(f"\n  Computing by-objects breakdown (from {args.source_tcs}, {len(tc_objects)} TCs indexed)")
+            print(f"\n  Computing by-objects breakdown (from {source_tcs}, {len(tc_objects)} TCs indexed)")
             by_obj_data: dict[str, dict] = {}
             for key, label in SERIES:
                 if key in files and files[key].exists():
@@ -992,6 +1105,7 @@ def main() -> None:
                 by_obj_path = plots_dir / "mod_types_by_objects.tex"
                 write_tex_table_by_objects(by_obj_data, by_obj_path)
                 plot_by_objects(by_obj_data, plots_dir, palette)
+                plot_by_objects_single(by_obj_data, plots_dir, palette)
                 # Echo the table to stdout
                 print()
                 print(by_obj_path.read_text())

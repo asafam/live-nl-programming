@@ -744,28 +744,28 @@ class EvalSummary(BaseModel):
     total_runs: int
     total_events: int
     mean_pass_rate: float
-    pass_rate_std: Optional[float] = None  # behavioral consistency (std dev across runs); None for single-run evals
-    # ── Per-role pass rates ──────────────────────────────────────────���─────────
+    pass_rate_ci95: Optional[float] = None  # 95% CI half-width (t-based, across-TC variance); None for single-run evals
+    # ── Per-role pass rates ────────────────────────────────────────────────────
     steps_pass_rate: Optional[float] = None        # S\d+ events mean fraction (baseline setup)
-    steps_pass_rate_std: Optional[float] = None
+    steps_pass_rate_ci95: Optional[float] = None
     samples_completion: Optional[float] = None     # fraction of TCs where ALL step events passed
-    samples_completion_std: Optional[float] = None
+    samples_completion_ci95: Optional[float] = None
     mod_pass_rate: Optional[float] = None          # all modification events (pre+post+irrelevant combined, conclusive TCs only)
-    mod_pass_rate_std: Optional[float] = None
+    mod_pass_rate_ci95: Optional[float] = None
     mod_pass_rate_all: Optional[float] = None      # same but including inconclusive TCs
-    mod_pass_rate_all_std: Optional[float] = None
+    mod_pass_rate_all_ci95: Optional[float] = None
     pre_mod_pass_rate: Optional[float] = None      # events before modification fires (conclusive TCs only)
-    pre_mod_pass_rate_std: Optional[float] = None
+    pre_mod_pass_rate_ci95: Optional[float] = None
     pre_mod_pass_rate_all: Optional[float] = None  # same but including inconclusive TCs
-    pre_mod_pass_rate_all_std: Optional[float] = None
+    pre_mod_pass_rate_all_ci95: Optional[float] = None
     post_mod_pass_rate: Optional[float] = None     # events after modification fires (key signal, conclusive TCs only)
-    post_mod_pass_rate_std: Optional[float] = None
+    post_mod_pass_rate_ci95: Optional[float] = None
     post_mod_pass_rate_all: Optional[float] = None # same but including inconclusive TCs
-    post_mod_pass_rate_all_std: Optional[float] = None
+    post_mod_pass_rate_all_ci95: Optional[float] = None
     irrelevant_pass_rate: Optional[float] = None   # events unrelated to the modification (conclusive TCs only)
-    irrelevant_pass_rate_std: Optional[float] = None
+    irrelevant_pass_rate_ci95: Optional[float] = None
     irrelevant_pass_rate_all: Optional[float] = None  # same but including inconclusive TCs
-    irrelevant_pass_rate_all_std: Optional[float] = None
+    irrelevant_pass_rate_all_ci95: Optional[float] = None
     inconclusive_tcs: int = 0                      # TCs where steps failed → mod result uninterpretable
     infra_error_tcs: int = 0                       # TCs excluded from scoring due to infra errors (e.g. content filter)
     # ── Token / latency means ──────────────────────────────────────────────────

@@ -441,6 +441,8 @@ class LLMObject:
         except NotImplementedError:
             return None, None
         except Exception as exc:
+            if "finish_reason=length" in str(exc) or "stop_reason=max_tokens" in str(exc):
+                raise RuntimeError(f"[evaluator] {exc}") from exc
             logger.warning(
                 "Evaluator call failed for %s (treating as PASS): %s",
                 self.object_id, exc,
@@ -811,6 +813,8 @@ class LLMObject:
                 except NotImplementedError:
                     pass
                 except Exception as exc:
+                    if "finish_reason=length" in str(exc) or "stop_reason=max_tokens" in str(exc):
+                        raise RuntimeError(f"[planner] {exc}") from exc
                     logger.warning(
                         "Planner call failed for %s (proceeding without plan): %s",
                         self.object_id, exc,
@@ -1062,7 +1066,12 @@ class LLMObject:
         tools_called: list[str] = []
 
         while True:
-            step, m = self._brain.react_call(messages, object_id=self.object_id)
+            try:
+                step, m = self._brain.react_call(messages, object_id=self.object_id)
+            except RuntimeError as exc:
+                if "finish_reason=length" in str(exc) or "stop_reason=max_tokens" in str(exc):
+                    raise RuntimeError(f"[executor] {exc}") from exc
+                raise
             metrics = _accumulate_metrics(metrics, m)
 
             if step.action == "finish":

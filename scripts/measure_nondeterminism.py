@@ -93,8 +93,9 @@ def analyze(path: Path) -> dict:
             unstable_tcs.add(tc_id)
     wir = (len(unstable_tcs) / n_multi) if n_multi else 0.0
 
-    # Step entropy with Miller-Madow correction (binary alphabet, +1/(2R) bias).
-    step_entropies: list[float] = []
+    # Step entropy — uncorrected Shannon and Miller-Madow corrected.
+    step_entropies_raw: list[float] = []
+    step_entropies_mm:  list[float] = []
     flipped_steps = 0
     total_steps = 0
     for (tc_id, _eid), vals in outcomes.items():
@@ -103,14 +104,17 @@ def analyze(path: Path) -> dict:
         total_steps += 1
         R = len(vals)
         p = sum(vals) / R
-        h = _entropy_bernoulli(p) + 1.0 / (2 * R)
-        step_entropies.append(min(h, 1.0))
+        h_raw = _entropy_bernoulli(p)
+        h_mm  = min(h_raw + 1.0 / (2 * R), 1.0)
+        step_entropies_raw.append(h_raw)
+        step_entropies_mm.append(h_mm)
         if 0.0 < p < 1.0:
             flipped_steps += 1
 
-    h_mean   = (sum(step_entropies) / total_steps) if total_steps else 0.0
-    h_max    = max(step_entropies) if step_entropies else 0.0
-    flip_pct = (flipped_steps / total_steps) if total_steps else 0.0
+    h_mean_raw = (sum(step_entropies_raw) / total_steps) if total_steps else 0.0
+    h_mean_mm  = (sum(step_entropies_mm)  / total_steps) if total_steps else 0.0
+    h_max_raw  = max(step_entropies_raw) if step_entropies_raw else 0.0
+    flip_pct   = (flipped_steps / total_steps) if total_steps else 0.0
 
     return {
         "n_tcs_total":            len(runs_per_tc),
@@ -123,8 +127,9 @@ def analyze(path: Path) -> dict:
         "n_step_groups":          total_steps,
         "n_flipped_step_groups":  flipped_steps,
         "frac_flipped_steps":     flip_pct,
-        "step_entropy_mean":      h_mean,
-        "step_entropy_max":       h_max,
+        "step_entropy_mean":      h_mean_raw,
+        "step_entropy_mean_mm":   h_mean_mm,
+        "step_entropy_max":       h_max_raw,
     }
 
 
@@ -148,7 +153,9 @@ def _print_report(path: Path, m: dict) -> None:
     print(f"  Flipped step groups  : {m['n_flipped_step_groups']}  "
           f"({m['frac_flipped_steps']:.1%})")
     print(f"  Mean step entropy H̄ : {m['step_entropy_mean']:.4f}  "
-          f"(max {m['step_entropy_max']:.3f}, Miller-Madow corrected)")
+          f"(max {m['step_entropy_max']:.3f}, Shannon uncorrected)")
+    print(f"  Mean step entropy H̄ : {m['step_entropy_mean_mm']:.4f}  "
+          f"(Miller-Madow corrected)")
 
 
 def main() -> None:

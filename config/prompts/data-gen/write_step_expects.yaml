@@ -44,10 +44,20 @@ prompt: |
 
   Categories to include — list every one that fires:
 
-  1. **State changes in named storage** — rows inserted/updated, status
-     fields flipped, fields set on records, counters incremented.
+  1. **State changes in EXTERNAL named storage** — rows inserted/updated,
+     status fields flipped, fields set on records, counters incremented
+     in a NAMED EXTERNAL system: Postgres tables, Google Sheets tabs,
+     Airtable bases, HubSpot/Salesforce objects, Asana/Jira/Linear
+     records, Notion pages, etc.
      Example: "Order ORD-1042 status set to 'fulfilled' in the
      orders Postgres table."
+
+     **DO NOT include internal LNL object NL state.** Workflow objects
+     keep state as a scratchpad for orchestration, but it is NOT
+     externally observable. Never demand things like
+     "verification-request-processor state contains X" or
+     "exit-survey-intake records the audit-trail" — replace with the
+     real external effect (Gmail draft, Jira ticket, Sheet row, etc.).
 
   2. **Outbound messages / notifications** — emails sent, Slack DMs/posts,
      SMS, push notifications. Always include recipient + content summary.
@@ -89,6 +99,13 @@ prompt: |
     ✗ "Lead payload forwarded to lead-routing object for processing."
     ✗ "Submission data forwarded to the contact-verification peer."
     ✗ "Full call payload forwarded to the sales-coaching-analyzer."
+
+  **Wrong (internal LNL object state — not externally observable):**
+    ✗ "follow-up-composition state records the generated email preview."
+    ✗ "verification-request-processor state contains the request payload."
+    ✗ "exit-survey-intake audit-trail stores the submission record."
+    These are workflow-internal scratchpads — replace with the real
+    external effect that resulted (Gmail draft, Jira ticket, Sheet row).
 
   **Wrong (vague, no named destinations or content):**
     ✗ "A notification is sent to the team."
