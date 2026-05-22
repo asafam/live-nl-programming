@@ -173,11 +173,14 @@ def _load_pool_config(path: Path) -> list[WorkerConfig]:
 def _clean_pool_worker_dirs(workers: list[WorkerConfig]) -> None:
     """Wipe accumulated workspace/config/log files from each worker data_dir.
 
-    Preserves identity/ and devices/ (auth files written by start-pool.sh).
+    Preserves identity/, devices/ (auth files written by start-pool.sh) and
+    openclaw.json (gateway config containing the auth token + agent list).
+    Deleting openclaw.json causes every worker to look like it has a token mismatch
+    on the next run, triggering unnecessary container restarts.
     Called once at the start of every pool-mode eval run so workers start clean.
     """
     import shutil
-    _KEEP = {"identity", "devices"}
+    _KEEP = {"identity", "devices", "openclaw.json"}
     for w in workers:
         if not w.data_dir.is_dir():
             continue
@@ -293,7 +296,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v13): companion bump to evaluate.py v13 (truncation labeling + abort-on-infra-error); no baseline behavior change
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v17): preserve openclaw.json in _clean_pool_worker_dirs so token-mismatch restarts don't fire on every run
 
 # ── Infrastructure failure detection ─────────────────────────────────────────
 
@@ -309,6 +312,10 @@ _INFRA_ERROR_PATTERNS: list[str] = [
     "websocket disconnected",
     "keepalive ping timeout",
     "gatewaydisconnected",
+    # TCP-level transport errors from Docker gateway hot-reload / container restart
+    "connection reset by peer",  # errno 54 (macOS) / 104 (Linux) — gateway mid-restart
+    "connection refused",        # gateway not yet up after restart
+    "broken pipe",               # write to a closed socket during hot-reload
     # Generic timeout strings from websockets (TimeoutError("timed out")) and
     # subprocess.TimeoutExpired ("Command '...' timed out after 60 seconds")
     "timed out",
@@ -2667,11 +2674,13 @@ async def _run_all_tcs_concurrent(
                 # Unexpected error — write a failed result so the TC isn't silently dropped
                 _err_label = str(exc) or repr(exc)
                 _err_elapsed_ms = (time.time() - tc_t0) * 1000
+                _err_is_infra = bool(_classify_error_type([_err_label]))
                 err_results: list[EventResult] = []
                 for i, step in enumerate(tc.steps):
                     if step.expect is not None:
                         err_results.append(EventResult(
                             event_id=f"S{i+1:03d}", passed=False, reasoning=_err_label,
+                            infra_error=_err_is_infra,
                         ))
                 _max_mods_err = getattr(args, "modifications", None)
                 _active_mod_ids_err = {m.id for m in (tc.modifications[:_max_mods_err] if _max_mods_err else tc.modifications)}
@@ -2681,6 +2690,7 @@ async def _run_all_tcs_concurrent(
                             err_results.append(EventResult(
                                 event_id=evt.id, passed=False, reasoning=_err_label,
                                 role=getattr(evt, "role", None),
+                                infra_error=_err_is_infra,
                             ))
                 err_mod_results = [ModificationResult(mod_id=m.id) for m in (tc.modifications[:_max_mods_err] if _max_mods_err else tc.modifications)]
                 tc_result = SampleResult(
@@ -2729,7 +2739,7 @@ def _print_summary(summary, output_path: Optional[Path] = None, elapsed_s: Optio
     def _fmt_mod(conclusive, conclusive_std, all_val, all_std) -> str:
         if not has_inconclusive:
             return _fmts(conclusive, conclusive_std)
-        return f"{_fmts(conclusive, conclusive_std)}  ({summary.inconclusive_tcs} inconclusive TCs excluded; all: {_fmts(all_val, all_std)})"
+        return f"{_fmts(all_val, all_std)}  (conclusive only: {_fmts(conclusive, conclusive_std)}, {summary.inconclusive_tcs} inconclusive excluded)"
 
     if output_path:
         print(f"Complete. Output: {output_path}")
@@ -2902,9 +2912,14 @@ def run(args: argparse.Namespace) -> Path:
                     restarted_workers.append(w)
             if restarted_workers:
                 # Wait for restarted containers to become healthy before proceeding.
+                # Must wait for BOTH mock server AND gateway: the mock server (Flask) comes
+                # up in ~1s, but the OpenClaw gateway (Node.js + plugin) takes longer.
+                # Without waiting for gateway stability here, the first TC that hits this
+                # worker runs into a mid-restart hot-reload and gets a connection reset.
                 print("  Waiting for restarted containers to become ready...")
                 for w in restarted_workers:
                     RemoteMockServer(w.mock_server_url).wait_ready(timeout=60.0)
+                    asyncio.run(_wait_for_gateway(w.gateway_url, None, timeout_s=60.0, stable_for_s=5.0))
                     print(f"  [{w.name}] ready.")
         else:
             print("  WARNING: No local device operator token found. "
