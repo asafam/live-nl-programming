@@ -287,6 +287,7 @@ system_prompt: |
 
   # Active Plan
   {active_plan}
+  {active_plan_mode_note}
 
   # Current State
   {current_state}

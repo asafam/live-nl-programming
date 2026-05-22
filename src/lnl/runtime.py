@@ -132,6 +132,13 @@ class SystemConfig:
     # Tool dispatch mode: "async" (default) — tools submit to pool, result arrives
     # via mailbox REPLY; "sync" — tools execute inline in the ReAct loop.
     tool_dispatch: str = "async"
+    # Planner mode: "sequential" (default) — planner emits a step-by-step plan
+    # that the executor dispatches one step per turn. "dag" — planner emits a
+    # dependency graph; independent steps (empty depends_on or all deps done)
+    # are fanned out concurrently in a single executor turn. The choice selects
+    # the planner prompt file (planner.yaml vs planner_dag.yaml) and toggles
+    # ready-set annotation in the executor's active_plan rendering.
+    planner_mode: str = "sequential"
 
     @staticmethod
     def load(path: Path | None = None) -> "SystemConfig":
@@ -145,6 +152,8 @@ class SystemConfig:
         hb = data.get("heartbeat", {})
         lim = data.get("limits", {})
         kg = data.get("knowledge_gaps", {})
+        planner_mode_raw = str(data.get("planner_mode", "sequential")).lower()
+        planner_mode = planner_mode_raw if planner_mode_raw in ("sequential", "dag") else "sequential"
         return SystemConfig(
             heartbeat_enabled=bool(hb.get("enabled", False)),
             heartbeat_interval_seconds=float(hb.get("interval_seconds", 30.0)),
@@ -163,6 +172,7 @@ class SystemConfig:
             stale_plan_seconds=float(data.get("stale_plan_seconds", 180.0)),
             max_active_plans_per_object=int(data.get("max_active_plans_per_object", 32)),
             memory_backend=str(data.get("memory_backend", "nested")),
+            planner_mode=planner_mode,
         )
 
 
@@ -208,7 +218,13 @@ class Runtime:
         # Executor prompt file defaults to whatever the chosen backend names —
         # flat → executor.yaml, nested → executor_nested.yaml.
         self._prompt_file: str = _shared_backend.prompt_file
-        self._planner_prompt_file: str = "planner.yaml"
+        # Planner mode and prompt file are derived from SystemConfig.planner_mode.
+        # The mode is also forwarded to LLMObject so the executor's active_plan
+        # rendering knows to surface the ready set for fan-out dispatch.
+        self._planner_mode: str = cfg.planner_mode
+        self._planner_prompt_file: str = (
+            "planner_dag.yaml" if self._planner_mode == "dag" else "planner.yaml"
+        )
         self._sources: dict[str, Path] = {}  # object_id -> file path
         self._modified: set[str] = set()  # object_ids with unsaved changes
         self._classes: dict[str, ObjectDefinition] = {}  # class_id -> template definition
@@ -310,6 +326,16 @@ class Runtime:
         """Set the planner system-prompt template filename (relative to config/prompts/lnl/).
         Must be called before loading objects."""
         self._planner_prompt_file = planner_prompt_file
+
+    def set_planner_mode(self, planner_mode: str) -> None:
+        """Set the planner mode ('sequential' or 'dag'). Also resets the planner
+        prompt file to the canonical filename for that mode. Must be called
+        before loading objects. Unknown values fall back to 'sequential'."""
+        mode = (planner_mode or "sequential").lower()
+        if mode not in ("sequential", "dag"):
+            mode = "sequential"
+        self._planner_mode = mode
+        self._planner_prompt_file = "planner_dag.yaml" if mode == "dag" else "planner.yaml"
 
     def set_max_history(self, max_history: int) -> None:
         """Override the conversation history window per object. Must be called before loading objects."""
@@ -431,6 +457,7 @@ class Runtime:
             planner_brain=self._planner_brain,
             evaluator_brain=self._evaluator_brain,
             planner_prompt_file=self._planner_prompt_file,
+            planner_mode=self._planner_mode,
             log_synthetic_message=self._bus.log_synthetic,
             stale_plan_seconds=self._heartbeat.stale_plan_seconds,
             max_active_plans=self._heartbeat.max_active_plans_per_object,

@@ -334,7 +334,28 @@ def _peer_interaction_loop(pending_timeout_seconds: float, heartbeat_interval_se
   Review your state for time-sensitive conditions or emit proactive outgoing_messages if warranted."""
 
 
-def _render_active_plan(plan: Optional[Plan]) -> str:
+def _active_plan_mode_note(mode: str) -> str:
+    """Mode-specific addendum injected after the active_plan block.
+
+    In DAG mode this instructs the executor to fan out every step listed in
+    the rendered `ready:` set in the same finish, rather than dispatching one
+    step per turn. Returns empty string in sequential mode so existing prompts
+    render byte-identically.
+    """
+    if mode == "dag":
+        return (
+            "\n**DAG mode.** The `ready:` list above enumerates every step whose "
+            "dependencies are satisfied. In your next finish, emit "
+            "`outgoing_messages` for ALL ready dispatch steps (kind=tell/ask) "
+            "and `tool_calls` for ALL ready tool steps simultaneously. Do not "
+            "serialize them across turns. A step is unready only when its "
+            "`deps=[...]` lists an id whose `result` is not yet captured — wait "
+            "for that step's result before dispatching its dependents."
+        )
+    return ""
+
+
+def _render_active_plan(plan: Optional[Plan], mode: str = "sequential") -> str:
     """Render the active plan for the prompt.
 
     Each step is identified by its stable string id (e.g., 's1', 's2'). The LLM
@@ -342,10 +363,29 @@ def _render_active_plan(plan: Optional[Plan]) -> str:
     URL from s2.result". Captured step results are rendered in their native
     shape (NL for peer replies, JSON for tool returns) so downstream steps can
     reference them directly without state-write hops.
+
+    When `mode == "dag"` the rendering surfaces a `ready:` header listing every
+    step whose `depends_on` are all in terminal status (done/skipped) and which
+    is itself still `planned`. Each such step also gets a `READY` tag in its
+    line so the executor can dispatch them all in the same turn.
     """
     if plan is None:
         return "(none)"
-    lines = [f"goal: {plan.goal}", f"status: {plan.status}", "steps:"]
+    ready_ids: set[str] = set()
+    if mode == "dag":
+        done_ids = {(s.id or f"s{i+1}") for i, s in enumerate(plan.steps)
+                    if s.status in ("done", "skipped")}
+        for i, s in enumerate(plan.steps):
+            sid = s.id or f"s{i+1}"
+            if s.status != "planned":
+                continue
+            if all(d in done_ids for d in (s.depends_on or [])):
+                ready_ids.add(sid)
+    lines = [f"goal: {plan.goal}", f"status: {plan.status}"]
+    if mode == "dag":
+        ready_list = ", ".join(sorted(ready_ids, key=lambda x: (len(x), x))) if ready_ids else "(none)"
+        lines.append(f"ready: [{ready_list}]")
+    lines.append("steps:")
     if not plan.steps:
         lines.append("  (empty)")
     for i, s in enumerate(plan.steps):
@@ -353,7 +393,8 @@ def _render_active_plan(plan: Optional[Plan]) -> str:
         sid = s.id or f"s{i+1}"
         target = f" → {s.target}" if s.target else ""
         deps = f"  deps={s.depends_on}" if s.depends_on else ""
-        lines.append(f"  {sid}: {s.kind}{target}  status={s.status}{deps}")
+        ready_tag = "  READY" if (mode == "dag" and sid in ready_ids) else ""
+        lines.append(f"  {sid}: {s.kind}{target}  status={s.status}{deps}{ready_tag}")
         lines.append(f"      description: \"{s.description}\"")
         if s.kind == "wait" and s.wait_predicate:
             src = f" (source hint: {s.wait_source})" if s.wait_source else ""
@@ -649,6 +690,7 @@ def build_system_prompt(
     heartbeat_interval_seconds: float = 30.0,
     active_plan: Optional["Plan"] = None,  # type: ignore[name-defined]
     prompt_file: str = "object.yaml",
+    planner_mode: str = "sequential",
 ) -> str:
     """Build the system prompt from the YAML template and an ObjectDefinition."""
     config = _load_prompt_config(prompt_file)
@@ -674,7 +716,8 @@ def build_system_prompt(
         "peers": peers or "(none)",
         "event_sources": event_sources or "(none)",
         "current_state": (json.dumps(current_state, indent=2) if isinstance(current_state, dict) else current_state.strip()) if current_state else "(empty)",
-        "active_plan": _render_active_plan(active_plan),
+        "active_plan": _render_active_plan(active_plan, mode=planner_mode),
+        "active_plan_mode_note": _active_plan_mode_note(planner_mode),
         "tools": tools or "(none)",
         "peer_interaction_loop": _peer_interaction_loop(pending_timeout_seconds, heartbeat_interval_seconds) if react_cross_objects else "",
     }

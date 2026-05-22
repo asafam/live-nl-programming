@@ -20,3 +20,14 @@ knowledge_gaps:
   enabled: false
   # Also auto-ask all declared peers if they know the answer.
   ask_peers: false
+
+# Planner mode controls how the pre-execution planner shapes its output and
+# how the executor dispatches steps.
+#   sequential — planner emits steps that the executor handles one per turn.
+#                Safer for plans where every step depends on the prior step.
+#   dag        — planner emits a dependency graph; the executor fans out all
+#                ready steps (empty depends_on or all deps done) in a single
+#                turn. Faster when behaviors notify/write to multiple peers
+#                that don't consume each other's results.
+# Only consulted when enable_planner is true.
+planner_mode: sequential
