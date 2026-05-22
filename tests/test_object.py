@@ -464,3 +464,134 @@ class TestStateDelta:
         obj.process_message(_user_msg("go"))
 
         assert obj.state == {"legacy": True}
+
+
+class TestSinkShimMergeSemantics:
+    """The sink completion shim must NEVER overwrite LLM-authored auto_completion
+    fields. It only fills missing subkeys (fill-missing merge). See the
+    08d6350 → merge-fix story: the wholesale `set` cost ~13pt on the Zapier
+    multistep eval by replacing LLM-specific fields (deal_id, file_name,
+    amount) with the shim's generic blob."""
+
+    def _make_sink_obj(self, role="A write service that stores records.") -> LLMObject:
+        # `_SINK_ROLE_KEYWORDS` keyword detection — "write service" / "store" both
+        # land in the vocabulary. Pass enable_sink_completion_shim=True so the
+        # shim path runs.
+        brain = MockBrain()
+        obj = LLMObject(
+            _make_definition(role=role),
+            brain,
+            enable_sink_completion_shim=True,
+        )
+        return obj
+
+    def _origin_msg(self) -> Message:
+        return Message(
+            sender="upstream-peer",
+            recipient="test-obj",
+            type=MessageType.DOMAIN,
+            content="deal_id=D-123 amount=$45000 customer=Acme",
+            id="msg-001",
+        )
+
+    def test_shim_provides_everything_when_state_empty(self):
+        """LLM wrote nothing → shim is the sole author of auto_completion."""
+        obj = self._make_sink_obj()
+        finish = ReactFinish(reply="done", updated_state={})
+        pending: list[StateDelta] = []
+        obj._apply_sink_shim(finish, pending, trace_id=None, origin_msg=self._origin_msg())
+
+        ac_deltas = [d for d in pending if d.key == "auto_completion"]
+        assert len(ac_deltas) == 1
+        ac = ac_deltas[0].value
+        assert ac["status"] == "completed"
+        assert ac["completed_by"] == "runtime_sink_shim"
+        assert isinstance(ac["artifact"], dict)
+        assert ac["artifact"].get("content") == "deal_id=D-123 amount=$45000 customer=Acme"
+
+    def test_shim_preserves_llm_authored_domain_fields(self):
+        """LLM wrote {status: 'posted', deal_id: 'D-123'} → both fields survive,
+        shim fills artifact + completed_by. Status stays LLM's value."""
+        obj = self._make_sink_obj()
+        obj.set_state({"auto_completion": {"status": "posted", "deal_id": "D-123"}})
+        finish = ReactFinish(reply="done", updated_state={})
+        pending: list[StateDelta] = []
+        obj._apply_sink_shim(finish, pending, trace_id=None, origin_msg=self._origin_msg())
+
+        ac = [d for d in pending if d.key == "auto_completion"][0].value
+        # LLM-authored fields survive
+        assert ac["status"] == "posted"  # LLM's value, NOT overridden by shim
+        assert ac["deal_id"] == "D-123"  # domain field preserved
+        # Shim-provided fields added
+        assert ac["completed_by"] == "runtime_sink_shim"
+        assert isinstance(ac["artifact"], dict)
+
+    def test_shim_is_noop_when_llm_wrote_full_completion(self):
+        """LLM wrote a complete auto_completion → shim values appear only where
+        the LLM left a gap; LLM's fields all survive."""
+        obj = self._make_sink_obj()
+        llm_ac = {
+            "status": "posted",
+            "completed_by": "deal-pipeline",
+            "artifact": {"id": "LLM-1", "url": "https://llm/1", "content": "full content"},
+            "deal_id": "D-123",
+        }
+        obj.set_state({"auto_completion": llm_ac})
+        finish = ReactFinish(reply="done", updated_state={})
+        pending: list[StateDelta] = []
+        obj._apply_sink_shim(finish, pending, trace_id=None, origin_msg=self._origin_msg())
+
+        ac = [d for d in pending if d.key == "auto_completion"][0].value
+        # Every LLM field survives verbatim
+        assert ac["status"] == "posted"
+        assert ac["completed_by"] == "deal-pipeline"
+        assert ac["deal_id"] == "D-123"
+        # Artifact subfields: LLM's id / url / content all win
+        assert ac["artifact"]["id"] == "LLM-1"
+        assert ac["artifact"]["url"] == "https://llm/1"
+        assert ac["artifact"]["content"] == "full content"
+
+    def test_shim_merges_partial_artifact_subkeys(self):
+        """LLM wrote artifact.id only → shim fills artifact.url and
+        artifact.content; LLM's id survives."""
+        obj = self._make_sink_obj()
+        obj.set_state({"auto_completion": {"artifact": {"id": "LLM-X"}}})
+        finish = ReactFinish(reply="done", updated_state={})
+        pending: list[StateDelta] = []
+        obj._apply_sink_shim(finish, pending, trace_id=None, origin_msg=self._origin_msg())
+
+        ac = [d for d in pending if d.key == "auto_completion"][0].value
+        # LLM artifact.id preserved
+        assert ac["artifact"]["id"] == "LLM-X"
+        # Missing artifact subkeys filled by shim
+        assert "url" in ac["artifact"]
+        assert ac["artifact"]["content"] == "deal_id=D-123 amount=$45000 customer=Acme"
+
+    def test_shim_preserves_non_dict_auto_completion_under_raw(self):
+        """LLM wrote a bare string as auto_completion → preserved under 'raw',
+        shim's structured fields layered alongside. Nothing is lost."""
+        obj = self._make_sink_obj()
+        obj.set_state({"auto_completion": "all done"})
+        finish = ReactFinish(reply="done", updated_state={})
+        pending: list[StateDelta] = []
+        obj._apply_sink_shim(finish, pending, trace_id=None, origin_msg=self._origin_msg())
+
+        ac = [d for d in pending if d.key == "auto_completion"][0].value
+        assert ac.get("raw") == "all done"  # original preserved
+        assert ac["status"] == "completed"  # shim provided
+
+    def test_shim_telemetry_log_emitted(self, caplog):
+        """The shim logs a structured `[sink_shim]` line per fire so post-run
+        analysis can grep which TCs went through and which fields were
+        preserved vs added."""
+        import logging
+        obj = self._make_sink_obj()
+        obj.set_state({"auto_completion": {"status": "posted", "deal_id": "D-123"}})
+        finish = ReactFinish(reply="done", updated_state={})
+        pending: list[StateDelta] = []
+        with caplog.at_level(logging.INFO, logger="src.lnl.object"):
+            obj._apply_sink_shim(finish, pending, trace_id="trace-1", origin_msg=self._origin_msg())
+        assert any("[sink_shim]" in rec.message for rec in caplog.records), (
+            "expected the [sink_shim] telemetry line; got: "
+            + repr([r.message for r in caplog.records])
+        )

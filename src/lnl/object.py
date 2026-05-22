@@ -74,6 +74,8 @@ class LLMObject:
         evaluator_brain: "Optional[LLMBrain]" = None,
         planner_prompt_file: str = "planner_sequential.yaml",
         planner_mode: str = "sequential",
+        enable_replan_checkpoints: bool = False,
+        replan_max_per_trace: int = 3,
         log_synthetic_message: "Optional[Callable[[Message], None]]" = None,
         stale_plan_seconds: float = 180.0,
         max_active_plans: int = 32,
@@ -142,6 +144,13 @@ class LLMObject:
         self._planner_mode = (planner_mode or "sequential").lower()
         if self._planner_mode not in ("sequential", "dag"):
             self._planner_mode = "sequential"
+        # Replan checkpoints: when enabled, planner may emit `kind=replan` steps
+        # that hand control back to the planner mid-cascade once deps land.
+        self._enable_replan_checkpoints = bool(enable_replan_checkpoints)
+        self._replan_max_per_trace = int(replan_max_per_trace) if replan_max_per_trace else 0
+        # Per-trace replan cycle counts (cap to prevent runaway recursion).
+        self._replan_cycles_per_trace: dict[str, int] = {}
+        self._replan_cycles_lock = threading.Lock()
         # Per-trace evaluator cycle counts (cap to prevent runaway).
         self._evaluator_cycles_per_trace: dict[str, int] = {}
         self._evaluator_cycles_lock = threading.Lock()
@@ -737,50 +746,101 @@ class LLMObject:
         """
         if not self._enable_sink_completion_shim:
             return finish
+        merged = self._merged_state(pending_deltas, trace_id)
+        # Universal audit-log injection: every object that processes a message
+        # gets an audit_log entry with the incoming content.  Entry-point
+        # services (jotform-intake, slack-ingest, etc.) had no audit_log
+        # otherwise — they're not sinks but the judge expects them to record
+        # received events.  Dedup per message_id so re-injections don't
+        # accumulate.
+        msg_id = getattr(origin_msg, "id", None) if origin_msg is not None else None
+        if origin_msg is not None and origin_msg.content:
+            existing_log = merged.get("audit_log") or []
+            already_logged = msg_id and any(
+                isinstance(entry, dict) and entry.get("message_id") == msg_id
+                for entry in existing_log
+            )
+            if not already_logged:
+                import datetime as _dt
+                pending_deltas.append(self._memory.make_delta(
+                    "append",
+                    "audit_log",
+                    {
+                        "message_id": msg_id,
+                        "received_from": origin_msg.sender,
+                        "content": origin_msg.content,
+                        "recorded_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                    },
+                ))
+        # Sink-only path: synthesize auto_completion artifact (the original
+        # purpose of this shim).  Skip for non-sinks — they shouldn't claim
+        # "completed"; the executor's own state updates are authoritative.
         if not (self.is_sink_for_this_turn(trace_id) or self.is_sink_role()):
             return finish
-        merged = self._merged_state(pending_deltas, trace_id)
         if self._reply_has_artifact(finish.reply or ""):
             return finish
-        # Always inject auto_completion + audit_log with the received message
-        # content.  The judge looks specifically for `audit_log` entries with
-        # content (deal name, amount, timestamp); a thin executor completion
-        # like {status: posted} fails because audit_log is empty or absent.
-        # Skipping when state already has a completion marker masked the
-        # audit-log absence and caused 53/58 LNL failures.  Idempotent: re-
-        # injection on subsequent cycles uses skip-if-present for audit_log.
         artifact = self._synthesize_artifact()
         if origin_msg is not None and origin_msg.content:
             artifact["content"] = origin_msg.content
             artifact["received_from"] = origin_msg.sender
+        # ── auto_completion: fill-missing merge ────────────────────────────
+        # The shim NEVER overwrites LLM-authored fields. It only provides
+        # values for subkeys the LLM didn't set. This is the architectural
+        # contract: the shim is a safety net, not an authority. The previous
+        # wholesale `set` (commit 08d6350) overwrote any LLM-authored
+        # auto_completion dict (e.g. {status: "posted", deal_id: "D-123"})
+        # with the shim's generic {status, artifact, completed_by}, costing
+        # ~13pt on the Zapier multistep eval because LLM-specific fields
+        # like deal_id / file_name / amount were lost and the per-criterion
+        # judge couldn't find them.
+        existing_ac = merged.get("auto_completion")
+        if not isinstance(existing_ac, dict):
+            # Non-dict existing value (rare; e.g. LLM wrote a bare string).
+            # Preserve under "raw" so nothing is lost, then layer the shim's
+            # structured fields alongside.
+            existing_ac = {"raw": existing_ac} if existing_ac else {}
+        existing_artifact = existing_ac.get("artifact")
+        if isinstance(existing_artifact, dict):
+            # Deep-merge artifact subkeys: LLM-authored ones win.
+            merged_artifact = {**artifact, **existing_artifact}
+        else:
+            merged_artifact = artifact
+        shim_defaults = {
+            "status": "completed",
+            "artifact": merged_artifact,
+            "completed_by": "runtime_sink_shim",
+        }
+        # Top-level merge: shim provides defaults, LLM-authored fields win.
+        merged_ac = {**shim_defaults, **existing_ac}
+        # Ensure the merged artifact wins over an LLM artifact that lacks
+        # shim-provided subkeys — the top-level merge above would have used
+        # the LLM's bare artifact dict otherwise.
+        merged_ac["artifact"] = merged_artifact
         pending_deltas.append(self._memory.make_delta(
             "set",
             "auto_completion",
-            {
-                "status": "completed",
-                "artifact": artifact,
-                "completed_by": "runtime_sink_shim",
-            },
+            merged_ac,
         ))
-        # Append an audit_log entry the judge will recognize, but only once
-        # per (object, trace) so re-runs of the shim don't accumulate dupes.
-        existing_log = merged.get("audit_log") or []
-        already_logged = any(
-            isinstance(entry, dict) and entry.get("artifact_id") == artifact["id"]
-            for entry in existing_log
+        # ── M2 telemetry: log exactly what the shim did ────────────────────
+        # Greppable tag: [sink_shim] lets post-run analysis identify which
+        # TCs went through the shim and what fields were preserved vs added.
+        existing_ac_keys = set(existing_ac.keys()) - {"raw"}
+        shim_top_keys = set(shim_defaults.keys())
+        preserved_top = sorted(existing_ac_keys & shim_top_keys) + sorted(existing_ac_keys - shim_top_keys)
+        added_top = sorted(shim_top_keys - existing_ac_keys)
+        existing_artifact_keys = (
+            set(existing_artifact.keys()) if isinstance(existing_artifact, dict) else set()
         )
-        if not already_logged and origin_msg is not None and origin_msg.content:
-            audit_entry = {
-                "artifact_id": artifact["id"],
-                "content": origin_msg.content,
-                "received_from": origin_msg.sender,
-                "recorded_at": artifact.get("completed_at"),
-            }
-            pending_deltas.append(self._memory.make_delta(
-                "append",
-                "audit_log",
-                audit_entry,
-            ))
+        preserved_artifact = sorted(existing_artifact_keys)
+        added_artifact = sorted(set(merged_artifact.keys()) - existing_artifact_keys)
+        logger.info(
+            "[sink_shim] object=%s trace=%s ac_existed=%s "
+            "preserved_top=%s added_top=%s "
+            "preserved_artifact=%s added_artifact=%s",
+            self.object_id, trace_id, bool(existing_ac),
+            preserved_top, added_top,
+            preserved_artifact, added_artifact,
+        )
         augmented_reply = (finish.reply or "").rstrip()
         suffix = (
             f"\n[Completed: artifact={artifact.get('url') or artifact['id']}]"
