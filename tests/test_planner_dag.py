@@ -144,15 +144,18 @@ class TestRenderActivePlanDagMode:
         assert _render_active_plan(None, mode="dag") == "(none)"
         assert _render_active_plan(None, mode="sequential") == "(none)"
 
-    def test_sequential_byte_compat_with_pre_dag_format(self):
-        """Regression guard: sequential mode rendering must equal what the
-        renderer produced before the mode parameter existed."""
+    def test_sequential_renders_with_next_marker(self):
+        """Sequential mode points at the first planned step deterministically
+        via a 'next:' header line and a '← NEXT' tag on the corresponding
+        step. The DAG mode 'ready:' line stays absent so the two modes remain
+        visually distinct."""
         plan = _plan_fanout()
         expected = textwrap.dedent("""\
             goal: fan out to two peers, then notify channel
             status: active
+            next: s1
             steps:
-              s1: tell → peer-a  status=planned
+              s1: tell → peer-a  status=planned  ← NEXT
                   description: "d1"
               s2: tell → peer-b  status=planned
                   description: "d2"

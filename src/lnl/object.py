@@ -1488,10 +1488,29 @@ class LLMObject:
                 key = trace_id or ""
                 self._tool_rounds_per_trace[key] = self._tool_rounds_per_trace.get(key, 0) + len(tcs)
             pool = self._get_tool_pool()
+            # Detect duplicate tc.id within the batch — the LLM should be
+            # giving each tool_call a unique id, but malformed outputs happen.
+            # Without unique ids, _capture_tool_result_on_step can't tell which
+            # call's result it is recording on plan.steps[i].result.
+            seen_tc_ids: set[str] = set()
             for tc in tcs:
+                if tc.id in seen_tc_ids:
+                    logger.warning(
+                        "Duplicate tool_call id %r in batch for %s; replies will "
+                        "still be uniquely correlated via dispatch_id, but step "
+                        "result capture may lose the earlier call's output.",
+                        tc.id, self.object_id,
+                    )
+                seen_tc_ids.add(tc.id)
                 tools_called.append(tc.tool)
                 dispatch_id = secrets.token_hex(2)  # 4-char suffix for unique call correlation
                 call_key = f"{tc.id}-{dispatch_id}"
+                # Mark the corresponding plan step as 'dispatched' so the plan
+                # render shows the tool is in flight (not 'planned', not 'done').
+                # The status transitions to 'done'/'failed' via
+                # _capture_tool_result_on_step when the REPLY arrives.
+                if tc.plan_step_index is not None:
+                    self.mark_step_dispatched(tc.plan_step_index, trace_id)
                 try:
                     pool.submit(self._execute_tool, tc, trace_id, dispatch_id)
                 except RuntimeError:

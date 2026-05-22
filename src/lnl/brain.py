@@ -385,10 +385,22 @@ def _render_active_plan(plan: Optional[Plan], mode: str = "sequential") -> str:
                 continue
             if all(d in done_ids for d in (s.depends_on or [])):
                 ready_ids.add(sid)
+    # Sequential-mode: deterministically point at the first 'planned' step
+    # (skipping anything already in 'dispatched' status — that step is
+    # currently in flight and the LLM should NOT pick it back up). The LLM
+    # should execute this one next; everything before it is done/dispatched.
+    next_planned_id: Optional[str] = None
+    if mode != "dag":
+        for i, s in enumerate(plan.steps):
+            if s.status == "planned" and s.kind != "final":
+                next_planned_id = s.id or f"s{i+1}"
+                break
     lines = [f"goal: {plan.goal}", f"status: {plan.status}"]
     if mode == "dag":
         ready_list = ", ".join(sorted(ready_ids, key=lambda x: (len(x), x))) if ready_ids else "(none)"
         lines.append(f"ready: [{ready_list}]")
+    else:
+        lines.append(f"next: {next_planned_id if next_planned_id else '(none — all steps done/dispatched)'}")
     lines.append("steps:")
     if not plan.steps:
         lines.append("  (empty)")
@@ -398,7 +410,8 @@ def _render_active_plan(plan: Optional[Plan], mode: str = "sequential") -> str:
         target = f" → {s.target}" if s.target else ""
         deps = f"  deps={s.depends_on}" if s.depends_on else ""
         ready_tag = "  READY" if (mode == "dag" and sid in ready_ids) else ""
-        lines.append(f"  {sid}: {s.kind}{target}  status={s.status}{deps}{ready_tag}")
+        next_tag = "  ← NEXT" if (mode != "dag" and sid == next_planned_id) else ""
+        lines.append(f"  {sid}: {s.kind}{target}  status={s.status}{deps}{ready_tag}{next_tag}")
         lines.append(f"      description: \"{s.description}\"")
         if s.kind == "wait" and s.wait_predicate:
             src = f" (source hint: {s.wait_source})" if s.wait_source else ""
