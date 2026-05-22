@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v24): async semantics cleanup — removed pending_tool_call_context "continuation" hack (tool REPLY is now a generic inbound message; results flow through plan.steps[i].result), capped async ReAct loop at 1 LLM call per turn
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v26): modifications now dispatch via rt.send_admin (ADMIN path) — domain-path modifications no longer change definitions
 
 from src.data.schema import (
     EvalSummary,
@@ -1053,7 +1053,12 @@ def _run_test_case_timeline(
 
             t0 = time.monotonic()
             results, timed_out = _run_with_timeout(
-                lambda it=item: rt.send(it.target, it.intent, sender=it.source),
+                # Modifications now route through the dedicated admin path so
+                # the LLM can actually patch the target's definition (role /
+                # behavior / peers / skills). DOMAIN messages no longer carry
+                # `updated_definition`, so a modification sent via rt.send
+                # would only update state — never the definition itself.
+                lambda it=item: rt.send_admin(it.target, it.intent, sender=it.source),
                 timeout_s,
             )
             latency_ms = (time.monotonic() - t0) * 1000
