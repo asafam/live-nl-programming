@@ -296,7 +296,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v17): preserve openclaw.json in _clean_pool_worker_dirs so token-mismatch restarts don't fire on every run
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v19): companion bump for analyze_results / plot_mod_types defensive event-level infra_error filtering (no behavior change in evaluate_baseline.py — already filtered via and not e.infra_error)
 
 # ── Infrastructure failure detection ─────────────────────────────────────────
 
@@ -935,11 +935,23 @@ def _write_worker_config(
 
     # Write directly to the bind-mount — the gateway's file watcher
     # detects the change and applies an in-process hot-reload.
-    config_file.write_text(json.dumps(config, indent=2) + "\n")
+    # Skip the write when content is unchanged: writing identical bytes still
+    # updates mtime, which triggers a spurious hot-reload and drops connections.
+    new_content = json.dumps(config, indent=2) + "\n"
+    if config_file.exists():
+        try:
+            if config_file.read_text() == new_content:
+                n = len(registered_ids)
+                if verbose:
+                    print(f"  [{worker.name}] Config unchanged ({n} agents), skipping write.", flush=True)
+                return n, False  # type: ignore[return-value]
+        except Exception:
+            pass
+    config_file.write_text(new_content)
     n = len(registered_ids)
     if verbose:
         print(f"  [{worker.name}] Config written ({n} agents).", flush=True)
-    return n
+    return n, True  # type: ignore[return-value]
 
 
 def _preregister_agents_on_workers(
@@ -977,7 +989,7 @@ def _preregister_agents_on_workers(
         for clob in w.data_dir.glob("openclaw.json.clobbered.*"):
             clob.unlink(missing_ok=True)
 
-        _write_worker_config(w, all_object_ids, provider, model, single_agent_id)
+        _write_worker_config(w, all_object_ids, provider, model, single_agent_id)  # type: ignore[misc]
 
         # Wait for this worker's gateway to complete its hot-reload (HTTP + WS
         # stable for 3s) before writing the next worker.  Prevents the
@@ -2460,16 +2472,17 @@ async def _run_all_tcs_concurrent(
                                 tc_agent_ids = {single_agent_id}
                             _model = getattr(args, "model", None) or "gpt-4o"
                             _provider = getattr(args, "provider", None) or infer_provider(_model)
-                            _write_worker_config(
+                            _, _config_changed = _write_worker_config(
                                 worker, tc_agent_ids, _provider, _model, single_agent_id,
                                 verbose=False, preserve_a2a_allow=True,
                             )
-                            await _wait_for_gateway_restart(
-                                slot_gateway_url, None,
-                                drop_timeout_s=15.0,
-                                ready_timeout_s=45.0,
-                                stable_for_s=5.0,
-                            )
+                            if _config_changed:
+                                await _wait_for_gateway_restart(
+                                    slot_gateway_url, None,
+                                    drop_timeout_s=15.0,
+                                    ready_timeout_s=45.0,
+                                    stable_for_s=5.0,
+                                )
                             # Delete BOOTSTRAP.md so the gateway doesn't run its
                             # onboarding flow (which overrides SOUL.md).
                             for _obj in tc.objects:
@@ -2724,9 +2737,25 @@ async def _run_all_tcs_concurrent(
     return new_tc_results
 
 
+# ── Pricing ──────────────────────────────────────────────────────────────────
+
+_MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "gpt-5.4-mini": (0.75, 1.5),
+    "gpt-5.4":      (2.5,  5.0),
+}
+
+
+def _compute_cost(in_tok: int, out_tok: int, model: str) -> Optional[float]:
+    prices = _MODEL_PRICES.get(model)
+    if prices is None:
+        return None
+    return in_tok / 1_000_000 * prices[0] + out_tok / 1_000_000 * prices[1]
+
+
 # ── Main runner ──────────────────────────────────────────────────────────────
 
-def _print_summary(summary, output_path: Optional[Path] = None, elapsed_s: Optional[float] = None) -> None:
+def _print_summary(summary, output_path: Optional[Path] = None, elapsed_s: Optional[float] = None,
+                   agent_model: str = None, judge_model: str = None) -> None:
     """Print a human-readable summary of evaluation results."""
     def _fmt(v):
         return f"{v:.4f}" if v is not None else "N/A"
@@ -2770,6 +2799,14 @@ def _print_summary(summary, output_path: Optional[Path] = None, elapsed_s: Optio
           f"  (mean/event: {summary.mean_event_input_tokens:.0f} in / {summary.mean_event_output_tokens:.0f} out)")
     print(f"Judge tokens:        {summary.total_judge_input_tokens:,} in / {summary.total_judge_output_tokens:,} out"
           f"  (mean/event: {summary.total_judge_input_tokens/n_events:.0f} in / {summary.total_judge_output_tokens/n_events:.0f} out)")
+    agent_cost = _compute_cost(summary.total_agent_input_tokens, summary.total_agent_output_tokens, agent_model or "")
+    judge_cost = _compute_cost(summary.total_judge_input_tokens, summary.total_judge_output_tokens, judge_model or "")
+    if agent_cost is not None or judge_cost is not None:
+        agent_str = f"${agent_cost:.2f}" if agent_cost is not None else "unknown model"
+        judge_str = f"${judge_cost:.2f}" if judge_cost is not None else "unknown model"
+        total = (agent_cost or 0) + (judge_cost or 0)
+        print(f"Cost:                ${total:.2f} total  "
+              f"(agent: {agent_str}  judge: {judge_str})")
 
 
 def _warn_continuation_mismatch(output_path: Path, args: argparse.Namespace) -> None:
@@ -3331,7 +3368,8 @@ def run(args: argparse.Namespace) -> Path:
         mock_server.stop()
 
     print()
-    _print_summary(summary, output_path=args.output, elapsed_s=time.monotonic() - eval_start)
+    _print_summary(summary, output_path=args.output, elapsed_s=time.monotonic() - eval_start,
+                   agent_model=args.model, judge_model=getattr(args, "judge_model", None))
 
     # Report non-behavioral failures that are excluded from the pass-rate above.
     # These are NOT re-run automatically — re-run the script to retry them.
