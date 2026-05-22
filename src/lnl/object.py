@@ -1084,6 +1084,18 @@ class LLMObject:
                 feedback
                 or any(isinstance(c, dict) and c.get("status") == "FAIL" for c in criteria)
             )
+            if not actionable_fail and verdict == "FAIL":
+                # Evaluator returned FAIL but provided no failing criteria and no
+                # feedback (e.g. plan had only reason steps while the goal required
+                # a tool call or outgoing message). Synthesize a generic prompt so
+                # the retry fires and the executor gets a chance to perform the
+                # missing action.
+                actionable_fail = True
+                feedback = (
+                    "The overall goal was not fully achieved. "
+                    "Review the active plan and ensure all required actions — "
+                    "including any tool calls or outgoing messages — have been completed."
+                )
             if not actionable_fail:
                 # Close reason steps — they have no outgoing messages to
                 # auto-close them; evaluator PASS is the completion signal.
