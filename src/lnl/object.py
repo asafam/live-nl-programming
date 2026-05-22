@@ -239,42 +239,64 @@ class LLMObject:
         path as peer replies: a MessageType.REPLY with sender="__tool__:<name>"
         is delivered to the mailbox, decrementing _pending_tool_count so
         read() eventually unblocks and processes the result.
+
+        The whole body is wrapped in try/finally: under all exit paths the
+        worker delivers a REPLY (synthesizing an error one if it must) so
+        _pending_tool_count is always decremented. Without this guarantee,
+        an exception raised before deliver() leaves the count permanently
+        positive and read() blocks forever — the deadlock pathway we saw
+        in async eval timeouts (form-pipedrive E002, 2026-05-22).
         """
-        ctx = self._tool_context_factory(self) if self._tool_context_factory else {}
-        try:
-            result = self._tool_registry.execute(tc, ctx)
-        except Exception as exc:
-            result = ToolResult(
-                id=tc.id, output="", error=f"Tool execution raised: {exc}",
-            )
-
-        if tc.plan_step_index is not None and trace_id is not None:
-            try:
-                self._capture_tool_result_on_step(
-                    trace_id, tc.plan_step_index, result,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to capture tool result on plan step for %s", self.object_id,
-                )
-
-        # Deliver result as a REPLY message to our own mailbox.
         call_key = f"{tc.id}-{dispatch_id}" if dispatch_id else tc.id
-        reply_msg = Message(
-            sender=f"__tool__:{tc.tool}",
-            recipient=self.object_id,
-            type=MessageType.REPLY,
-            content=result.output if not result.error else result.error,
-            status="failed" if result.error else "ok",
-            error=result.error or None,
-            trace_id=trace_id,
-            plan_step_index=tc.plan_step_index,
-            depth_remaining=0,
-            id=f"tool-reply-{call_key}",
-            in_reply_to=call_key,
-            reference=tc.id,  # original LLM-assigned tool call ID for conversation reconstruction
-        )
-        self.deliver(reply_msg, decrement_pending=True)
+        result: ToolResult | None = None
+        try:
+            ctx = self._tool_context_factory(self) if self._tool_context_factory else {}
+            try:
+                result = self._tool_registry.execute(tc, ctx)
+            except Exception as exc:
+                result = ToolResult(
+                    id=tc.id, output="", error=f"Tool execution raised: {exc}",
+                )
+
+            if tc.plan_step_index is not None and trace_id is not None:
+                try:
+                    self._capture_tool_result_on_step(
+                        trace_id, tc.plan_step_index, result,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to capture tool result on plan step for %s", self.object_id,
+                    )
+        except Exception as exc:
+            logger.exception(
+                "Tool worker for %s.%s crashed before result was captured",
+                self.object_id, tc.tool,
+            )
+            if result is None:
+                result = ToolResult(
+                    id=tc.id, output="", error=f"Tool worker crashed: {exc}",
+                )
+        finally:
+            if result is None:
+                result = ToolResult(
+                    id=tc.id, output="",
+                    error="Tool worker exited without producing a result.",
+                )
+            reply_msg = Message(
+                sender=f"__tool__:{tc.tool}",
+                recipient=self.object_id,
+                type=MessageType.REPLY,
+                content=result.output if not result.error else result.error,
+                status="failed" if result.error else "ok",
+                error=result.error or None,
+                trace_id=trace_id,
+                plan_step_index=tc.plan_step_index,
+                depth_remaining=0,
+                id=f"tool-reply-{call_key}",
+                in_reply_to=call_key,
+                reference=tc.id,  # original LLM-assigned tool call ID for conversation reconstruction
+            )
+            self.deliver(reply_msg, decrement_pending=True)
         return result
 
     def _get_repl_namespace(self) -> dict:
@@ -928,13 +950,17 @@ class LLMObject:
             # We must REPLACE messages[-2] when it is already an assistant message
             # ("Understood." from history compression) to avoid two consecutive
             # assistant turns, which LLM providers reject or mishandle.
+            #
+            # The context is preserved (NOT cleared after read) so every REPLY
+            # in a multi-tool batch sees the same assistant(tool_call) preamble.
+            # The context is naturally replaced when a new tool batch dispatches
+            # (line ~1428) and dropped when the plan retires.
             if _plan is not None and _plan.pending_tool_call_context:
                 tool_call_msg = {"role": "assistant", "content": _plan.pending_tool_call_context}
                 if len(messages) >= 3 and messages[-2].get("role") == "assistant":
                     messages[-2] = tool_call_msg
                 else:
                     messages.insert(-1, tool_call_msg)
-                _plan.pending_tool_call_context = None  # consumed
         else:
             effective_sender = message.sender
             effective_msg_id = message.id

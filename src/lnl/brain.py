@@ -750,6 +750,32 @@ def build_system_prompt(
     return result
 
 
+def _is_tool_reply(msg: Message) -> bool:
+    return (
+        msg.type == MessageType.REPLY
+        and isinstance(msg.sender, str)
+        and msg.sender.startswith("__tool__:")
+    )
+
+
+def _render_tool_reply(msg: Message) -> str:
+    """Render an async tool REPLY using the same framing sync mode produces
+    inline in the ReAct loop: '[Tool result (call X) from Y] (status=ok|failed): <content>'.
+
+    Sync builds this string directly in object._run_react_cycle and appends it
+    as the next user message. Async wraps the same content in a Message and
+    routes it via the mailbox; without this special-cased render the prompt
+    would prefix it with '[system time:...] [msg-id:...] [in-reply-to:...]'
+    making it visually identical to a peer reply — which empirically caused
+    the LLM to misread tool results as peer chatter.
+    """
+    tool_name = msg.sender[len("__tool__:"):]
+    call_id = msg.reference or ""
+    id_part = f" (call {call_id})" if call_id else ""
+    status_str = "failed" if (msg.status == "failed" or msg.error) else "ok"
+    return f"[Tool result{id_part} from {tool_name}] (status={status_str}): {msg.content}"
+
+
 def _build_chat_messages(
     sys_prompt: str,
     history: Sequence[Message],
@@ -762,13 +788,21 @@ def _build_chat_messages(
     """
     msgs: list[dict[str, str]] = [{"role": "system", "content": sys_prompt}]
     if history:
-        history_lines = [f"  [{_message_label(msg)}]: {msg.content}" for msg in history]
+        history_lines: list[str] = []
+        for msg in history:
+            if _is_tool_reply(msg):
+                history_lines.append(f"  {_render_tool_reply(msg)}")
+            else:
+                history_lines.append(f"  [{_message_label(msg)}]: {msg.content}")
         msgs.append({"role": "user", "content": "[Past messages — already reflected in your state]\n" + "\n".join(history_lines)})
         msgs.append({"role": "assistant", "content": "Understood. What is the new message?"})
-    ts = message.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
-    id_tag = f" [msg-id: {message.id}]" if message.id else ""
-    reply_tag = f" [in-reply-to: {message.in_reply_to}]" if message.in_reply_to else ""
-    msgs.append({"role": "user", "content": f"[system time: {ts}]{id_tag}{reply_tag} [{_message_label(message)}]: {message.content}"})
+    if _is_tool_reply(message):
+        msgs.append({"role": "user", "content": _render_tool_reply(message)})
+    else:
+        ts = message.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        id_tag = f" [msg-id: {message.id}]" if message.id else ""
+        reply_tag = f" [in-reply-to: {message.in_reply_to}]" if message.in_reply_to else ""
+        msgs.append({"role": "user", "content": f"[system time: {ts}]{id_tag}{reply_tag} [{_message_label(message)}]: {message.content}"})
     return msgs
 
 
