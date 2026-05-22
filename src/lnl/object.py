@@ -73,7 +73,7 @@ class LLMObject:
         planner_brain: "Optional[LLMBrain]" = None,
         evaluator_brain: "Optional[LLMBrain]" = None,
         planner_prompt_file: str = "planner_sequential.yaml",
-        planner_mode: str = "sequential",
+        planner_mode: str = "dag",
         enable_replan_checkpoints: bool = False,
         replan_max_per_trace: int = 3,
         log_synthetic_message: "Optional[Callable[[Message], None]]" = None,
@@ -138,12 +138,12 @@ class LLMObject:
         self._evaluator_max_cycles = evaluator_max_cycles_per_trace
         self._evaluator_brain = evaluator_brain or brain
         self._planner_prompt_file = planner_prompt_file
-        # "sequential" — executor handles one step per turn (default).
-        # "dag" — active_plan rendering surfaces the ready set so the executor
-        # fans out independent steps in a single turn.
-        self._planner_mode = (planner_mode or "sequential").lower()
+        # "dag" (default) — active_plan rendering surfaces the ready set so
+        # the executor fans out independent steps in a single turn.
+        # "sequential" — executor handles one step per turn.
+        self._planner_mode = (planner_mode or "dag").lower()
         if self._planner_mode not in ("sequential", "dag"):
-            self._planner_mode = "sequential"
+            self._planner_mode = "dag"
         # Replan checkpoints: when enabled, planner may emit `kind=replan` steps
         # that hand control back to the planner mid-cascade once deps land.
         self._enable_replan_checkpoints = bool(enable_replan_checkpoints)

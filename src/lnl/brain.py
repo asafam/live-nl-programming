@@ -878,7 +878,7 @@ def build_system_prompt(
     heartbeat_interval_seconds: float = 30.0,
     active_plan: Optional["Plan"] = None,  # type: ignore[name-defined]
     prompt_file: str = "object.yaml",
-    planner_mode: str = "sequential",
+    planner_mode: str = "dag",
 ) -> str:
     """Build the system prompt from the YAML template and an ObjectDefinition."""
     config = _load_prompt_config(prompt_file)

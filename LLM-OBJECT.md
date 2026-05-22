@@ -173,19 +173,19 @@ Plan retirement: plans idle for `stale_plan_seconds` (default 180s) move to `"ab
 
 Configured by `SystemConfig.planner_mode` (also `--planner-mode` CLI on `evaluate.py`).
 
-### Sequential (default)
+### DAG (default)
 
-The planner prompt (`planner_sequential.yaml`) instructs: *"another component will execute the plan one step per turn"*. Even when behaviors say "send to A and B simultaneously," the planner emits two separate steps for the executor to walk one at a time. The executor's `active_plan` rendering lists all steps but does not flag readiness.
-
-Best for: chained workflows where step N consumes step N-1's reply; reproducibility against historical runs; conservative latency budgets.
-
-### DAG (opt-in)
-
-The planner prompt (`planner_dag.yaml`) instructs: *"design your plan as a DAG, not a sequence — independent steps will be dispatched IN PARALLEL in the same turn"*. The same `PlanStep` schema is used (no code changes!) but the planner authors `depends_on` deliberately: only when sN's payload literally embeds sM's result.
+The planner prompt (`planner_dag.yaml`) instructs: *"design your plan as a DAG, not a sequence — independent steps will be dispatched IN PARALLEL in the same turn"*. The planner authors `depends_on` deliberately: only when sN's payload literally embeds sM's result.
 
 The executor's `active_plan` rendering gets a `ready: [s1, s2, ...]` header listing every step whose `depends_on` is empty or fully satisfied, and tags those steps `READY` inline. A DAG-mode addendum is injected into the executor prompt instructing: *"if `ready:` lists N dispatch steps, your finish MUST produce N entries across `outgoing_messages` and `tool_calls` combined"*.
 
-Best for: fan-out heavy workflows (multi-peer notifications, parallel writes); reducing wall-clock latency by 1 LLM turn per parallel branch.
+Best for: default; fan-out workflows (multi-peer notifications, parallel writes); reduces wall-clock latency by 1 LLM turn per parallel branch.
+
+### Sequential (opt-in)
+
+The planner prompt (`planner_sequential.yaml`) instructs: *"another component will execute the plan one step per turn"*. Even when behaviors say "send to A and B simultaneously," the planner emits two separate steps for the executor to walk one at a time. The executor's `active_plan` rendering lists all steps but does not flag readiness.
+
+Best for: bit-for-bit reproducibility against pre-2026-05 historical runs; pure chains where every step consumes step N-1's reply.
 
 The schema, runtime correlation (`_correlate_outgoing`), and plan auto-close logic already accommodate multiple ready steps per turn — the change is purely on the prompt side plus a config toggle.
 
@@ -442,7 +442,7 @@ Live mode is what enables heartbeats and event-source polling. `evaluate.py` doe
 | `max_active_plans_per_object` | `32` | Cardinality cap; oldest force-retired |
 | `memory_backend` | `"nested"` | `"nested"` or `"flat"` |
 | `tool_dispatch` | `"async"` | `"async"` or `"sync"` |
-| `planner_mode` | `"sequential"` | `"sequential"` or `"dag"` |
+| `planner_mode` | `"dag"` | `"dag"` (default) or `"sequential"` |
 
 CLI flags on `evaluate.py` map to these (e.g., `--memory`, `--tool-dispatch`, `--planner-mode`, `--max-tool-rounds`, `--enable-planner` / `--no-enable-planner`, `--enable-evaluator` / `--no-enable-evaluator`, `--sink-shim` / `--no-sink-shim`).
 

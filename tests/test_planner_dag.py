@@ -59,17 +59,17 @@ def _plan_fanout():
 
 
 class TestSystemConfigLoad:
-    def test_default_is_sequential(self, tmp_path: Path):
+    def test_default_is_dag(self, tmp_path: Path):
         cfg_path = tmp_path / "system.yaml"
         cfg_path.write_text("heartbeat:\n  enabled: false\n")
         cfg = SystemConfig.load(cfg_path)
-        assert cfg.planner_mode == "sequential"
-
-    def test_dag_value_parsed(self, tmp_path: Path):
-        cfg_path = tmp_path / "system.yaml"
-        cfg_path.write_text("planner_mode: dag\n")
-        cfg = SystemConfig.load(cfg_path)
         assert cfg.planner_mode == "dag"
+
+    def test_sequential_value_parsed(self, tmp_path: Path):
+        cfg_path = tmp_path / "system.yaml"
+        cfg_path.write_text("planner_mode: sequential\n")
+        cfg = SystemConfig.load(cfg_path)
+        assert cfg.planner_mode == "sequential"
 
     def test_uppercase_dag_normalized(self, tmp_path: Path):
         cfg_path = tmp_path / "system.yaml"
@@ -77,15 +77,15 @@ class TestSystemConfigLoad:
         cfg = SystemConfig.load(cfg_path)
         assert cfg.planner_mode == "dag"
 
-    def test_unknown_value_falls_back_to_sequential(self, tmp_path: Path):
+    def test_unknown_value_falls_back_to_default(self, tmp_path: Path):
         cfg_path = tmp_path / "system.yaml"
         cfg_path.write_text("planner_mode: parallel-explicit\n")
         cfg = SystemConfig.load(cfg_path)
-        assert cfg.planner_mode == "sequential"
+        assert cfg.planner_mode == "dag"
 
     def test_missing_file_returns_default(self, tmp_path: Path):
         cfg = SystemConfig.load(tmp_path / "does-not-exist.yaml")
-        assert cfg.planner_mode == "sequential"
+        assert cfg.planner_mode == "dag"
 
 
 # ── _render_active_plan ready-set annotation ────────────────────────────────
@@ -223,30 +223,31 @@ class TestExecutorPromptModeNote:
 
 
 class TestRuntimeDagWiring:
-    def test_default_runtime_uses_sequential_planner_prompt(self):
+    def test_default_runtime_uses_dag_planner_prompt(self):
         rt = Runtime(MockBrain())
-        assert rt._planner_mode == "sequential"
-        assert rt._planner_prompt_file == "planner_sequential.yaml"
-
-    def test_dag_systemconfig_selects_dag_prompt(self):
-        cfg = SystemConfig(planner_mode="dag")
-        rt = Runtime(MockBrain(), system_config=cfg)
         assert rt._planner_mode == "dag"
         assert rt._planner_prompt_file == "planner_dag.yaml"
+
+    def test_sequential_systemconfig_selects_sequential_prompt(self):
+        cfg = SystemConfig(planner_mode="sequential")
+        rt = Runtime(MockBrain(), system_config=cfg)
+        assert rt._planner_mode == "sequential"
+        assert rt._planner_prompt_file == "planner_sequential.yaml"
 
     def test_set_planner_mode_api_updates_prompt_file(self):
         rt = Runtime(MockBrain())
-        rt.set_planner_mode("dag")
-        assert rt._planner_mode == "dag"
-        assert rt._planner_prompt_file == "planner_dag.yaml"
         rt.set_planner_mode("sequential")
         assert rt._planner_mode == "sequential"
         assert rt._planner_prompt_file == "planner_sequential.yaml"
+        rt.set_planner_mode("dag")
+        assert rt._planner_mode == "dag"
+        assert rt._planner_prompt_file == "planner_dag.yaml"
 
     def test_set_planner_mode_unknown_value_falls_back(self):
         rt = Runtime(MockBrain())
         rt.set_planner_mode("speculative")
-        assert rt._planner_mode == "sequential"
+        # Unknown values fall back to the default mode (dag).
+        assert rt._planner_mode == "dag"
 
     def test_object_inherits_mode_from_runtime(self):
         cfg = SystemConfig(planner_mode="dag")

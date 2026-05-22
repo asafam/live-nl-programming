@@ -107,22 +107,22 @@ Output: `test_cases_eval.jsonl` (next to input file)
 
 #### Planner mode (`--planner-mode`)
 
-LNL-objects use a pre-execution **planner** (separate LLM call) that produces an `active_plan` the executor walks through. By default the planner emits a step-by-step plan that the executor dispatches **one step per turn**. With `--planner-mode dag`, the planner instead emits a **dependency graph** and the executor fans out every step whose `depends_on` is satisfied in a single turn — concurrent peer dispatches and tool calls go out together.
+LNL-objects use a pre-execution **planner** (separate LLM call) that produces an `active_plan` the executor walks through. By default the planner emits a **dependency graph** (DAG) and the executor fans out every step whose `depends_on` is satisfied in a single turn — concurrent peer dispatches and tool calls go out together. Pass `--planner-mode sequential` to revert to the old step-by-step behavior (one step per turn).
 
 | Value | Planner prompt | Dispatch | When to use |
 |---|---|---|---|
-| `sequential` (default) | `planner_sequential.yaml` | One step per executor turn | Default; lowest risk for chained workflows; bit-for-bit reproducible with historical runs |
-| `dag` | `planner_dag.yaml` | All ready steps in one turn (fan-out across peers, tools, asks) | Speed up workflows that notify/write to multiple independent peers; reduces wall-clock by 1 LLM turn per parallel branch |
+| `dag` (default) | `planner_dag.yaml` | All ready steps in one turn (fan-out across peers, tools, asks) | Default; speeds up workflows that notify/write to multiple independent peers; saves 1 LLM turn per parallel branch |
+| `sequential` | `planner_sequential.yaml` | One step per executor turn | Bit-for-bit reproducible with pre-2026-05 historical runs; safer for pure chains |
 
 ```bash
-# Default sequential
+# Default — DAG mode
 python -m src.data.evaluate -i test_cases.jsonl --model gpt-4o
 
-# DAG mode — parallel fan-out
-python -m src.data.evaluate -i test_cases.jsonl --model gpt-4o --planner-mode dag
+# Sequential mode — historical behavior
+python -m src.data.evaluate -i test_cases.jsonl --model gpt-4o --planner-mode sequential
 ```
 
-The mode also switches the executor prompt's `active_plan` rendering: DAG mode surfaces a `ready: [s1, s2, ...]` header listing every step whose dependencies are satisfied, and tags those steps `READY` inline. Sequential mode renders unchanged. See [LLM-OBJECT.md](LLM-OBJECT.md#5-planner-modes-sequential-vs-dag) for the full design.
+The mode also switches the executor prompt's `active_plan` rendering: DAG mode surfaces a `ready: [s1, s2, ...]` header listing every step whose dependencies are satisfied, and tags those steps `READY` inline. Sequential mode renders unchanged from the historical format. See [LLM-OBJECT.md](LLM-OBJECT.md#5-planner-modes-sequential-vs-dag) for the full design.
 
 `--planner-prompt` still wins if explicitly passed (otherwise auto-derived from the mode). The run banner shows both `Planner mode` and the resolved `Planner prompt` so you can confirm what loaded.
 
@@ -316,7 +316,7 @@ python -m src.data.evaluate_baseline -i test_cases.jsonl --model gpt-4o --multi-
 
 Without `--mock-server` the agent can only narrate actions ("I would send a Slack message…") — there's no real feedback loop. With it:
 
-**Outbound (agent → external system):** The `lnl-mock-external` plugin registers 12 tools (`slack_send_message`, `email_send`, `jira_create_issue`, etc.) with the OpenClaw daemon. When the agent calls one, the plugin forwards it to a local MockServer (FastAPI, `localhost:18888`), which returns a scripted response. The call is logged.
+**Outbound (agent → external system):** The `lnl-mock-external` plugin registers 12 tools (`slack_send_message`, `email_send`, `jira_create_issue`, etc.) with the OpenClaw daemon. When the agent calls one, the plugin forwards it to a MockServer (FastAPI), which returns a scripted response. The call is logged. In local mode the server runs on `localhost:18888`; Docker workers use `localhost:19888+` (single) or `localhost:20888+` (multi).
 
 **Inbound (external system → agent):** After each tool call, the MockServer can fire a callback into the live session via OpenClaw's `/hooks/wake` endpoint (e.g., a Slack delivery confirmation a few seconds later).
 
@@ -334,7 +334,13 @@ cd plugins/openclaw-mock-external && npm run build
 
 ### Parallel evaluation with Docker
 
-Run multiple evaluations simultaneously without OpenClaw label collisions by using the Docker worker pool. Each container bundles an isolated OpenClaw gateway and mock server. Workers use host ports `19789`/`19888` (and up) so they don't collide with a locally-running OpenClaw instance on the default `18789`/`18888` ports — both can run at the same time.
+Run multiple evaluations simultaneously without OpenClaw label collisions by using the Docker worker pool. Two named worker types — `single-agent` and `multi-agent` — each have their own isolated port range, so both can run in parallel alongside a local evaluation:
+
+| Zone | Gateway ports | Mock ports |
+|---|---|---|
+| Local LNL (reserved) | `18789` | `18888` |
+| `single-worker-1..24` | `19789`–`19812` | `19888`–`19911` |
+| `multi-worker-1..24` | `20789`–`20812` | `20888`–`20911` |
 
 **1. Build the image** (one time, from repo root):
 ```bash
@@ -343,29 +349,30 @@ docker build -f docker/Dockerfile -t lnl-openclaw-worker .
 
 **2. Start the pool** using the provided script (reads your local OpenClaw operator token automatically):
 ```bash
-./docker/start-pool.sh
+./docker/start-pool.sh --type single --workers 8   # single-agent pool
+./docker/start-pool.sh --type multi  --workers 8   # multi-agent pool (can start simultaneously)
 ```
 
 **3. Run the evaluation with `--pool`** — dispatches all TCs across the worker pool automatically:
 ```bash
+# Single-agent
 python -m src.data.evaluate_baseline \
   -i outputs/.../test_cases.jsonl \
-  --pool docker/worker-pool.yaml \
-  --model gpt-4o \
-  --runs 3
+  --pool docker/worker-pool-single-8.yaml \
+  --single-agent --model gpt-4o --runs 3
+
+# Multi-agent
+python -m src.data.evaluate_baseline \
+  -i outputs/.../test_cases.jsonl \
+  --pool docker/worker-pool-multi-8.yaml \
+  --model gpt-4o --runs 3
 ```
 
-`--pool` reads `docker/worker-pool.yaml`, distributes test cases dynamically across all workers (work-queue style), and writes a single merged output file. No `--mock-server-url` or `--gateway-url` flags needed — the pool YAML supplies them.
+`--pool` reads the YAML, distributes test cases dynamically across all workers (work-queue style), and writes a single merged output file. No `--mock-server-url` or `--gateway-url` flags needed — the pool YAML supplies them.
 
-The pool can run alongside a local evaluation without port conflicts:
-```bash
-# Both can run simultaneously
-python -m src.data.evaluate_baseline -i test_cases.jsonl --model gpt-4o --runs 1 &
-python -m src.data.evaluate_baseline -i test_cases.jsonl --pool docker/worker-pool.yaml --model gpt-4o --runs 1 &
-wait
-```
+Pre-built pool YAMLs exist for sizes 2, 4, 8, 16, and 24 for both types (`worker-pool-single-N.yaml`, `worker-pool-multi-N.yaml`).
 
-See [`docker/README.md`](docker/README.md) for full setup details: bind-mount mechanics, plugin placement, session isolation, port assignments, and instructions for enabling more workers.
+See [`docker/README.md`](docker/README.md) for full setup details: bind-mount mechanics, plugin placement, session isolation, and port assignments.
 
 ## CLI Flags
 
@@ -387,8 +394,8 @@ See [`docker/README.md`](docker/README.md) for full setup details: bind-mount me
 | `--tc` | Specific test cases by 1-based index or ID (overrides `--limit`) | Same |
 | `--steps-only` | Run only steps; skip modifications and events | N/A |
 | `--memory` | Memory backend: `nested` (default; Redux-style `{op,path,value}` actions on a nested JSON tree) or `flat` (legacy `{op,key,value}` top-level deltas). Picks the matching executor prompt. | N/A |
-| `--planner-mode` | Planner output shape: `sequential` (default; one step per executor turn) or `dag` (DAG with `depends_on`; ready steps fan out in one turn). Auto-selects `planner_dag.yaml` when set to `dag` (unless `--planner-prompt` is also passed). | N/A |
-| `--planner-prompt` | Override the planner system-prompt filename relative to `config/prompts/lnl/` (default: `planner_sequential.yaml`, or `planner_dag.yaml` when `--planner-mode=dag`). | N/A |
+| `--planner-mode` | Planner output shape: `dag` (default; DAG with `depends_on`; ready steps fan out in one turn) or `sequential` (one step per executor turn — historical reproducibility). Auto-selects `planner_dag.yaml` (or `planner_sequential.yaml`) unless `--planner-prompt` is also passed. | N/A |
+| `--planner-prompt` | Override the planner system-prompt filename relative to `config/prompts/lnl/` (default: auto-derived from `--planner-mode` — `planner_dag.yaml` for `dag`, `planner_sequential.yaml` for `sequential`). | N/A |
 | `--modifications N` | Limit to the first N modifications; events referencing later mods are skipped | Same |
 | `--concurrency N` | Fire N events concurrently per mod window (0 = sequential, default). Requires TCs with `concurrent_group` fields. | N/A |
 | `--reuse-steps` / `--no-reuse-steps` | Run steps once per sample; reuse state across variants (saves ~6× step cost). **Default: on.** | N/A |

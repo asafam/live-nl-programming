@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v27): add --enable-replan-checkpoints + --replan-max for planner re-entry on conditional branches
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v29): default --planner-mode flipped to 'dag' (sequential available via --planner-mode sequential for historical reproducibility)
 
 from src.data.schema import (
     EvalSummary,
@@ -400,8 +400,8 @@ def _execute_test_case_inner(
     mock_slot_id: str = "default",
     memory_backend: str = "nested",
     log_planner_output: bool = False,
-    tool_dispatch: str = "sync",
-    planner_mode: str = "sequential",
+    tool_dispatch: str = "async",
+    planner_mode: str = "dag",
     enable_replan_checkpoints: bool = False,
     replan_max_per_trace: int = 3,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
@@ -1148,8 +1148,8 @@ def execute_test_case(
     mock_slot_id: str = "default",
     memory_backend: str = "nested",
     log_planner_output: bool = False,
-    tool_dispatch: str = "sync",
-    planner_mode: str = "sequential",
+    tool_dispatch: str = "async",
+    planner_mode: str = "dag",
     enable_replan_checkpoints: bool = False,
     replan_max_per_trace: int = 3,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
@@ -1510,7 +1510,7 @@ def run(args: argparse.Namespace) -> Path:
         evaluator_label = f"{evaluator_provider}/{evaluator_model}"
     else:
         evaluator_label = "(disabled)"
-    planner_mode = getattr(args, "planner_mode", "sequential")
+    planner_mode = getattr(args, "planner_mode", "dag")
     planner_prompt_display = getattr(args, "planner_prompt", "planner_sequential.yaml")
     if planner_mode == "dag" and planner_prompt_display == "planner_sequential.yaml":
         # Mode auto-selects planner_dag.yaml unless --planner-prompt was explicit.
@@ -1786,8 +1786,8 @@ def run(args: argparse.Namespace) -> Path:
                 mock_server_url=mock_server_url,
                 mock_slot_id=f"tc{tc_idx}-r{run_idx}",
                 log_planner_output=(getattr(args, "verbose", None) == "DEBUG"),
-                tool_dispatch=getattr(args, "tool_dispatch", "sync"),
-                planner_mode=getattr(args, "planner_mode", "sequential"),
+                tool_dispatch=getattr(args, "tool_dispatch", "async"),
+                planner_mode=getattr(args, "planner_mode", "dag"),
                 enable_replan_checkpoints=getattr(args, "enable_replan_checkpoints", False),
                 replan_max_per_trace=getattr(args, "replan_max", 3),
             )
@@ -2509,12 +2509,13 @@ Examples:
     parser.add_argument(
         "--planner-mode",
         choices=["sequential", "dag"],
-        default="sequential",
+        default="dag",
         help=(
-            "Planner output shape (default: sequential). "
-            "'sequential' — planner emits steps the executor dispatches one per turn. "
+            "Planner output shape (default: dag). "
             "'dag' — planner emits a dependency graph; independent steps (empty "
             "depends_on or all deps done) fan out in a single executor turn. "
+            "'sequential' — planner emits steps the executor dispatches one per "
+            "turn (use for reproducibility against pre-2026-05 historical runs). "
             "Selects planner_dag.yaml automatically when set to 'dag' unless "
             "--planner-prompt is also passed explicitly."
         ),
@@ -2554,14 +2555,15 @@ Examples:
     parser.add_argument(
         "--tool-dispatch",
         choices=["async", "sync"],
-        default="sync",
+        default="async",
         help=(
-            "Tool dispatch mode (default: sync). "
+            "Tool dispatch mode (default: async). "
+            "'async' — tools submit to a per-object pool; the result arrives as a mailbox "
+            "REPLY processed in a new process_message turn (non-blocking actor semantics; "
+            "the object can service peer/heartbeat messages while a tool runs). "
             "'sync' — tools execute inline in the ReAct loop (single multi-turn LLM call); "
-            "the result is fed back as the next user message. Wins +23pt over async on the "
-            "Zapier multistep eval (2026-05-22). "
-            "'async' — tools submit to a per-object pool and the result arrives via mailbox "
-            "REPLY that resumes the conversation on a new process_message turn."
+            "the result is fed back as the next user message. Blocks the object thread "
+            "until all tools complete."
         ),
     )
     parser.add_argument(

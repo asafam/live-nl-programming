@@ -129,23 +129,22 @@ class SystemConfig:
     # "flat" reverts to the legacy {op, key, value} top-level deltas (kept for
     # A/B comparison and back-compat with pre-refactor runs).
     memory_backend: str = "nested"
-    # Tool dispatch mode: "sync" (default) — tools execute inline in the ReAct
-    # loop, result fed back immediately as the next user message; "async" —
-    # tools submit to the per-object pool and the result arrives as a mailbox
-    # REPLY that resumes the conversation on a new process_message turn.
-    # Sync is the default because the async mailbox-round-trip path empirically
-    # loses ~23pt of pass rate (Zapier multistep, 2026-05-22) — the continuation
-    # turn often loses track of the dispatched tool call, the planner produces
-    # over-condensed plans for tool sinks, and timeouts strike when no progress
-    # signal arrives.
-    tool_dispatch: str = "sync"
-    # Planner mode: "sequential" (default) — planner emits a step-by-step plan
-    # that the executor dispatches one step per turn. "dag" — planner emits a
-    # dependency graph; independent steps (empty depends_on or all deps done)
-    # are fanned out concurrently in a single executor turn. The choice selects
-    # the planner prompt file (planner_sequential.yaml vs planner_dag.yaml) and toggles
-    # ready-set annotation in the executor's active_plan rendering.
-    planner_mode: str = "sequential"
+    # Tool dispatch mode: "async" (default) — tools submit to the per-object
+    # pool and the result arrives as a mailbox REPLY processed in a new
+    # process_message turn (non-blocking actor semantics; the object can
+    # service peer/heartbeat messages while a tool runs). "sync" — tools
+    # execute inline in the ReAct loop, result fed back immediately as the
+    # next user message (single multi-turn LLM call; blocks the object
+    # thread until tools complete). Sync was a temporary default while we
+    # closed sync↔async behaviour gaps; async is the architectural default.
+    tool_dispatch: str = "async"
+    # Planner mode: "dag" (default) — planner emits a dependency graph and
+    # independent steps (empty depends_on or all deps done) fan out concurrently
+    # in a single executor turn. "sequential" — planner emits a step-by-step
+    # plan that the executor dispatches one step per turn. The choice selects
+    # the planner prompt file (planner_dag.yaml vs planner_sequential.yaml) and
+    # toggles ready-set annotation in the executor's active_plan rendering.
+    planner_mode: str = "dag"
     # Replan checkpoints: planner re-entry when a kind=replan step is reached.
     # When enabled, the planner may emit `replan` steps that suspend execution
     # until prior deps land, then re-invoke the planner with completed-step
@@ -168,8 +167,8 @@ class SystemConfig:
         hb = data.get("heartbeat", {})
         lim = data.get("limits", {})
         kg = data.get("knowledge_gaps", {})
-        planner_mode_raw = str(data.get("planner_mode", "sequential")).lower()
-        planner_mode = planner_mode_raw if planner_mode_raw in ("sequential", "dag") else "sequential"
+        planner_mode_raw = str(data.get("planner_mode", "dag")).lower()
+        planner_mode = planner_mode_raw if planner_mode_raw in ("sequential", "dag") else "dag"
         return SystemConfig(
             heartbeat_enabled=bool(hb.get("enabled", False)),
             heartbeat_interval_seconds=float(hb.get("interval_seconds", 30.0)),
@@ -348,10 +347,10 @@ class Runtime:
     def set_planner_mode(self, planner_mode: str) -> None:
         """Set the planner mode ('sequential' or 'dag'). Also resets the planner
         prompt file to the canonical filename for that mode. Must be called
-        before loading objects. Unknown values fall back to 'sequential'."""
-        mode = (planner_mode or "sequential").lower()
+        before loading objects. Unknown values fall back to 'dag' (the default)."""
+        mode = (planner_mode or "dag").lower()
         if mode not in ("sequential", "dag"):
-            mode = "sequential"
+            mode = "dag"
         self._planner_mode = mode
         self._planner_prompt_file = "planner_dag.yaml" if mode == "dag" else "planner_sequential.yaml"
 

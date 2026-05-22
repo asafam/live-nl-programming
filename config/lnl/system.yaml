@@ -23,14 +23,15 @@ knowledge_gaps:
 
 # Planner mode controls how the pre-execution planner shapes its output and
 # how the executor dispatches steps.
-#   sequential — planner emits steps that the executor handles one per turn.
-#                Safer for plans where every step depends on the prior step.
-#   dag        — planner emits a dependency graph; the executor fans out all
-#                ready steps (empty depends_on or all deps done) in a single
-#                turn. Faster when behaviors notify/write to multiple peers
-#                that don't consume each other's results.
+#   dag (default) — planner emits a dependency graph; the executor fans out
+#                   all ready steps (empty depends_on or all deps done) in a
+#                   single turn. Faster when behaviors notify/write to
+#                   multiple peers that don't consume each other's results.
+#   sequential    — planner emits steps that the executor handles one per
+#                   turn. Use for reproducibility against historical runs or
+#                   when plans are pure chains.
 # Only consulted when enable_planner is true.
-planner_mode: sequential
+planner_mode: dag
 
 # Replan checkpoints (default off). When true, the planner may emit
 # `kind: replan` steps that hand control back to the planner mid-cascade
