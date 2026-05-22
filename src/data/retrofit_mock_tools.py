@@ -112,7 +112,7 @@ def _identify_missing_tools(
         f"[{obj.object_id}] {obj.role}\n  behavior: {obj.behavior[:300]}"
         for obj in tc.objects
     )
-    steps_text = "\n".join(f"  - {s.text}" for s in tc.steps)
+    steps_text = "\n".join(f"  - {s}" for s in tc.steps)
     existing = (
         "\n".join(f"  - {t.tool_name}: {t.description}" for t in tc.tools)
         or "  (none)"
@@ -179,7 +179,7 @@ def run(args: argparse.Namespace) -> None:
                     tqdm.write(f"    [write] → {t['tool_name']}: {t.get('description', '')[:80]}")
             return sid, None
 
-        step_texts = [s.text for s in representative.steps if s.text]
+        step_texts = [s for s in representative.steps if s]
         tools: list[MockToolDef] = list(representative.tools)
         mocked = {t.tool_name for t in tools}
 
