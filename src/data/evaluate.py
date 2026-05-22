@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v17): companion bump for evaluate_baseline.py v21 — preserve extensions/ in _clean_pool_worker_dirs
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v18): companion bump for evaluate_baseline.py v22 — token snapshot fallback to totalTokens
 
 from src.data.schema import (
     EvalSummary,

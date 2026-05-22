@@ -298,7 +298,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v21): preserve extensions/ in _clean_pool_worker_dirs so lnl-mock-external survives gateway restart
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v22): fall back to totalTokens when inputTokens absent in session snapshot (running sessions)
 
 # ── Infrastructure failure detection ─────────────────────────────────────────
 
@@ -1298,6 +1298,21 @@ def _tool_call_matches(match: dict[str, str], args: dict) -> bool:
     return True
 
 
+def _session_tok(s: dict) -> tuple[int, int]:
+    """Extract (inputTokens, outputTokens) from a sessions.list entry.
+
+    Sessions still in "running" state only have totalTokens (no inputTokens/
+    outputTokens).  Fall back to totalTokens as an approximation so the delta
+    is non-zero rather than silently 0.
+    """
+    in_tok = s.get("inputTokens")
+    out_tok = s.get("outputTokens")
+    if in_tok is None:
+        in_tok = s.get("totalTokens", 0)
+        out_tok = 0
+    return (in_tok or 0, out_tok or 0)
+
+
 async def _snapshot_session_tokens(
     gateway: Any,
     session_keys: Optional[list[str]] = None,
@@ -1311,16 +1326,9 @@ async def _snapshot_session_tokens(
         result = await gateway.call("sessions.list", {})
         sessions = result.get("sessions", [])
         if session_keys is None:
-            return {
-                s.get("key", ""): (s.get("inputTokens", 0), s.get("outputTokens", 0))
-                for s in sessions
-            }
+            return {s.get("key", ""): _session_tok(s) for s in sessions}
         sess_map = {s.get("key", ""): s for s in sessions}
-        return {
-            k: (sess_map.get(k, {}).get("inputTokens", 0),
-                sess_map.get(k, {}).get("outputTokens", 0))
-            for k in session_keys
-        }
+        return {k: _session_tok(sess_map[k]) if k in sess_map else (0, 0) for k in session_keys}
     except Exception:
         return {}
 
