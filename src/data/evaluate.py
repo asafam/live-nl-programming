@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v23): async-path fixes — _execute_tool try/finally guarantees REPLY delivery, explicit Tool-result framing in chat messages, pending_tool_call_context preserved across batch replies
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v24): async semantics cleanup — removed pending_tool_call_context "continuation" hack (tool REPLY is now a generic inbound message; results flow through plan.steps[i].result), capped async ReAct loop at 1 LLM call per turn
 
 from src.data.schema import (
     EvalSummary,

@@ -830,15 +830,21 @@ class LLMObject:
         # Pre-execution planning (separate LLM call). Runs once per trace;
         # gated on DOMAIN message + no plan ever seen for this trace.
         # Subsequent internal self-correction cycles reuse the same plan.
+        # Exception: when an admin modification marked the active plan
+        # `needs_replan`, run the planner again against the new definition
+        # and replace plan.steps in place (state and accumulated_deltas are
+        # preserved).
         planner_metrics: Optional[InferenceMetrics] = None
+        existing_plan = self.plan_for(trace_id)
+        needs_replan = existing_plan is not None and existing_plan.needs_replan
         if (
             self._enable_planner
             and message.type == MessageType.DOMAIN
-            and self.plan_for(trace_id) is None
+            and (existing_plan is None or needs_replan)
         ):
             with self._planned_traces_lock:
                 already_planned = trace_id is not None and trace_id in self._planned_traces
-            if not already_planned:
+            if (not already_planned) or needs_replan:
                 try:
                     planner_prompt = build_planner_prompt(
                         self._definition, self._state, message,
@@ -857,13 +863,25 @@ class LLMObject:
                     # executor falls back to its own definition + behavior,
                     # which is the safer recovery path.
                     if plan.steps:
-                        plan.state = self._state  # snapshot master at plan creation
-                        with self._plans_lock:
+                        if needs_replan and existing_plan is not None:
+                            # Re-plan in place: keep plan-scoped state and
+                            # deltas, replace goal/steps/status with fresh
+                            # output from the planner.
+                            with self._plans_lock:
+                                existing_plan.goal = plan.goal
+                                existing_plan.steps = plan.steps
+                                existing_plan.status = "active"
+                                existing_plan.needs_replan = False
+                                existing_plan.last_progress_at = datetime.datetime.now(datetime.timezone.utc)
+                            plan = existing_plan
+                        else:
+                            plan.state = self._state  # snapshot master at plan creation
+                            with self._plans_lock:
+                                if trace_id is not None:
+                                    self._active_plans[trace_id] = plan
                             if trace_id is not None:
-                                self._active_plans[trace_id] = plan
-                        if trace_id is not None:
-                            with self._planned_traces_lock:
-                                self._planned_traces.add(trace_id)
+                                with self._planned_traces_lock:
+                                    self._planned_traces.add(trace_id)
                         logger.debug(
                             "  ◆ planner produced plan for %s: %d steps (goal=%s)",
                             self.object_id, len(plan.steps), plan.goal,
@@ -929,6 +947,11 @@ class LLMObject:
             and message.sender.startswith("__tool__:")
         )
         if is_tool_reply:
+            # Tool REPLYs are generic messages — no "continuation" semantics.
+            # The only special handling is RUNTIME routing context: if the LLM
+            # eventually finalizes after seeing the tool result, the reply needs
+            # to go back to the ORIGINAL sender that started this trace, not to
+            # __tool__:<name>. We carry that routing through plan.original_*.
             _plan = self.plan_for(trace_id)
             if _plan is not None and _plan.original_sender is not None:
                 effective_sender = _plan.original_sender
@@ -936,31 +959,12 @@ class LLMObject:
                 effective_msg_type = _plan.original_source_message_type or message.type
                 effective_depth = _plan.original_depth_remaining
                 effective_step_index = _plan.original_source_plan_step_index
-                # Don't consume original_sender here — a second async turn (LLM
-                # calls another tool in the continuation) needs it again. It is
-                # only cleared when tools are re-dispatched or the plan closes.
             else:
                 effective_sender = message.sender
                 effective_msg_id = message.id
                 effective_msg_type = message.type
                 effective_depth = message.depth_remaining
                 effective_step_index = message.plan_step_index
-            # Inject the LLM's prior tool_call step as an assistant message so
-            # the continuation sees its own action alongside the result.
-            # We must REPLACE messages[-2] when it is already an assistant message
-            # ("Understood." from history compression) to avoid two consecutive
-            # assistant turns, which LLM providers reject or mishandle.
-            #
-            # The context is preserved (NOT cleared after read) so every REPLY
-            # in a multi-tool batch sees the same assistant(tool_call) preamble.
-            # The context is naturally replaced when a new tool batch dispatches
-            # (line ~1428) and dropped when the plan retires.
-            if _plan is not None and _plan.pending_tool_call_context:
-                tool_call_msg = {"role": "assistant", "content": _plan.pending_tool_call_context}
-                if len(messages) >= 3 and messages[-2].get("role") == "assistant":
-                    messages[-2] = tool_call_msg
-                else:
-                    messages.insert(-1, tool_call_msg)
         else:
             effective_sender = message.sender
             effective_msg_id = message.id
@@ -1266,6 +1270,12 @@ class LLMObject:
         patch = finish.get("updated_definition") or None
         if isinstance(patch, dict) and patch:
             self._apply_definition_update(patch)
+            # Mark every in-flight plan as needing a re-plan against the new
+            # definition. The next inbound message on that trace re-plans
+            # before dispatching; plan state and deltas are preserved.
+            with self._plans_lock:
+                for plan in self._active_plans.values():
+                    plan.needs_replan = True
 
         self._history.append(message)
         if len(self._history) > self._max_history:
@@ -1323,6 +1333,13 @@ class LLMObject:
         tool_rounds = 0
         finish: Optional[ReactFinish] = None
         tools_called: list[str] = []
+        # In async mode the ReAct cycle is one-shot: a single LLM call either
+        # finishes (returns the finish) or dispatches tools (returns pending,
+        # exits the function). No internal looping — the next LLM call only
+        # happens when a tool REPLY arrives in the mailbox and a fresh
+        # process_message turn is invoked.
+        react_iterations = 0
+        async_mode = (self._tool_dispatch == "async")
 
         while True:
             # Cross-turn cap: check total dispatched tools for this trace.
@@ -1338,6 +1355,14 @@ class LLMObject:
                 finish = ReactFinish(reply="", updated_state=self._state)
                 break
 
+            if async_mode and react_iterations >= 1:
+                # Async: never loop. If the first LLM action didn't either
+                # finish or dispatch tools (e.g. empty tool_calls list,
+                # malformed action), force-finish empty so the caller commits
+                # and waits for the next inbound message.
+                finish = ReactFinish(reply="", updated_state=self._state)
+                break
+
             try:
                 step, m = self._brain.react_call(messages, object_id=self.object_id)
             except RuntimeError as exc:
@@ -1345,6 +1370,7 @@ class LLMObject:
                     raise RuntimeError(f"[executor] {exc}") from exc
                 raise
             metrics = _accumulate_metrics(metrics, m)
+            react_iterations += 1
 
             if step.action == "finish":
                 # Commitment — apply state/plan updates, return finish.
@@ -1365,7 +1391,9 @@ class LLMObject:
             tcs = step.tool_calls
             if not self._tool_registry or not tcs:
                 # No registry, or tool_call action with empty list — tell the
-                # LLM and re-run so it can finish properly.
+                # LLM and re-run so it can finish properly. (Sync only — async
+                # never re-enters this loop; the async_mode iteration cap above
+                # force-finishes on the next pass.)
                 messages.append({"role": "assistant", "content": json.dumps({
                     "thought": step.thought, "action": "tool_call",
                     "tool_calls": [{"id": t.id, "tool": t.tool, "arguments": t.arguments} for t in tcs],
@@ -1419,21 +1447,15 @@ class LLMObject:
             # Dispatch all tools in this batch to the per-object pool — async.
             # Each tool posts a REPLY back to our own mailbox when it finishes;
             # read() will unblock when all pending tool counts reach zero.
+            # Tool results are captured onto plan.steps[i].result via
+            # _capture_tool_result_on_step (called from _execute_tool) and
+            # surfaced to the LLM on subsequent turns through the rendered
+            # active_plan. There is no separate "continuation" conversation —
+            # the REPLY is processed as a regular inbound message.
             with self._lock:
                 self._pending_tool_count += len(tcs)
             if plan is not None:
                 plan.tool_rounds += len(tcs)
-                # Save the LLM's tool_call step as conversation context so the
-                # continuation call can see its own prior action alongside the
-                # tool results. Stored on the plan; consumed in process_message.
-                plan.pending_tool_call_context = json.dumps({
-                    "thought": step.thought or "",
-                    "action": "tool_call",
-                    "tool_calls": [
-                        {"id": t.id, "tool": t.tool, "arguments": t.arguments}
-                        for t in tcs
-                    ],
-                })
             else:
                 # Fallback cross-turn counter when no plan exists.
                 key = trace_id or ""
