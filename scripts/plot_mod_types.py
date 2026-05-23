@@ -489,11 +489,25 @@ _BIN_ORDER = ["3–4", "5", "6–8", "9+"]
 
 
 def compute_table_by_objects(path: Path, tc_objects: dict[str, int]) -> dict[str, dict]:
-    """Per object-count bin: aggregate Base/On-Mod/Off-Mod rates.
+    """Per object-count bin: aggregate Base/On-Mod/Off-Mod rates using
+    pass_strict semantics.
 
-    Returns {bin_label: {base_mean, base_std, on_mod_..., off_mod_..., n_tcs}}
-    Uses the same per-TC across-run std convention as compute_table_row.
-    Excludes infra+wiring failures.
+    Returns {bin_label: {base_mean, base_std, on_mod_..., off_mod_..., n_tcs}}.
+
+    pass_strict (different from compute_table_row's pass_clean default):
+      - Events flagged infra_error / classified as oc_eval / infra_provider
+        are COUNTED as failures rather than filtered out.
+      - Events with passed=None but with an infra signal are counted as
+        failures (judge didn't run because the system broke).
+      - Events with passed=None and no infra signal are still skipped
+        (no verdict at all = not measurable).
+      - TCs with error_type="infra" / "timeout" are NOT skipped wholesale —
+        any events they did record are counted, infra-flagged ones as fail.
+
+    Rationale: at low complexity infra errors are mostly random noise, but
+    at high complexity (9+ objects) they correlate with system capability
+    ceilings. Filtering them hides the breakdown; counting them as
+    failures keeps the curve honest end-to-end.
     """
     from collections import defaultdict
     # bin → tc_id → run_index → {role: [pass_bools]}
@@ -506,7 +520,8 @@ def compute_table_by_objects(path: Path, tc_objects: dict[str, int]) -> dict[str
             try: d = json.loads(line)
             except json.JSONDecodeError: continue
             if "tc_id" not in d: continue
-            if d.get("error_type") in ("infra", "timeout"): continue
+            # NOTE: do NOT skip TC-level error_type="infra"/"timeout" — let
+            # any events they did record contribute, with infra ones as fail.
 
             tc_id = d["tc_id"]
             n_obj = tc_objects.get(tc_id)
@@ -515,21 +530,28 @@ def compute_table_by_objects(path: Path, tc_objects: dict[str, int]) -> dict[str
             ri = d.get("run_index", 0)
 
             for e in (d.get("events") or []):
-                if e.get("passed") is None: continue
-                if e.get("infra_error"): continue  # LNL event-level infra flag
-                if _classify_event(e) in ("oc_eval", "infra_provider"): continue
+                # Apply pass_strict semantics:
+                #   - infra_error or oc_eval/infra_provider → fail
+                #   - passed=None + no infra signal → skip (no verdict)
+                #   - passed=None + infra signal → fail (broken before judge)
+                infra = e.get("infra_error") or _classify_event(e) in ("oc_eval", "infra_provider")
+                raw_passed = e.get("passed")
+                if raw_passed is None and not infra:
+                    continue
+                passed = False if infra else bool(raw_passed)
+
                 role = e.get("role")
                 if role is None:
-                    by_bin[b][tc_id][ri]["base"].append(e["passed"])
+                    by_bin[b][tc_id][ri]["base"].append(passed)
                 elif role == "pre_mod":
-                    by_bin[b][tc_id][ri]["pre_mod"].append(e["passed"])
+                    by_bin[b][tc_id][ri]["pre_mod"].append(passed)
                 elif role == "post_mod":
-                    by_bin[b][tc_id][ri]["on_mod"].append(e["passed"])
+                    by_bin[b][tc_id][ri]["on_mod"].append(passed)
                 elif role == "irrelevant":
-                    by_bin[b][tc_id][ri]["off_mod"].append(e["passed"])
+                    by_bin[b][tc_id][ri]["off_mod"].append(passed)
                 # mean: all non-step events regardless of role
                 if not re.match(r"^S\d+$", e.get("event_id", "")):
-                    by_bin[b][tc_id][ri]["mean"].append(e["passed"])
+                    by_bin[b][tc_id][ri]["mean"].append(passed)
 
     out: dict[str, dict] = {}
     for b, tcs in by_bin.items():

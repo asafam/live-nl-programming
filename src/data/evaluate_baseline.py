@@ -321,6 +321,10 @@ _INFRA_ERROR_PATTERNS: list[str] = [
     # Generic timeout strings from websockets (TimeoutError("timed out")) and
     # subprocess.TimeoutExpired ("Command '...' timed out after 60 seconds")
     "timed out",
+    # Azure / OpenAI provider 5xx — the LLM provider is the one failing, not the
+    # agent. Keep parity with _INFRA_PROVIDER_PATTERNS below so TC-level
+    # catch-all classification matches per-event classification.
+    "http 500", "http 503", "5xx", "internal server error", "service unavailable",
 ]
 
 def _classify_error_type(reasoning_texts: list[str]) -> Optional[str]:

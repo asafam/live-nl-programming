@@ -685,7 +685,12 @@ class Runtime:
             if f.exception():
                 exc = f.exception()
                 exc_str = str(exc).lower()
-                if "content filter" in exc_str or "finish_reason=length" in exc_str or "stop_reason=max_tokens" in exc_str:
+                _INFRA_EXC_MARKERS = (
+                    "content filter", "finish_reason=length", "stop_reason=max_tokens",
+                    # Azure / OpenAI provider 5xx — provider failure, not agent behavior.
+                    "http 500", "http 503", "5xx", "internal server error", "service unavailable",
+                )
+                if any(m in exc_str for m in _INFRA_EXC_MARKERS):
                     logger.warning("Error reading object %s: %s", _oid, exc)
                     with self._infra_errors_lock:
                         self._infra_errors.append((_oid, str(exc)))
