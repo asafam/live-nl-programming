@@ -392,23 +392,8 @@ class Workflow(BaseModel):
 
     @property
     def all_events(self) -> "list[Event]":
-        """Unified event list: base events (from events or synthesised from steps) + mod events."""
-        existing_base = [e for e in self.events if e.role == "base"]
-        if existing_base or not self.steps:
-            return self.events
-        return [
-            Event(
-                id=f"S{i+1:03d}",
-                call_type="send",
-                source=s.source,
-                recipient=s.target,
-                input=s.text,
-                when="W00-1T00:00",
-                expect=s.expect,
-                role="base",
-            )
-            for i, s in enumerate(self.steps)
-        ] + self.events
+        """Unified event list: base events (in self.events with role='base') + mod events."""
+        return self.events
 
     def model_post_init(self, __context: object) -> None:
         # Merge legacy mock_tools into tools
@@ -618,6 +603,62 @@ class Scenario(BaseModel):
 
 class Scenarios(BaseModel):
     scenarios: list[Scenario]
+
+
+# ── Event sequence validation schemas (Stage 1e) ─────────────────────────────
+
+class EventVerdictOutput(BaseModel):
+    """LLM output: issues found for one base event."""
+    event_id: str
+    issues: list[str] = Field(default_factory=list)
+    # issue codes: sequential_paradox | causal_orphan | expect_leak |
+    #              expect_incomplete | expect_null_invalid | redundant
+    issue_descriptions: list[str] = Field(default_factory=list)
+    quality: Literal["GOOD", "ADEQUATE", "POOR"]
+
+class EventSequenceJudgement(BaseModel):
+    """LLM output: all event verdicts + sequence-level verdict."""
+    event_verdicts: list[EventVerdictOutput]
+    sequence_verdict: Literal["CLEAN", "MILD_ISSUES", "PARADOX", "INCOMPLETE"]
+    sequence_issues: list[str] = Field(default_factory=list)
+    reasoning: str
+
+class EventVerdict(BaseModel):
+    """Per-event verdict combining deterministic health checks + LLM quality."""
+    workflow_id: str
+    event_id: str
+    event_input_preview: str = ""
+    issues: list[str] = Field(default_factory=list)
+    issue_descriptions: list[str] = Field(default_factory=list)
+    quality: Literal["GOOD", "ADEQUATE", "POOR"] = "ADEQUATE"
+
+class EventSequenceValidation(BaseModel):
+    """Aggregate validation result for one workflow's base event sequence."""
+    workflow_id: str
+    n_base_events: int
+    event_verdicts: list[EventVerdict] = Field(default_factory=list)
+    sequence_verdict: Literal["CLEAN", "MILD_ISSUES", "PARADOX", "INCOMPLETE"]
+    sequence_issues: list[str] = Field(default_factory=list)
+    sequence_reasoning: str = ""
+    aggregate_health: Literal["OK", "ISSUES"] = "OK"
+    aggregate_quality: Literal["GOOD", "ADEQUATE", "POOR"] = "ADEQUATE"
+    judge_input_tokens: int = 0
+    judge_output_tokens: int = 0
+
+
+class SampleEventSequenceValidation(BaseModel):
+    """Aggregate validation result for one Sample's full event sequence (base + mod events)."""
+    sample_id: str
+    workflow_id: str
+    n_events: int
+    event_verdicts: list[EventVerdict] = Field(default_factory=list)
+    sequence_verdict: Literal["CLEAN", "MILD_ISSUES", "PARADOX", "INCOMPLETE"]
+    sequence_issues: list[str] = Field(default_factory=list)
+    sequence_reasoning: str = ""
+    aggregate_health: Literal["OK", "ISSUES"] = "OK"
+    aggregate_quality: Literal["GOOD", "ADEQUATE", "POOR"] = "ADEQUATE"
+    judge_input_tokens: int = 0
+    judge_output_tokens: int = 0
 
 
 # Run configuration record (written as first line of every eval results file)

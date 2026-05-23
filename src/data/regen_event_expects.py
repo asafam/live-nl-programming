@@ -72,8 +72,9 @@ def main_with_args(args: argparse.Namespace) -> int:
             updated[s.id] = result
             print(f"  ✓ {result.id}  ({len(result.events)} events refreshed)")
 
-    # If writing in-place, preserve any samples we didn't touch (filter / limit).
-    if output_path == args.samples:
+    # If writing in-place (same file, resolving symlinks), preserve untouched samples.
+    import os
+    if os.path.realpath(output_path) == os.path.realpath(args.samples):
         all_samples: list[Sample] = load_jsonl(args.samples, Sample)
         out_list = [updated.get(s.id, s) for s in all_samples]
     else:

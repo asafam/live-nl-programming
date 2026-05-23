@@ -35,9 +35,7 @@ def main_with_args(args: argparse.Namespace) -> int:
         if wf is None:
             missing_parent += 1
             continue
-        # Deep-copy steps so future mutations don't share references
-        s.steps = [Sample.model_fields["steps"].annotation.__args__[0].model_validate(st.model_dump())
-                   for st in wf.steps]
+        s.steps = list(wf.steps)
         updated += 1
 
     output_path = args.output or args.samples

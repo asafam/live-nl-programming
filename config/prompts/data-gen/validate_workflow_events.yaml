@@ -1,0 +1,125 @@
+prompt: |
+  # Task: Validate Base Event Sequence
+
+  You are auditing the base event sequence for a workflow automation. Identify quality
+  issues in each event and detect sequence-level paradoxes.
+
+  ---
+
+  ## Workflow
+
+  **ID:** {WORKFLOW_ID}
+  **Name:** {WORKFLOW_NAME}
+
+  ---
+
+  ## Grounded Steps (what the system does, in execution order)
+
+  {GROUNDED_STEPS}
+
+  ---
+
+  ## Reference Data (mock values available at eval time)
+
+  {MOCK_DATA}
+
+  ---
+
+  ## Base Events (in sequence order)
+
+  {BASE_EVENTS}
+
+  ---
+
+  ## Issue codes to check
+
+  **`sequential_paradox`**
+  The event's input presupposes a system state that contradicts a prior event's output.
+  Example: event N assumes the approval case is still open, but event N-1's expect.action
+  closed it with "changes requested" — and no resubmission event appears in between.
+  Flag only when there is a direct contradiction, not merely a temporal gap.
+
+  **`causal_orphan`**
+  An actor in event N performs an action (approves, rejects, responds) but no prior
+  event's expect.action established that this actor received the prerequisite to do so
+  (e.g., an approval request was never sent to them by the system).
+  Check: is the actor's receipt of the prerequisite explicitly established by a prior expect?
+
+  **`expect_leak`**
+  The event's expect.action contains outcomes derivable only from a *later* event's input.
+  Check: does the expect mention names, decisions, or content that only appear in
+  subsequent events' inputs? The system cannot know future inputs when processing this event.
+  Example: S001 expect.action says "changes requested by Maria Chen" but Maria's decision
+  only arrives in S002's input — S001 cannot have produced this output.
+
+  **`expect_incomplete`**
+  The event's expect.action is missing an obvious externally-observable output that the
+  grounded steps describe for this trigger type.
+  Example: steps say the system posts to a Slack channel AND sends an email, but
+  expect.action only mentions the email.
+  Flag only clearly missing outputs the steps explicitly describe — not minor omissions.
+
+  **`expect_null_invalid`**
+  The event's expect is null but the grounded steps describe a clear external output
+  for this trigger type (state change, message sent, record created).
+  Flag only when a non-null expect is clearly warranted by the steps.
+
+  **`redundant`**
+  Two or more events test the same trigger class with near-identical inputs — same source,
+  same action type, no meaningful behavioral variation between them.
+  Minor data variation (different amounts, names) is NOT redundant if the steps apply
+  different thresholds or conditional logic to different values.
+
+  ---
+
+  ## Sequence-level verdict
+
+  After checking all events, assign one verdict:
+
+  - **`CLEAN`** — no issues found across all events.
+  - **`MILD_ISSUES`** — minor issues only (incomplete expects, one isolated causal_orphan).
+    No paradoxes, no leakage.
+  - **`PARADOX`** — at least one `sequential_paradox`: the sequence contains a logical
+    contradiction where a later event assumes state that a prior event explicitly foreclosed.
+  - **`INCOMPLETE`** — the sequence is missing a critical setup event. Example: there is a
+    "second approval" event but no prior event establishes the first approval request was
+    ever dispatched, making the second approval causally ungrounded.
+
+  ---
+
+  ## Output
+
+  Respond with JSON only:
+  {
+    "event_verdicts": [
+      {
+        "event_id": "S001",
+        "issues": ["expect_leak", "expect_incomplete"],
+        "issue_descriptions": [
+          "expect.action references Maria Chen's 'changes requested' outcome, which only appears in S002's input — S001 cannot know this when it is processed",
+          "expect.action omits the Slack channel post described in grounded step 3"
+        ],
+        "quality": "POOR"
+      },
+      {
+        "event_id": "S002",
+        "issues": [],
+        "issue_descriptions": [],
+        "quality": "GOOD"
+      }
+    ],
+    "sequence_verdict": "PARADOX",
+    "sequence_issues": [
+      "S003 assumes the approval case is open, but S002's expect.action closed it with changes-requested and no resubmission event appears before S003"
+    ],
+    "reasoning": "S001's expect leaks Maria Chen's decision from S002. S003 and S004 are causally broken because no resubmission occurs after S002 closes the case."
+  }
+
+  Quality levels:
+  - `GOOD` — no issues; expect is complete and correctly scoped to this event's input alone
+  - `ADEQUATE` — minor issue (slightly incomplete expect) that does not break benchmark validity
+  - `POOR` — serious issue: paradox, leakage, causal orphan, or null when output clearly exists
+
+  Include one entry per event in event_verdicts (include events with no issues — use empty
+  lists and quality="GOOD"). The sequence_issues list should contain one sentence per
+  sequence-level finding. reasoning should be 2-4 sentences summarizing your assessment.

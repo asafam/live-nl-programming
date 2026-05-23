@@ -32,14 +32,33 @@ prompt: |
 
   ## How to reason
 
+  **CRITICAL ISOLATION RULE — read this before anything else.**
+
+  Each event is processed by the system ONE AT A TIME. When the system processes event
+  S001, it has NOT yet received S002, S003, or any later event. The system cannot know
+  what those events will say or what decisions humans will make later.
+
+  **For each event, write ONLY what the system produces automatically from THAT event's
+  input alone — as if the later events did not exist.**
+
+  The other events are listed here only so you know all the triggers in scope.
+  Do NOT use the content of other events to determine what THIS event produces.
+
+  Concretely: if S001 causes the system to send an approval request to a human,
+  STOP THERE. Do NOT include the human's eventual response (that is S002 or S003).
+  The human's response arrives as a separate future event — it is not part of S001's output.
+
   **Step 1 — Identify which workflow step this event activates.**
   Match the event's `recipient` and `input` to the relevant step(s) above.
   Use the steps to understand what the system does in response.
 
-  **Step 2 — Trace the step to its terminal external output.**
-  Follow the logic in the steps to the final externally-observable actions:
-  messages sent, records updated, notifications triggered.
-  Stop at the first external outputs — do NOT include outputs from subsequent events.
+  **Step 2 — Trace only the immediate, synchronous outputs of THIS event.**
+  Include only what happens automatically within the system's processing of THIS single input.
+  Stop as soon as the system sends a notification or request that awaits a human response.
+  That notification IS the terminal output — the human's reply is a future event.
+
+  Use the Reference Data to fill in exact names of approvers, channels, IDs, etc.
+  Do NOT use another event's input text to infer the outcome of THIS event.
 
   **Step 3 — Look up exact names from the Reference Data.**
   Use the Reference Data to replace role descriptions with actual names and identifiers.
@@ -49,32 +68,184 @@ prompt: |
   numeric or categorical threshold, evaluate whether the event's input satisfies
   that condition. Only include the conditional output if the threshold IS met.
 
-  **Step 4 — Apply ACTIVE modifications to recompute the expected output.**
+  **Step 4 — Apply ACTIVE modifications via an explicit differential check.**
 
   A modification is active ONLY if the event occurs at or after the modification's `when` timestamp.
   The `[active modifications: ...]` annotation on each event tells you exactly which apply.
 
-  When an event has `[active modifications: M001, ...]`, write the MODIFIED behavior, not baseline.
-  For each active modification:
-    1. Read the modification's intent text.
-    2. Determine HOW the intent changes the system's response to THIS event.
-    3. WRITE THE EXPECTED OUTPUT THAT REFLECTS THE MODIFICATION'S EFFECT.
+  For every event with at least one active modification, run this differential procedure
+  in your head BEFORE writing `action`:
 
-  **Make the modification's effect prominently visible in `action`.**
-  If it suppresses an action, write "[suppressed by M001] action X not produced".
-  If it changes a destination or adds a field, name it explicitly.
+  **Step 4a — Scope check.** Read the modification's intent and identify TWO kinds of scope:
 
-  **CRITICAL**: never write the baseline behavior for a `role=post_mod` event without
-  also writing in `reason` why the modification's effect does not change THIS event's
-  outcome.
+  (i) **Conditional scope** — which inputs does the mod target?
+    List the conditions explicitly (e.g., "only when discount > 20%", "only for ideas
+    under 10 words", "only for batch-shaped submissions").
+    For each condition, check the EVENT's input:
+      - input CLEARLY satisfies the condition → mod applies; do NOT default to baseline
+      - input clearly violates the condition → mod does NOT apply; write baseline
+      - input is ambiguous → DO apply the mod (the benchmark assumes the LLM judges
+        the trigger as matching when it plausibly fits)
+
+  (ii) **Temporal scope** — how long does the mod's effect persist? Read the intent
+       carefully for scope-limiting language:
+    - **One-shot / this-execution-only**: "this week", "today", "this report", "for
+      the current quote", "just this once". The mod applies to events within that
+      window only; events outside the window get BASELINE behavior even if
+      after_mod_ids includes this mod.
+    - **Time-bounded persistent**: "for the next 2 days", "until Friday", "this
+      quarter". Mod applies during the window, baseline outside.
+    - **Persistent (default if no scope marker)**: "going forward", "from now on",
+      no time qualifier → mod applies to all post-mod events of the matching kind.
+
+  Decision:
+    - **Conditional IN + Temporal IN** → apply mod (proceed to Step 4b)
+    - **Conditional OUT** → baseline; `reason`: "[M001 condition not met: <which one>]"
+    - **Conditional IN but Temporal OUT** → baseline; `reason`: "[M001 out of scope:
+      one-shot mod targeted <window>, this event is in <event's window>]"
+    - **Multiple active mods** → apply each per its own scope; do not bleed one mod's
+      effect onto events outside its scope just because another mod is still active
+
+  **Sub-rule for "defer/hold/wait until X" mods:**
+  If the modification says the action is *delayed until* some time T (e.g., "wait until
+  late afternoon", "hold until Monday morning", "defer until 17:00"), then the deferral
+  applies to events that fire BEFORE T. When an event fires AT or AFTER T, the
+  deferral window has elapsed and the action FIRES — write the normal (non-suppressed)
+  action and tag it `[fired-on-schedule by M001] action X is now produced at <event time>
+  per the deferral window`. Do NOT keep writing "[deferred] action held" if the event
+  time has already reached the deferral target.
+
+  **Step 4b — Baseline-vs-modified differential.** Before writing `action`, mentally
+  write out the two candidate outputs:
+    - BASELINE: what the unmodified system would produce for this event's input
+    - MODIFIED: what the system produces with M001 applied per Step 4a's decision
+  Then:
+    (1) If BASELINE ≠ MODIFIED → write the MODIFIED action; the difference MUST be
+        explicit (different recipient, different status, suppression annotation, etc.).
+        Do NOT write text that "could be either" — pick concrete words that only the
+        modified policy would produce.
+    (2) If BASELINE = MODIFIED → the event cannot test the mod. Write the baseline
+        action and add `reason`: "[M001 produces no observable difference on this
+        input]". This should be RARE — if it happens often, the event inputs were
+        chosen poorly.
+
+  **Self-check before finalizing the action**: if a reader compared this post_mod
+  event's `action` text to a pre_mod or baseline event's `action` for the same trigger
+  class, would they see a clear difference attributable to M001? If no — the action is
+  wrong. Rewrite it to show the modification's effect concretely.
+
+  ---
+
+  ## Cross-event consistency (verify before finalizing any expect)
+
+  You are writing expects for ALL events in this sample in one pass — use that to
+  enforce internal consistency. Before finalizing each event's `action`:
+
+  **Identify created entities and carry them forward.**
+  When an event's expect creates a record (a quote, ticket, scheduled post, lead,
+  retrospective…) or a thread/case (Slack thread, approval case), use specific IDs
+  from the Reference Data when they exist there, and reuse the same IDs in subsequent
+  events that reference the same entity. If an event creates a lead for "Marcus
+  Delgado at marcus@example.com", a later event referring to that same person should
+  treat that lead as already created — do not write an expect saying "no matching
+  lead exists" for the same person.
+
+  **Do not contradict state established by a prior event in the same sequence.**
+  Before writing an expect, mentally scan the prior events' expects in `when`-order:
+    - If a prior event already created entity X with attributes A, this event must
+      not say X doesn't exist or has different attributes A'.
+    - If a prior event closed/resolved/approved entity X, this event must not treat
+      X as still-open without an intervening event that re-opens it.
+    - If a prior event recorded an action by actor Y on resource Z, this event must
+      not contradict that record.
+
+  **Same entity, same identifier.**
+  When two events reference the same real-world entity (same person, same record,
+  same thread), use the same identifier. If S001 creates employee EMP-3847 for
+  "Maya Hernandez", a later event referencing Maya Hernandez should NOT introduce
+  EMP-4421 for the same name without explicit re-identification context.
+
+  **Name created artifacts and notified actors explicitly.**
+  When an expect describes the system creating a thread, case, record, or
+  notifying an actor, NAME the specific identifier/person from the Reference
+  Data. Do NOT write generic placeholders like "a thread is created" or
+  "approval requests are sent to the approvers" — write "Slack thread TS-88421
+  is created in #quote-approvals" and "approval requests are sent to Maria Chen
+  and Daniel Lopez". This makes the downstream causal chain explicit: when a
+  later event references TS-88421 or "Maria Chen approves", the validator
+  (and any reader) can trace it back to S001 that created the thread / sent
+  the request. Generic language breaks the chain even when the cascade is
+  correct.
+
+  If you encounter an input that genuinely contradicts a prior event's established
+  state (e.g., S002's input says "step 2 is due after 3 days" but S001 fired at the
+  same timestamp), the input is structurally inconsistent — write the best expect
+  you can and add to `reason`: "[INPUT PARADOX: <briefly describe the contradiction>]"
+  so the inconsistency is visible to reviewers.
+
+  **Step 4c — Visibility annotation.** Tag the modified portion of `action` so a reader
+  can see at a glance that the mod fired:
+    - Suppression: `[suppressed by M001] <action X> not produced`
+    - Routing change: `[rerouted by M001] sent to <new destination> instead of <old>`
+    - Threshold/value change: `[adjusted by M001] <field> = <new value> (was <old>)`
+    - Additive: `[added by M001] also notifies <recipient> / also appends to <table>`
+    - Conditional hold: `[deferred by M001] action held until <when>, not produced now`
+
+  **CRITICAL — the post_mod event MUST visibly differ from the equivalent pre_mod or
+  baseline event.** If two events with the same trigger class produce identical
+  `action` text — one pre_mod, one post_mod — then the modification is untested
+  by this scenario. Re-read the mod's intent and rewrite the post_mod action to make
+  the difference unmistakable. Common failure modes to avoid:
+    - Writing the baseline output and calling it "modified" without any visible change
+    - Applying the mod to events outside its qualifying scope (forces a wrong baseline)
+    - Generic phrasing that could pass under either policy ("a notification is sent")
+
+  ---
+
+  ## Threshold rules (apply consistently)
+
+  **Null `action` threshold.**
+  Setting `action` to null is RARE and requires all of:
+    (i) the event triggers a read-only check (no writes anywhere)
+    AND (ii) the Reference Data shows no matching records to process
+    AND (iii) no active modification adds an action
+  If any of these is false, write a concrete action — even a small one like
+  "the input is recorded in the audit log with no further processing". Default
+  to writing a real action; null is the exception.
+
+  **When to use `[suppressed by Mxxx]` annotation.**
+  Use suppression ONLY when the modification's intent EXPLICITLY says one of:
+  "do not", "skip", "cancel", "suppress", "hold and don't send", "drop". If the
+  mod merely changes HOW the action fires (different recipient, different timing,
+  different field value, different destination), use one of these instead:
+    - `[rerouted by Mxxx]` (different destination)
+    - `[adjusted by Mxxx]` (different field/value)
+    - `[deferred by Mxxx]` (different timing, will fire later)
+    - `[added by Mxxx]` (additive, not replacing)
+  Suppression means the externally observable action does NOT happen at all.
+
+  **When identical expects for same-trigger events are acceptable.**
+  Two events with the same trigger class may have identical `action` text ONLY if:
+    (i) they differ meaningfully in `when` (timing produces no behavioral delta), OR
+    (ii) they differ in active modifications (a pre-mod vs post-mod), OR
+    (iii) state established by prior events affects them differently
+  If two same-trigger events produce identical text with none of these differences,
+  one is redundant test coverage — note in `reason`: "[redundant: same coverage as
+  <other event_id>]" so reviewers can flag for input variation.
 
   ---
 
   ## What to write
 
   `action` = an EXHAUSTIVE list of EVERY terminal externally-observable side
-  effect the cascade produces for this event. Write in plain business language —
-  what a human observer outside the system would see happen.
+  effect the cascade produces for THIS event's processing. Write in plain
+  business language — what a human observer outside the system would see happen.
+
+  "Exhaustive" applies within the bounds of THIS event's synchronous processing:
+  list every state change, message, and write the system makes in response to
+  this single input. STOP at the next external-response boundary — if the
+  cascade sends a notification that awaits a human reply, that notification IS
+  a terminal output for this event; the reply is a separate future event.
 
   Categories to enumerate — list every one that fires:
 

@@ -64,10 +64,7 @@ def _format_objects(s: Sample) -> str:
 def _format_steps(s: Sample) -> str:
     if not s.steps:
         return "(no steps)"
-    lines = []
-    for i, st in enumerate(s.steps, 1):
-        lines.append(f"  [{i}] target={st.target}  text: {st.text}")
-    return "\n".join(lines)
+    return "\n".join(f"  [{i}] {st}" for i, st in enumerate(s.steps, 1))
 
 
 def _format_modifications(s: Sample) -> str:

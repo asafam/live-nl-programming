@@ -20,6 +20,17 @@ prompt: |
 
   ---
 
+  ## Mock Data (concrete entities the system will see at eval time)
+
+  Use these EXACT names, IDs, and values when writing the step `text`. They are the
+  ground-truth values the mock tools will return at evaluation time, so every name,
+  ID, role title, and amount you include MUST come from here. Do not invent new
+  approvers, employees, customer names, or IDs — pull them from the data below.
+
+  {MOCK_DATA}
+
+  ---
+
   ## Instructions
 
   Steps are **external triggers only** — events that arrive from outside the system boundary and cause the automation to run. They are NOT a trace of the internal workflow.
@@ -70,7 +81,15 @@ prompt: |
 
   - `target` — the `object_id` of the object that receives the external trigger. MUST be an object with a non-empty `event_sources` list.
   - `source` — the external system sending this trigger (e.g., `"webhook"`, `"__external__"`). Use the actual system name if known.
-  - `text` — the natural language description of the trigger CLASS. Describe WHAT TYPE of event arrives and WHAT FIELDS it carries, using roles and field names — NOT specific instance values. Do not include quote IDs, person names, dollar amounts, dates, or any other concrete data values. Example: "A sales rep submits a new quote in HubSpot Quotes carrying the quote ID, submitting rep's identity and role, and the concession details (discount percentage, payment terms, add-ons)." — NOT "James Brown submits quote Q-2048 with 25% discount."
+  - `text` — the natural-language description of THIS event arriving from outside.
+    Use **concrete instance values** drawn from the Mock Data section: the exact quote ID,
+    the submitting person's name and role, the customer name, dollar amounts, discount
+    percentages, payment terms, thread IDs, etc. The text should read like a real event
+    payload, not an abstract template. Example: "HubSpot Quotes sends a quote approval
+    submitted event for quote Q-2048 from James Brown, Account Executive, for Acme Corp,
+    with a 25% discount and Net 75 payment terms." — NOT "A sales rep submits a quote
+    with concession details." Every concrete value (names, IDs, amounts) MUST match
+    something in the Mock Data block.
   - `expect` — what the system produces when run with no modifications:
     - `action` — an EXHAUSTIVE list of TERMINAL, externally-observable
       side effects the cascade produces. NOT a first-hop peer dispatch.
@@ -98,6 +117,14 @@ prompt: |
       If the cascade writes to two systems, list both. If it sends a
       notification AND updates a status AND invokes a tool, list all three.
 
+      **Stop at the next external response boundary.** Trace effects only as
+      far as the system can produce them automatically from THIS step's input
+      alone. If the cascade sends a notification or approval request that
+      awaits an external reply, that notification IS the terminal output —
+      the reply is a SEPARATE future Step. Do NOT include the eventual reply's
+      outcome (e.g., "approved or rejected") in this step's expect; the reply
+      arrives as another Step and produces its own expect.
+
       **Right shape (terminal outcomes with named destinations & data):**
         ✓ "A new row is appended to the `New Submissions` tab of the
            `Contact Intake` Google Sheet with Sarah Mitchell's name,
@@ -116,7 +143,11 @@ prompt: |
         ✗ "A notification is sent to the team."
         ✗ "The data is stored in the database."
 
-      Use **roles and field references, not instance values** — "approval-request email sent to the designated approvers" not "email sent to Maria Chen". Steps describe what the system DOES for any instance of this trigger class; concrete values (names, IDs, amounts) are supplied only at evaluation time via event payloads. Slack channel names from the object system's behavior descriptions are acceptable (they are structural, not instance data).
+      Use **concrete names and IDs from the Mock Data section** — write "approval-request
+      email sent to Maria Chen (Revenue Operations Manager) and Daniel Lopez (Enterprise
+      Sales director)" not "email sent to the designated approvers". The mock data
+      provides the ground-truth roster, status enums, and channel names; the expect must
+      reference the same concrete entities that the mock tools will return at eval time.
 
       Describe only natural-language messages and data writes — NOT
       interactive UI elements (buttons, dropdowns, forms, widgets). LNL
@@ -147,6 +178,49 @@ prompt: |
 
   **Consistency:** Names used in step `text` must be realistic and consistent — the pipeline will generate matching mock API data using these names.
 
-  **Steps are templates, not instances.** The `text` describes the trigger class abstractly — what fields arrive, not what their values are. Concrete values (quote IDs, names, amounts, thread IDs) belong in Events, not Steps. A step that reads "A sales rep submits a quote with concession details" is correct; one that reads "James Brown submits quote Q-2048 with 25% discount" is wrong.
+  **Steps are concrete instance events, consistent with mock data.** The `text` MUST
+  include the specific names, IDs, amounts, and identifiers that the mock tools will
+  return at eval time. Pull every concrete value from the Mock Data section above —
+  do not invent new approvers, customer names, or IDs. A step that reads "HubSpot
+  Quotes sends a quote approval submitted event for quote Q-2048 from James Brown,
+  Account Executive, for Acme Corp with a 25% discount and Net 75 payment terms" is
+  correct; one that reads "A sales rep submits a quote with concession details" is wrong.
 
-  **Shared state:** Steps run sequentially on a shared runtime. Each step's side effects carry forward. Before writing `expect` for any step N, ask: "Have prior steps already resolved the state this step depends on?" If yes, omit `expect` — the outcome is no longer deterministic. Omit `expect` entirely for scheduled/heartbeat triggers.
+  **Shared state:** Steps run sequentially on a shared runtime, and modifications later in the
+  pipeline may change behavior. Use `expect` carefully:
+  - **WRITE a concrete expect** when the step's own `text` describes both the trigger AND
+    the precondition state it operates on (e.g., "a reminder timer fires for an OPEN
+    approval thread", "a revised quote arrives after a CHANGES-REQUESTED outcome", "an
+    approver acts on an ACTIVE case"). The expect should describe what the system does
+    given that the precondition holds — even if a prior step's state was different.
+  - **OMIT expect (null)** only for pure scheduled/heartbeat triggers whose outcome
+    genuinely depends on runtime state not described in the trigger text (e.g., "every
+    midnight, check for stale tickets" — the action depends on whether any are stale).
+
+  Default to writing a concrete expect. A null expect is the exception, not the norm —
+  every external trigger of a real automation produces some observable output, and the
+  benchmark cannot grade null expects.
+
+  ### Sequential coherence (verify before finalizing)
+
+  After drafting all steps, check each step against its predecessors:
+
+  **1. State compatibility.** Can this external event arrive given the system state after
+  all prior steps have been processed? If a prior step's `expect.action` shows the system
+  in a terminal state (rejected, changes-requested, case closed), the NEXT step must either
+  resolve that terminal state (e.g., the submitter resubmits) or be a completely independent
+  trigger. DO NOT write a step that presupposes a prior process is still open when a prior
+  `expect.action` has explicitly closed it.
+
+  **2. Actor prerequisites.** If step N has an external actor taking an action (e.g.,
+  approving a quote, confirming a request), verify that a prior step's `expect.action`
+  explicitly established that this actor received the necessary prerequisite (e.g., an
+  approval request was sent to them). If no prior step established this receipt, either:
+  (a) add it to the prior step's `expect.action`, or (b) add a setup step before step N.
+  An actor cannot respond to a message the system never sent them.
+
+  **3. Isolated expect scope.** When writing step N's `expect.action`, use ONLY the
+  information in step N's own `text`. Do NOT incorporate outcomes from steps N+1, N+2,
+  etc. — those are future external events the system has not yet received. If step N
+  causes the system to send an approval request, STOP THERE. The approver's reply is
+  step N+1 or N+2, not part of step N's output.

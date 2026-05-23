@@ -856,6 +856,11 @@ Examples:
         help="Skip Stage 1d (LLM-judge grading of grounded workflow steps vs templates.yaml raw_steps)",
     )
     shared.add_argument(
+        "--no-validate-workflow-events",
+        action="store_true",
+        help="Skip Stage 1e (LLM-judge grading of base event sequence quality)",
+    )
+    shared.add_argument(
         "--workflow-step-judge-model",
         default="gpt-5.4",
         help="Judge model for Stage 1d workflow-step validation (default: gpt-5.4)",
@@ -985,6 +990,24 @@ Examples:
             no_fail=True,  # don't abort the pipeline; report and continue
         )
         _vws.main_with_args(vws_args)
+
+    # --- Stage 1e: validate base event sequence quality ---
+    if not args.no_validate_workflow_events and not skip_stage1:
+        print()
+        print("=" * 60)
+        print("STAGE 1e: Validate Base Event Sequence Quality")
+        print("=" * 60)
+        from src.data import validate_workflow_events as _vwe
+        _vwe.main_with_args(argparse.Namespace(
+            input=workflows_path,
+            provider=args.workflow_step_judge_provider,
+            judge_model=args.workflow_step_judge_model,
+            workers=args.workers,
+            output=None,
+            limit=None,
+            filter=None,
+            no_fail=True,
+        ))
 
     # Any sample explicitly regenerated via --id must have its TCs invalidated,
     # even if the validation step made no repairs (Stage 2 would otherwise hit

@@ -36,7 +36,7 @@
   raw_steps:
   - A sales rep submits a new quote for approval in HubSpot Quotes
   - The system identifies approvers based on the specific concessions asked for and the rep's reporting chain
-  - An email approval request gets sent to the designated approvers
+  - An email approval request gets sent to the designated approvers, and an actionable Slack approval message with the quote details is posted to each approver so they can act on it directly in Slack
   - The approver reviews the quote details and takes action—approve, reject, or request changes—in Slack
   - If approved, the quote is marked as such in HubSpot, and the rep is free to send it
   - If concessions aren't approved, the quote is marked rejected, and reps can resubmit

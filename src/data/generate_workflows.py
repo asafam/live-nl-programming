@@ -140,7 +140,20 @@ def _identify_objects(llm, grounded: GroundedTemplate, template: dict, prompt_cf
     )
 
 
-def _write_steps(llm, grounded: GroundedTemplate, graph: ObjectGraph, template: dict, prompt_cfg: dict) -> WorkflowSteps | None:
+def _format_mock_data_for_steps(tools) -> str:
+    """Format mock tool seed data so steps can use ground-truth names/IDs."""
+    if not tools:
+        return "(no mock data available — invent realistic but consistent names)"
+    chunks = []
+    for t in tools:
+        tmpl = (t.response_template or "").strip()
+        if not tmpl:
+            continue
+        chunks.append(f"### {t.tool_name}\n{tmpl[:1500]}")
+    return "\n\n".join(chunks) if chunks else "(no seed data found in mock tools)"
+
+
+def _write_steps(llm, grounded: GroundedTemplate, graph: ObjectGraph, template: dict, prompt_cfg: dict, tools: list | None = None) -> WorkflowSteps | None:
     """Stage 1c: write the external trigger steps."""
     steps_text = "\n".join(f"- {s}" for s in grounded.grounded_steps)
     prompt = (
@@ -148,6 +161,7 @@ def _write_steps(llm, grounded: GroundedTemplate, graph: ObjectGraph, template: 
         .replace("{NAME}", grounded.name)
         .replace("{GROUNDED_STEPS}", steps_text)
         .replace("{OBJECTS}", _format_objects(graph))
+        .replace("{MOCK_DATA}", _format_mock_data_for_steps(tools or []))
     )
     valid_entry_points = {obj.object_id for obj in graph.objects if obj.event_sources}
 

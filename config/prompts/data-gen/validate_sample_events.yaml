@@ -1,0 +1,125 @@
+prompt: |
+  # Task: Validate Full Event Sequence for a Sample
+
+  You are auditing the FULL event sequence for one Sample — base events + pre-mod +
+  post-mod + irrelevant events — to detect paradoxes, leakage, and modification-effect
+  inconsistencies. The Sample includes modifications that change behavior at specific
+  times; events after a modification's `when` should reflect that change if the
+  modification's intent applies to them.
+
+  ---
+
+  ## Sample
+
+  **ID:** {SAMPLE_ID}
+  **Name:** {SAMPLE_NAME}
+
+  ---
+
+  ## Grounded Steps (baseline system behavior)
+
+  {GROUNDED_STEPS}
+
+  ---
+
+  ## Reference Data (mock values available at eval time)
+
+  {MOCK_DATA}
+
+  ---
+
+  ## Modifications
+
+  {MODIFICATIONS}
+
+  ---
+
+  ## Events (sorted by `when` — full sequence)
+
+  {EVENTS}
+
+  ---
+
+  ## Issue codes (apply to ALL event roles, not just base)
+
+  **`sequential_paradox`** — event N's input presupposes a state contradicted by an
+  earlier event's output. Direct contradiction only; not just a temporal gap.
+
+  **`causal_orphan`** — an actor in event N takes an action but no prior event's
+  expect.action established that this actor received the prerequisite.
+
+  **`expect_leak`** — event N's expect.action contains outcomes derivable only from a
+  *later* event's input. The system cannot know future inputs.
+
+  **`expect_incomplete`** — event N's expect.action is missing an obvious externally-
+  observable output that the grounded steps + active mods describe for this trigger.
+
+  **`expect_null_invalid`** — event N's expect is null but the grounded steps describe
+  a clear external output for this trigger class.
+
+  **`redundant`** — two or more events test the same trigger class with near-identical
+  inputs and no meaningful variation. Minor data variation is fine if it tests different
+  thresholds or rules.
+
+  ### Modification-specific codes
+
+  **`mod_effect_not_reflected`** — a post_mod event (event whose `when` is at or after
+  a modification's `when` AND whose `after_mod_ids` contains that mod_id) should reflect
+  the modification's effect in its expect.action, but doesn't. Examples:
+    - mod says "suppress reminders" but post_mod reminder event's expect describes the
+      normal reminder firing without a `[suppressed by Mxxx]` annotation
+    - mod says "route to channel #X" but post_mod event's expect still routes to #Y
+    - mod adds a new step but no post_mod event's expect mentions it
+
+  **`mod_unsuppression_invalid`** — event has a `[suppressed by Mxxx]` annotation in its
+  expect.action but either:
+    (a) the modification Mxxx is not yet active at this event's `when`, or
+    (b) the modification's intent does not actually suppress the action described
+
+  ---
+
+  ## Sequence-level verdict
+
+  - **`CLEAN`** — no issues across all events.
+  - **`MILD_ISSUES`** — minor issues only (incomplete expects, one isolated causal_orphan,
+    one mod_effect_not_reflected on a marginal case). No paradoxes, no leakage.
+  - **`PARADOX`** — at least one `sequential_paradox` found.
+  - **`INCOMPLETE`** — missing a critical setup event OR systematic mod_effect_not_reflected
+    (post_mod events fail to test the modification's effect).
+
+  ---
+
+  ## Output
+
+  Respond with JSON only:
+  {
+    "event_verdicts": [
+      {
+        "event_id": "E002",
+        "issues": ["mod_effect_not_reflected"],
+        "issue_descriptions": [
+          "E002 is a post_mod event for Q-3101 (reminder after the mod's 'late-Friday hold' rule) but its expect describes the reminder firing normally without the suppression / business-morning hold the modification specifies"
+        ],
+        "quality": "POOR"
+      },
+      {
+        "event_id": "S001",
+        "issues": [],
+        "issue_descriptions": [],
+        "quality": "GOOD"
+      }
+    ],
+    "sequence_verdict": "MILD_ISSUES",
+    "sequence_issues": [
+      "One post_mod event fails to reflect M001's late-Friday reminder hold"
+    ],
+    "reasoning": "Base events are clean and consistent. The post-mod events partially test M001 — E005 correctly shows suppression, but E002 (same mod, similar scenario) does not."
+  }
+
+  Quality levels:
+  - `GOOD` — no issues
+  - `ADEQUATE` — minor issue that doesn't break benchmark validity
+  - `POOR` — paradox, leakage, missing mod effect, or other serious issue
+
+  Include one entry per event in event_verdicts (use empty `issues` and quality="GOOD"
+  for clean events). The reasoning should be 2-4 sentences.
