@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-23 (v33): add --enable-step-retry-replan / --step-max-retries / --step-replan-max — reactive escalation when one PlanStep keeps getting invalidated; default OFF, opt-in only.
+_VERSION: str = _build_version()  # bumped 2026-05-23 (v34): hotfix — outer execute_test_case wrapper was missing the new step-retry-replan kwargs added in v33, so harness calls failed with TypeError. Inner _execute_test_case_inner already had them.
 
 from src.data.schema import (
     EvalSummary,
@@ -1204,6 +1204,9 @@ def execute_test_case(
     planner_mode: str = "dag",
     enable_replan_checkpoints: bool = False,
     replan_max_per_trace: int = 3,
+    enable_step_retry_replan: bool = False,
+    step_max_retries: int = 2,
+    step_replan_max: int = 1,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample with a per-event timeout (seconds).
 
