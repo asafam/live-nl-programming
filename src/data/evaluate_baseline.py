@@ -298,7 +298,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-23 (v35): companion bump for evaluate.py v31 — judge evidence gains PRIOR TOOL EXECUTIONS cross-event tool log (baseline unaffected)
+_VERSION: str = _build_version()  # bumped 2026-05-23 (v36): default --peer-message-timeout flipped 150→0 — full fire-and-forget for ALL multi-agent OC peer sends (was: leaf peers only at 0, coordinator peers at 150s). Coordinator peers no longer wait for downstream A2A replies; matches LNL send-and-continue semantics. Pass --peer-message-timeout 150 to restore prior cascade-waiting behavior. Internal default in openclaw_export._agents_md / rewrite_agents_md also 90→0 for consistency.
 
 # ── Infrastructure failure detection ─────────────────────────────────────────
 
@@ -1366,7 +1366,7 @@ async def _execute_tc_async(
     tracked_harness=None,
     thinking: Optional[str] = None,
     sequential: bool = False,
-    peer_message_timeout: float = 150.0,
+    peer_message_timeout: float = 0.0,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Async core: open persistent sessions for ALL agents simultaneously, then send messages.
 
@@ -1987,7 +1987,7 @@ def _execute_test_case_inner(
     tracked_harness=None,
     thinking: Optional[str] = None,
     sequential: bool = False,
-    peer_message_timeout: float = 150.0,
+    peer_message_timeout: float = 0.0,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Sync wrapper: delegate to _execute_tc_async with persistent multi-agent sessions."""
     gateway_url = next(iter(agents.values()))._gateway_url if agents else None
@@ -2023,7 +2023,7 @@ def execute_test_case(
     tracked_harness=None,
     thinking: Optional[str] = None,
     sequential: bool = False,
-    peer_message_timeout: float = 150.0,
+    peer_message_timeout: float = 0.0,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample with an optional wall-clock timeout."""
     if timeout_s is None:
@@ -2576,7 +2576,7 @@ async def _run_all_tcs_concurrent(
                                     tracked_harness=tracked_harness,
                                     thinking=getattr(args, "thinking", None),
                                     sequential=bool(getattr(args, "sequential", None)),
-                                    peer_message_timeout=getattr(args, "peer_message_timeout", 150.0),
+                                    peer_message_timeout=getattr(args, "peer_message_timeout", 0.0),
                                 )
                                 if tc_timeout:
                                     event_results, mod_results = await asyncio.wait_for(coro, timeout=tc_timeout)
@@ -3301,7 +3301,7 @@ def run(args: argparse.Namespace) -> Path:
                         concurrency_seed=getattr(args, "seed", None) or 42,
                         tracked_harness=tracked_harness,
                         thinking=getattr(args, "thinking", None),
-                        peer_message_timeout=getattr(args, "peer_message_timeout", 150.0),
+                        peer_message_timeout=getattr(args, "peer_message_timeout", 0.0),
                     )
                     pass_rate = (
                         sum(1 for e in event_results if e.passed) / len(event_results)
@@ -3348,7 +3348,7 @@ def run(args: argparse.Namespace) -> Path:
                                 concurrency_seed=getattr(args, "seed", None) or 42,
                                 tracked_harness=tracked_harness,
                                 thinking=getattr(args, "thinking", None),
-                                peer_message_timeout=getattr(args, "peer_message_timeout", 150.0),
+                                peer_message_timeout=getattr(args, "peer_message_timeout", 0.0),
                             )
                             pass_rate = (
                                 sum(1 for e in event_results if e.passed) / len(event_results)
@@ -3461,10 +3461,11 @@ Examples:
                         choices=["disabled", "enabled"],
                         default=None,
                         help="Set extended thinking mode for OpenClaw agent execute() calls (disabled/enabled). Default: not set (model default).")
-    parser.add_argument("--peer-message-timeout", type=float, default=150.0, metavar="SECONDS",
+    parser.add_argument("--peer-message-timeout", type=float, default=0.0, metavar="SECONDS",
                         help="timeoutSeconds for sessions_send peer messages in multi-agent runs. "
-                             "0 = fire-and-forget (enqueue and return immediately, no reply awaited). "
-                             "Default 150 — sized for 3-hop A2A chains that complete in ~110-115s. "
+                             "0 = fire-and-forget (enqueue and return immediately, no reply awaited) — DEFAULT. "
+                             "Pass >0 (e.g. 150) only if you want coordinator peers to wait for downstream "
+                             "sub-cascade replies; sized for 3-hop A2A chains. "
                              "See https://docs.openclaw.ai/concepts/session-tool. Multi-agent only.")
     parser.add_argument("--steps-only", action="store_true", default=False,
                         help="Run only the steps phase (no modifications/events). "

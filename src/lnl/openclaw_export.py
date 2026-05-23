@@ -109,7 +109,7 @@ def _classify_event_source(descriptor: str) -> EventSourceBinding:
 def _agents_md(
     obj: ObjectDefinition,
     session_name: str = "main",
-    peer_message_timeout: float = 90.0,
+    peer_message_timeout: float = 0.0,
     leaf_peer_ids: "frozenset[str]" = frozenset(),
 ) -> str:
     name = _slug_to_name(obj.object_id)
@@ -598,7 +598,7 @@ def rewrite_agents_md(
     session_name: str,
     *,
     slot_suffix: str = "",
-    peer_message_timeout: float = 90.0,
+    peer_message_timeout: float = 0.0,
 ) -> None:
     """Rewrite only AGENTS.md for each object workspace with the given session_name.
 

@@ -41,5 +41,5 @@ planner_mode: dag
 # workflows where a downstream decision genuinely depends on a value the
 # planner couldn't see at first-plan time (stock level, authorization,
 # returned id). Budget-capped per trace to prevent runaway recursion.
-enable_replan_checkpoints: true
+enable_replan_checkpoints: false
 replan_max_per_trace: 3

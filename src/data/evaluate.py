@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-23 (v31): judge evidence now includes a "PRIOR TOOL EXECUTIONS" section listing tool calls + responses from earlier events of the test case (in addition to the existing per-event "Tool calls" section). Helps the judge cross-reference what the workflow did upstream when scoring later events — especially for post_mod / irrelevant events that depend on whether a base/pre_mod step actually ran. Also exposed `_prior_tool_calls(execs, snapshots)` as a small helper alongside the existing `_new_tool_calls`.
+_VERSION: str = _build_version()  # bumped 2026-05-23 (v32): companion bump for evaluate_baseline.py v36 — multi-agent OC default peer_message_timeout flipped 150→0 (full fire-and-forget). LNL eval logic unchanged.
 
 from src.data.schema import (
     EvalSummary,
