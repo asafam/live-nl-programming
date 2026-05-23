@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-23 (v31): default --enable-replan-checkpoints set to True across the stack (SystemConfig, system.yaml, evaluate.py CLI + internal fn defaults, LLMObject, build_planner_prompt). Replan-mode planner-prompt note is now surfaced by default; planner may emit kind=replan steps for conditional branches whose downstream depends on a value not visible at first-plan time. Disable explicitly via --no-enable-replan-checkpoints or enable_replan_checkpoints: false in system.yaml. Budget per trace unchanged (3, --replan-max).
+_VERSION: str = _build_version()  # bumped 2026-05-22 (v30): default --tool-dispatch set to 'sync' across the stack (SystemConfig, evaluate.py internal + CLI). Async retained via --tool-dispatch async for actor-style production runs; sync is the eval default because the per-turn LLM call in async loses the prior tool_call context and triggers tool re-dispatch / lost-intent failures.
 
 from src.data.schema import (
     EvalSummary,
@@ -402,7 +402,7 @@ def _execute_test_case_inner(
     log_planner_output: bool = False,
     tool_dispatch: str = "sync",
     planner_mode: str = "dag",
-    enable_replan_checkpoints: bool = True,
+    enable_replan_checkpoints: bool = False,
     replan_max_per_trace: int = 3,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample and return event + modification results."""
@@ -1155,7 +1155,7 @@ def execute_test_case(
     log_planner_output: bool = False,
     tool_dispatch: str = "sync",
     planner_mode: str = "dag",
-    enable_replan_checkpoints: bool = True,
+    enable_replan_checkpoints: bool = False,
     replan_max_per_trace: int = 3,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample with a per-event timeout (seconds).
@@ -1520,7 +1520,7 @@ def run(args: argparse.Namespace) -> Path:
     if planner_mode == "dag" and planner_prompt_display == "planner_sequential.yaml":
         # Mode auto-selects planner_dag.yaml unless --planner-prompt was explicit.
         planner_prompt_display = "planner_dag.yaml"
-    replan_enabled = getattr(args, "enable_replan_checkpoints", True)
+    replan_enabled = getattr(args, "enable_replan_checkpoints", False)
     replan_label = (
         f"on (max={getattr(args, 'replan_max', 3)}/trace)" if replan_enabled else "off"
     )
@@ -1793,7 +1793,7 @@ def run(args: argparse.Namespace) -> Path:
                 log_planner_output=(getattr(args, "verbose", None) == "DEBUG"),
                 tool_dispatch=getattr(args, "tool_dispatch", "sync"),
                 planner_mode=getattr(args, "planner_mode", "dag"),
-                enable_replan_checkpoints=getattr(args, "enable_replan_checkpoints", True),
+                enable_replan_checkpoints=getattr(args, "enable_replan_checkpoints", False),
                 replan_max_per_trace=getattr(args, "replan_max", 3),
             )
         finally:
@@ -2529,7 +2529,7 @@ Examples:
         "--enable-replan-checkpoints",
         action=argparse.BooleanOptionalAction,
         dest="enable_replan_checkpoints",
-        default=True,
+        default=False,
         help=(
             "Replan checkpoints: planner re-entry when a `kind=replan` step is "
             "reached. The planner may insert replan steps that suspend "
@@ -2537,8 +2537,8 @@ Examples:
             "the planner with the prior plan + completed step results so it "
             "can emit continuation steps. Use for conditional branches the "
             "planner cannot decide up-front (stock level, authorization, "
-            "returned id). Default: ENABLED. Use --no-enable-replan-checkpoints "
-            "to disable. Budget per trace controlled by --replan-max."
+            "returned id). Default: DISABLED. Use --no-enable-replan-checkpoints "
+            "to be explicit. Budget per trace controlled by --replan-max."
         ),
     )
     parser.add_argument(

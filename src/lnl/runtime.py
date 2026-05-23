@@ -154,7 +154,7 @@ class SystemConfig:
     # results so it can emit continuation steps. Budget-capped to prevent
     # runaway recursion. Orthogonal to planner_mode — works for both sequential
     # and dag.
-    enable_replan_checkpoints: bool = True
+    enable_replan_checkpoints: bool = False
     # Budget per trace_id; mirrors evaluator_max_cycles_per_trace.
     replan_max_per_trace: int = 3
 
@@ -191,7 +191,7 @@ class SystemConfig:
             max_active_plans_per_object=int(data.get("max_active_plans_per_object", 32)),
             memory_backend=str(data.get("memory_backend", "nested")),
             planner_mode=planner_mode,
-            enable_replan_checkpoints=bool(data.get("enable_replan_checkpoints", True)),
+            enable_replan_checkpoints=bool(data.get("enable_replan_checkpoints", False)),
             replan_max_per_trace=int(data.get("replan_max_per_trace", 3)),
         )
 

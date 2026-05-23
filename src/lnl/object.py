@@ -74,7 +74,7 @@ class LLMObject:
         evaluator_brain: "Optional[LLMBrain]" = None,
         planner_prompt_file: str = "planner_sequential.yaml",
         planner_mode: str = "dag",
-        enable_replan_checkpoints: bool = True,
+        enable_replan_checkpoints: bool = False,
         replan_max_per_trace: int = 3,
         log_synthetic_message: "Optional[Callable[[Message], None]]" = None,
         stale_plan_seconds: float = 180.0,

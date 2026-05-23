@@ -7,9 +7,7 @@ again with `prior_plan` + the deferred question; the planner emits
 continuation steps that the runtime appends via `add_steps`. The replan step
 itself transitions `planned → dispatched → done`.
 
-On by default since 2026-05-23; opt-out via
-`SystemConfig.enable_replan_checkpoints=False` or
-`--no-enable-replan-checkpoints`.
+Off by default; opt-in via `SystemConfig.enable_replan_checkpoints`.
 """
 from __future__ import annotations
 
@@ -73,20 +71,20 @@ class TestSchemaAndParser:
 
 
 class TestSystemConfigLoad:
-    def test_default_on(self, tmp_path: Path):
+    def test_default_off(self, tmp_path: Path):
         cfg_path = tmp_path / "system.yaml"
         cfg_path.write_text("heartbeat:\n  enabled: false\n")
         cfg = SystemConfig.load(cfg_path)
-        assert cfg.enable_replan_checkpoints is True
+        assert cfg.enable_replan_checkpoints is False
         assert cfg.replan_max_per_trace == 3
 
-    def test_explicit_off(self, tmp_path: Path):
+    def test_explicit_on(self, tmp_path: Path):
         cfg_path = tmp_path / "system.yaml"
         cfg_path.write_text(
-            "enable_replan_checkpoints: false\nreplan_max_per_trace: 5\n"
+            "enable_replan_checkpoints: true\nreplan_max_per_trace: 5\n"
         )
         cfg = SystemConfig.load(cfg_path)
-        assert cfg.enable_replan_checkpoints is False
+        assert cfg.enable_replan_checkpoints is True
         assert cfg.replan_max_per_trace == 5
 
 
@@ -126,22 +124,21 @@ class TestReplanPromptRendering:
         completed_section = out.split("Completed steps")[-1]
         assert "s2:" not in completed_section
 
-    def test_replan_note_gated_by_flag(self):
+    def test_replan_note_only_when_enabled(self):
         defn = ObjectDefinition(object_id="o", role="r", behavior="b",
                                 peers=[PeerDeclaration("p", "x")])
         from datetime import datetime, timezone
         msg = Message(sender="u", recipient="o", type=MessageType.DOMAIN,
                       content="go", id="m1", trace_id="t1",
                       timestamp=datetime.now(timezone.utc))
-        # Default is now ON — note should appear by default.
-        out_default = build_planner_prompt(defn, "", msg,
-                                           prompt_file="planner_sequential.yaml")
-        assert "Replan checkpoints (available)" in out_default
-        assert "replan_question" in out_default
         out_off = build_planner_prompt(defn, "", msg,
-                                       prompt_file="planner_sequential.yaml",
-                                       enable_replan_checkpoints=False)
+                                       prompt_file="planner_sequential.yaml")
         assert "Replan checkpoints (available)" not in out_off
+        out_on = build_planner_prompt(defn, "", msg,
+                                      prompt_file="planner_sequential.yaml",
+                                      enable_replan_checkpoints=True)
+        assert "Replan checkpoints (available)" in out_on
+        assert "replan_question" in out_on
 
 
 # ── End-to-end: planner emits replan → runtime invokes planner again ───────
@@ -237,11 +234,10 @@ class TestReplanEndToEnd:
         assert orch._replan_cycles_per_trace, \
             "expected replan cycle counter to be populated"
 
-    def test_explicit_off_no_planner_re_entry(self):
-        """When enable_replan_checkpoints=False (explicit opt-out — the
-        default is now ON), a replan step in the plan is NOT actioned: the
-        planner is invoked once; the replan step stays in `planned` status;
-        the budget counter stays empty."""
+    def test_disabled_by_default_no_planner_re_entry(self):
+        """When enable_replan_checkpoints=False, a replan step in the plan is
+        NOT actioned: the planner is invoked once; the replan step stays in
+        `planned` status; the budget counter stays empty."""
         brain = MockBrain()
         self._script_initial_and_continuation(brain)
         brain.script_react(ReactStep(
@@ -253,9 +249,8 @@ class TestReplanEndToEnd:
             finish=ReactFinish(reply="ok", outgoing_messages=[]),
         ))
         brain.set_default(LLMResponse(updated_state={}, reply=""))
-        # Explicit opt-out — default flipped ON 2026-05-23.
-        cfg = SystemConfig(enable_replan_checkpoints=False)
-        rt = Runtime(brain, system_config=cfg)
+        # Default config — replan checkpoints OFF.
+        rt = Runtime(brain)
         rt.create_object(_defn())
         rt.send("orchestrator", "test")
         orch = rt._bus.objects["orchestrator"]
