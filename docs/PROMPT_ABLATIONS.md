@@ -2201,3 +2201,79 @@ without the overcorrection.
 | `executor.yaml` no-placeholder rule | Extended in 74b9e6e — wrapper variants `<unknown>` etc. covered, plus omit-the-field guidance when upstream tool returned no usable value |
 | `gather_evidence` prior_tool_calls | parameter + helper exist, not threaded |
 | `enable_replan_checkpoints` | default `False`; opt-in per-run |
+
+### Base-step R3 investigation (no eval run): lead-router S002 is also mock-data ceiling
+
+Inspected lead-router-temporal/S002 base failure across HEAD/R1/R2 to
+see if a targeted prompt change could fix it. Trace shows:
+
+  - Planner produced correct plan: `tell → sales-pipeline`
+  - Outgoing dispatched: `lead-routing → sales-pipeline (domain):
+    Updated lead record for lead_identifier LEAD-NE-001:
+    rep_name=Sandra Okafor, claim_timestamp=..., lead_status=claimed`
+  - Tool `update_active_leads_sheet` called 3 times with required
+    fields (lead_identifier, rep_name, claim_timestamp, lead_status)
+
+But:
+  - The `update_active_leads_sheet` calls have NO `← {...}` response in
+    the trace — mock tool isn't registered or doesn't update state
+  - `sales-pipeline` object state isn't being touched
+  - Judge looks for "sales-pipeline state entry showing X was updated"
+    → doesn't find it → fails
+
+Same shape as form-jira's mock-data ceiling. The prompt-level behavior
+is correct; the runtime-mock integration is the gap.
+
+### Inconclusive-TC categorization (summary)
+
+Of 25 inconclusive base failures on the 100-TC subset:
+
+| Category | TCs | Prompt-fixable? | Notes |
+|---|---:|---|---|
+| `<unknown>` placeholder (Pattern A) | 5 | partially | Base-R1 fixed 2/5 (engineering-work-intake); form-jira × 3 hit mock ceiling |
+| Missing downstream dispatch (D) | 6 | partially | engineering-work-intake fixed; lead-router × 2 hit mock ceiling |
+| Content truncation (B) | 5 | model-level | Long fields get fragmented across messages |
+| Wrong count / wrong lookup (C) | 3 | model-level | Brand-mentions wrong count, granola wrong assignees |
+| Infra-error (E) | 8 | no | Mock-server / content-filter — separate axis |
+| Action gating misses (F) | 2 | partially | Instagram-content / Google-my-business posted when shouldn't |
+
+**Total prompt-fixable from this sample: 2 TCs (engineering-work-intake).**
+The base-step loop converged after one round.
+
+### Final assessment of the prompt feedback loop
+
+Across the full session (mod loop R0–R9 + R5-rep + 3-run + 100-TC
+baseline + base-step R1–R2):
+
+  - **5 prompt commits produced measurable targeted wins**: R1 admin
+    MODIFICATION RULES (~+10 events vs R0 in original; needs replication),
+    R5 mod-loop gated planner hint (gated structurally, costless),
+    Base-step R1 wrapper-variant placeholder list (+2 targeted on
+    engineering-work-intake).
+  - **Everything else was at or below the ±10pt noise floor** of the
+    30-TC × 1-run measurement methodology.
+  - **The dominant performance ceiling on this dataset is mock-data
+    integration**, not prompt quality. Multiple workflows (form-jira,
+    lead-router, save-email-attachments, ai-voice-generator,
+    automate-employment-verification-letters) fail because mock tool
+    returns don't carry the values the workflow's downstream steps
+    need. No prompt rule can synthesize a value the mock didn't return.
+
+### Recommended next angles (non-prompt)
+
+In priority order:
+
+1. **Mock tool return enrichment.** For each chronically-failing
+   workflow, identify which downstream values the workflow expects
+   (e.g. Jira `issue_key`, Google Drive `file_id`, sales-pipeline
+   `sheet_row_id`) and update the mock to return them. Cascading
+   benefit: many TCs share mock tools (Jira used in form-jira × 3 +
+   engineering-work-intake × 2).
+2. **Runtime state-sync from tool calls.** When a mock tool is
+   semantically "store/update X in service Y", the runtime should
+   register the change in Y's object state — so the judge can find
+   it. Currently the agent dispatches a message AND calls the tool
+   but neither writes through to the object's state automatically.
+3. **Multi-run + larger-sample baseline.** 100 TCs × 3 runs would
+   give ME ±0.033 — finally enough to detect ±3pt prompt deltas. The
+   prompt iteration loop is unusable below this resolution.
