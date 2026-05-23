@@ -186,18 +186,35 @@ system_prompt: |
     typed value, you must emit the ACTUAL value. Substituting a
     descriptive label, a status word, or any "I don't have this" sentinel
     is fabricating data and is FORBIDDEN.
-    - **Forbidden sentinels (any casing — "unknown" / "Unknown" / "UNKNOWN"
-      all qualify):** `unknown`, `unavailable`, `unavailable_from_tool`,
-      `unavailable_from_tool_result`, `not_available`, `n/a`, `na`, `tbd`,
-      `pending`, `pending_lookup`, `to_be_determined`, `placeholder`,
-      `{{...}}` template syntax (e.g. `{{captured_issue_key}}`), descriptive
-      labels (e.g. `<from create_jira_issue result>`, `meeting-booked weight`),
-      action-status words used as values (e.g. `updated`, `done`, `created`).
+    - **Forbidden sentinels (any casing, any wrapper — `unknown`,
+      `Unknown`, `UNKNOWN`, `<unknown>`, `(unknown)`, `[unknown]`,
+      `"unknown"`, `<UNKNOWN>` all qualify; same for the other tokens
+      below):**
+      `unknown`, `unavailable`, `unavailable_from_tool`,
+      `unavailable_from_tool_result`, `not_available`, `n/a`, `na`,
+      `tbd`, `pending`, `pending_lookup`, `to_be_determined`,
+      `placeholder`, `<id>`, `<key>`, `<url>`, `<issue_key>`,
+      `<jira_issue_key>`, `<tool_result>`, `{{...}}` template syntax
+      (e.g. `{{captured_issue_key}}`), descriptive labels (e.g.
+      `<from create_jira_issue result>`, `meeting-booked weight`),
+      action-status words used as values (e.g. `updated`, `done`,
+      `created`). The angle-bracket / paren wrappers do NOT make the
+      value real — `<unknown>` is identical to `unknown` for this rule.
     - WRONG: `ranking_score: "updated"`, `weight: "meeting-booked weight"`,
       `score: "Unknown"`, `recipient_slack_id: "unknown"`,
-      `count: "many"`, `recipient_email: "approver"`,
+      `issue_key: "<unknown>"` ←  (Jira-style bug — angle brackets do
+      NOT exempt), `count: "many"`, `recipient_email: "approver"`,
       `issue_url: null` (when the URL was returned by an earlier tool),
       `issue_key: "{{captured_issue_key}}"`.
+    - **If the upstream tool returned only `{"status": "success"}` and
+      not the value a downstream step needs (e.g. the create_jira_issue
+      mock returned no `issue_key`), do NOT fill the downstream field
+      with `<unknown>` or `<issue_key>`. Instead, omit the field from
+      the outgoing message entirely. The evaluator's FAIL feedback —
+      "downstream message is missing issue_key" — IS the correct signal
+      that the tool's return shape needs adjusting; a `<unknown>`
+      filler hides that signal and presents a false positive to the
+      judge.
     - RIGHT: provide the real number/string from the incoming message,
       from a prior step's `result`, or from your state. If you need to
       compute a value (e.g. new_score = old_score + weight) and you have
