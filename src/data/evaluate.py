@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-23 (v34): hotfix — outer execute_test_case wrapper was missing the new step-retry-replan kwargs added in v33, so harness calls failed with TypeError. Inner _execute_test_case_inner already had them.
+_VERSION: str = _build_version()  # bumped 2026-05-23 (v36): add last_failure_reason to plan step serialization.
 
 from src.data.schema import (
     EvalSummary,
@@ -659,6 +659,10 @@ def _serialize_plan(obj_id: str, plan, source: str) -> dict:
             "result_kind": getattr(s, "result_kind", None),
             "wait_predicate": getattr(s, "wait_predicate", None),
             "wait_source": getattr(s, "wait_source", None),
+            "retry_count": getattr(s, "retry_count", 0),
+            "reactive_replan_count": getattr(s, "reactive_replan_count", 0),
+            "last_failure_reason": getattr(s, "last_failure_reason", None),
+            "reactive_replan_for": getattr(s, "reactive_replan_for", None),
         } for s in (plan.steps or [])],
     }
 
@@ -1934,6 +1938,9 @@ def run(args: argparse.Namespace) -> Path:
         concurrency=getattr(args, "concurrency", None),
         modifications=getattr(args, "modifications", None),
         is_continuation=is_continuation,
+        enable_step_retry_replan=getattr(args, "enable_step_retry_replan", False),
+        step_max_retries=getattr(args, "step_max_retries", 2),
+        step_replan_max=getattr(args, "step_replan_max", 1),
     )
 
     # With --reuse-steps, split into two phases to avoid blocking worker threads:

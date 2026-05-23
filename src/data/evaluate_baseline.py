@@ -298,7 +298,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-23 (v38): companion bump for evaluate.py v34 — hotfix to outer execute_test_case wrapper for step-retry-replan kwargs. Baseline logic unchanged.
+_VERSION: str = _build_version()  # bumped 2026-05-23 (v40): companion bump for evaluate.py v36. Baseline logic unchanged.
 
 # ── Infrastructure failure detection ─────────────────────────────────────────
 

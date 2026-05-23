@@ -383,6 +383,9 @@ class PlanStep:
     # feature flag is off.
     retry_count: int = 0
     reactive_replan_count: int = 0
+    # Last evaluator failure summary for this step — overwritten on each FAIL
+    # cycle; used to give the planner context when a reactive replan fires.
+    last_failure_reason: Optional[str] = None
     # Tag set by _synthesize_reactive_replans on the synthetic kind=replan step
     # so the terminal-failure branch in _dispatch_pending_replans can recognize
     # it and propagate failure back to the originating step's id.

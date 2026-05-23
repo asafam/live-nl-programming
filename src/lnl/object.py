@@ -2457,16 +2457,21 @@ class LLMObject:
         """
         if trace_id is None or not criteria:
             return
-        failed_ids: set[str] = set()
+        # Collect failure diagnostics keyed by step_id (one line per sub-item).
+        failed_reasons: dict[str, list[str]] = {}
         for c in criteria:
             if not isinstance(c, dict):
                 continue
             if (c.get("status") or "").upper() != "FAIL":
                 continue
             sid = c.get("step_id")
-            if isinstance(sid, str) and sid:
-                failed_ids.add(sid)
-        if not failed_ids:
+            if not isinstance(sid, str) or not sid:
+                continue
+            diag = c.get("diagnostic", "")
+            sub = c.get("sub_item", "")
+            line = f"{sub}: {diag}" if sub else diag
+            failed_reasons.setdefault(sid, []).append(line)
+        if not failed_reasons:
             return
         with self._plans_lock:
             plan = self._active_plans.get(trace_id)
@@ -2475,8 +2480,9 @@ class LLMObject:
             now = datetime.datetime.now(datetime.timezone.utc)
             for i, s in enumerate(plan.steps):
                 sid = s.id or f"s{i+1}"
-                if sid in failed_ids:
+                if sid in failed_reasons:
                     s.retry_count += 1
+                    s.last_failure_reason = "; ".join(failed_reasons[sid])
                     plan.last_progress_at = now
 
     def _synthesize_reactive_replans(self, trace_id: Optional[str]) -> int:
@@ -2505,7 +2511,11 @@ class LLMObject:
             for i, s in enumerate(original_steps):
                 if s.kind == "replan":
                     continue
-                if s.status in STEP_TERMINAL_STATUSES:
+                # Skip hard-terminal steps: failed (gave up) and skipped
+                # (explicitly bypassed). `done` is allowed — the executor
+                # completed the step but the evaluator rejected the result,
+                # so we still want to synthesize an alternative continuation.
+                if s.status in ("failed", "skipped"):
                     continue
                 if s.retry_count < self._step_max_retries:
                     continue
@@ -2521,6 +2531,10 @@ class LLMObject:
                     for r in plan.steps
                 ):
                     continue
+                failure_ctx = (
+                    f" Last evaluator feedback: {s.last_failure_reason}."
+                    if s.last_failure_reason else ""
+                )
                 new_idx = len(plan.steps)
                 plan.steps.append(PlanStep(
                     kind="replan",
@@ -2533,9 +2547,9 @@ class LLMObject:
                     status="planned",
                     replan_question=(
                         f"Step {origin_id} ({s.description!r}) has been retried "
-                        f"{s.retry_count} times without resolving. Propose an "
-                        "alternative continuation that bypasses or works around "
-                        "the blocked step."
+                        f"{s.retry_count} times without resolving.{failure_ctx} "
+                        "Propose an alternative continuation that bypasses or "
+                        "works around the blocked step."
                     ),
                     reactive_replan_for=origin_id,
                 ))

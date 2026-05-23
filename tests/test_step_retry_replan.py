@@ -158,9 +158,10 @@ class TestSynthesizeReactiveReplans:
 
         assert added == 0
 
-    def test_terminal_step_not_escalated(self):
-        """Steps already done/failed/skipped don't trigger synthesis even
-        if retry_count is past the threshold — they're no longer in play."""
+    def test_done_step_is_escalated(self):
+        """A `done` step with retry_count past the threshold DOES trigger
+        synthesis — `done` means the executor attempted it, but if the
+        evaluator kept rejecting the output we still want an alternative."""
         obj = _make_object(step_max_retries=2)
         s1 = PlanStep(
             kind="tool", id="s1", description="lookup",
@@ -170,7 +171,40 @@ class TestSynthesizeReactiveReplans:
 
         added = obj._synthesize_reactive_replans("t1")
 
-        assert added == 0
+        assert added == 1
+
+    def test_hard_terminal_steps_not_escalated(self):
+        """Steps with `failed` or `skipped` status don't trigger synthesis
+        even if retry_count is past the threshold — they were explicitly
+        given up on or bypassed."""
+        for status in ("failed", "skipped"):
+            obj = _make_object(step_max_retries=2)
+            s1 = PlanStep(
+                kind="tool", id="s1", description="lookup",
+                retry_count=5, status=status,
+            )
+            _seed_plan(obj, "t1", [s1])
+
+            added = obj._synthesize_reactive_replans("t1")
+
+            assert added == 0, f"expected no replan for status={status!r}"
+
+    def test_failure_reason_in_replan_question(self):
+        """last_failure_reason on the origin step appears in the synthetic
+        replan step's replan_question so the planner has failure context."""
+        obj = _make_object(step_max_retries=2)
+        s1 = PlanStep(
+            kind="tell", id="s1", description="send email",
+            retry_count=3, status="done",
+            last_failure_reason="no outgoing message observed",
+        )
+        _seed_plan(obj, "t1", [s1])
+
+        obj._synthesize_reactive_replans("t1")
+
+        plan = obj._active_plans["t1"]
+        rr = next(s for s in plan.steps if s.reactive_replan_for == "s1")
+        assert "no outgoing message observed" in (rr.replan_question or "")
 
     def test_pending_synthetic_replan_blocks_duplicate(self):
         """If a synthetic replan for this step is already pending in the
