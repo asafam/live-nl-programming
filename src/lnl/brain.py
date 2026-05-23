@@ -981,21 +981,28 @@ def _build_chat_messages(
     """
     msgs: list[dict[str, str]] = [{"role": "system", "content": sys_prompt}]
     if history:
-        # Group entries by task_id, preserving first-occurrence order.
-        groups: "dict[Optional[str], list[Message]]" = {}
+        # Two-level grouping — history[task][plan]. Outer by task_id, inner
+        # by plan_id (the plan generation). Both groupings preserve first-
+        # occurrence order. None task_id renders under "-- Other --"; None
+        # plan_id (only the orphan bucket today) skips the inner header.
+        task_groups: "dict[Optional[str], dict[Optional[str], list[Message]]]" = {}
         for entry in history:
-            groups.setdefault(entry.task_id, []).append(entry.message)
+            inner = task_groups.setdefault(entry.task_id, {})
+            inner.setdefault(entry.plan_id, []).append(entry.message)
         history_lines: list[str] = []
-        for task_id, msgs_in_group in groups.items():
+        for task_id, plan_buckets in task_groups.items():
             if task_id is None:
                 history_lines.append("  -- Other --")
             else:
                 history_lines.append(f"  -- Task {task_id[:8]} --")
-            for msg in msgs_in_group:
-                if _is_tool_reply(msg):
-                    history_lines.append(f"    {_render_tool_reply(msg)}")
-                else:
-                    history_lines.append(f"    [{_message_label(msg)}]: {msg.content}")
+            for plan_id, msgs_in_group in plan_buckets.items():
+                if plan_id is not None:
+                    history_lines.append(f"    -- Plan {plan_id[:8]} --")
+                for msg in msgs_in_group:
+                    if _is_tool_reply(msg):
+                        history_lines.append(f"      {_render_tool_reply(msg)}")
+                    else:
+                        history_lines.append(f"      [{_message_label(msg)}]: {msg.content}")
         msgs.append({"role": "user", "content": "[Past messages — already reflected in your state]\n" + "\n".join(history_lines)})
         msgs.append({"role": "assistant", "content": "Understood. What is the new message?"})
     if _is_tool_reply(message):

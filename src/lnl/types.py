@@ -201,6 +201,13 @@ class Message:
     # ── Transaction tracing (runtime-only; not exposed to the LLM) ──────────────
     trace_id: Optional[str] = None       # root msg.id of the cascade; propagated through every hop
     parent_id: Optional[str] = None      # msg.id whose processing caused this message to be sent
+    # Sender-side provenance: the task and plan generation in the sender
+    # LLM-object that produced this message. Lets receivers (and traces /
+    # debug tooling) correlate an inbound message back to the sender's
+    # task and plan generation. None when the sender had no active plan
+    # (admin path, external bootstrap, broadcasts).
+    task_id: Optional[str] = None
+    plan_id: Optional[str] = None
 
 
 @dataclass
@@ -222,6 +229,11 @@ class OutgoingMessage:
     plan_step_index: Optional[int] = None  # index of the plan step this dispatches (if correlated)
     in_reply_to: Optional[str] = None      # original message id when this is a cross-turn reply to a pending Ask
     is_reply: bool = False                 # true when this fulfills a pending inbound Ask (routed as MessageType.REPLY)
+    # Sender-side provenance: identifies the task and plan generation that
+    # produced this outgoing within the sender LLM-object. Together with
+    # plan_step_index and in_reply_to, the full causal chain is preserved.
+    task_id: Optional[str] = None          # sender's plan.task_id (stable across replans)
+    plan_id: Optional[str] = None          # sender's plan.id (re-minted on replan)
 
 
 @dataclass
@@ -380,11 +392,20 @@ class PlanStep:
 @dataclass
 class Plan:
     """An active or terminated plan, scoped to one trace_id. Multiple plans
-    may coexist on a single object — one per concurrent cascade."""
+    may coexist on a single object — one per concurrent cascade.
+
+    Identifiers:
+      - task_id: stable for the entire object-local processing of an
+        incoming request. Preserved across replan-in-place (the plan is
+        regenerated, but the task is the same). Used to tag HistoryEntry
+        rows and to stamp outgoing-message provenance.
+      - id: identifies a specific plan *generation*. Re-minted on every
+        replan-in-place so each generation is distinguishable.
+    """
     goal: str
-    # Stable per-plan identifier — survives replan-in-place; used to tag
-    # HistoryEntry rows so history can be grouped by task and flushed when
-    # the plan terminates.
+    # Stable across plan regeneration.
+    task_id: str = field(default_factory=lambda: secrets.token_hex(8))
+    # Re-minted on every replan-in-place.
     id: str = field(default_factory=lambda: secrets.token_hex(8))
     steps: list[PlanStep] = field(default_factory=list)
     status: str = "active"               # "active" | "waiting" | "complete" | "cancelled" | "abandoned" | "failed"
@@ -421,14 +442,21 @@ class Plan:
 
 @dataclass
 class HistoryEntry:
-    """A past message in an LLM-object's history, tagged with the Plan.id of
-    the task that owned its processing.
+    """A past message in an LLM-object's history, tagged with the task and
+    plan generation that owned its processing.
 
-    task_id == None means the message arrived outside any plan (admin
-    messages, broadcasts, or DOMAIN messages handled with planner disabled).
+    History is rendered grouped first by task_id (the stable request id),
+    then by plan_id (the specific plan generation — re-minted on every
+    replan). When a plan generation terminates (complete / cancelled /
+    failed / abandoned) or is replaced by a replan, its entries are
+    flushed.
+
+    Both fields are None for messages that arrived outside any plan
+    (admin, broadcasts, planner-off DOMAIN).
     """
     message: Message
     task_id: Optional[str] = None
+    plan_id: Optional[str] = None
 
 
 @dataclass

@@ -304,6 +304,7 @@ class LLMObject:
                     id=tc.id, output="",
                     error="Tool worker exited without producing a result.",
                 )
+            _reply_plan = self.plan_for(trace_id)
             reply_msg = Message(
                 sender=f"__tool__:{tc.tool}",
                 recipient=self.object_id,
@@ -317,6 +318,8 @@ class LLMObject:
                 id=f"tool-reply-{call_key}",
                 in_reply_to=call_key,
                 reference=tc.id,  # original LLM-assigned tool call ID for conversation reconstruction
+                task_id=_reply_plan.task_id if _reply_plan is not None else None,
+                plan_id=_reply_plan.id if _reply_plan is not None else None,
             )
             self.deliver(reply_msg, decrement_pending=True)
         return result
@@ -375,30 +378,40 @@ class LLMObject:
         orphan messages (admin / no-plan)."""
         return list(self._history)
 
-    def _resolve_task_id(self, trace_id: Optional[str]) -> Optional[str]:
-        """Resolve the current task (plan) id for a trace. None means no
-        active plan (admin path, broadcasts, or planner-off DOMAIN).
-        plan_for() already handles wait-step absorption."""
+    def _resolve_task_plan_ids(self, trace_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        """Resolve (task_id, plan_id) for a trace. task_id is plan.task_id
+        (stable across replan-in-place); plan_id is plan.id (re-minted on
+        every replan). Both None when no plan is active (admin path,
+        broadcasts, planner-off DOMAIN). plan_for() handles wait-step
+        absorption."""
         if not trace_id:
-            return None
+            return (None, None)
         plan = self.plan_for(trace_id)
-        return plan.id if plan is not None else None
+        if plan is None:
+            return (None, None)
+        return (plan.task_id, plan.id)
 
-    def _append_history(self, msg: Message, task_id: Optional[str]) -> None:
+    def _append_history(
+        self,
+        msg: Message,
+        task_id: Optional[str],
+        plan_id: Optional[str],
+    ) -> None:
         """Append a tagged HistoryEntry and enforce the total cap. Callers
-        either pass a pre-captured task_id (when the surrounding turn may
-        auto-close the plan before this append runs) or resolve it lazily
-        via _resolve_task_id()."""
-        self._history.append(HistoryEntry(message=msg, task_id=task_id))
+        either pass pre-captured ids (when the surrounding turn may
+        auto-close the plan before this append runs) or resolve them
+        lazily via _resolve_task_plan_ids()."""
+        self._history.append(HistoryEntry(message=msg, task_id=task_id, plan_id=plan_id))
         if len(self._history) > self._max_history:
             self._history = self._history[-self._max_history:]
 
-    def _flush_history_for_task(self, task_id: str) -> None:
-        """Drop every history entry tagged with `task_id`. Called from plan
-        terminal-close sites (complete / cancel / abandon / timeout)."""
-        if not task_id:
+    def _flush_history_for_plan(self, plan_id: str) -> None:
+        """Drop every history entry tagged with `plan_id`. Called from plan
+        terminal-close sites (complete / cancel / abandon / timeout) AND
+        from replan-in-place (the old plan generation is being replaced)."""
+        if not plan_id:
             return
-        self._history = [e for e in self._history if e.task_id != task_id]
+        self._history = [e for e in self._history if e.plan_id != plan_id]
 
     # --- Mailbox ---
 
@@ -997,15 +1010,24 @@ class LLMObject:
                     # which is the safer recovery path.
                     if plan.steps:
                         if needs_replan and existing_plan is not None:
-                            # Re-plan in place: keep plan-scoped state and
-                            # deltas, replace goal/steps/status with fresh
-                            # output from the planner.
+                            # Re-plan in place: keep plan-scoped state, deltas,
+                            # and task_id (this is still the same task), but
+                            # re-mint plan.id since this is a fresh plan
+                            # generation. The old plan generation's history
+                            # entries are flushed — the old plan is being
+                            # replaced, so its in-flight exchanges shouldn't
+                            # confuse the new generation's executor.
+                            import secrets as _secrets
+                            old_plan_id = existing_plan.id
                             with self._plans_lock:
                                 existing_plan.goal = plan.goal
                                 existing_plan.steps = plan.steps
                                 existing_plan.status = "active"
                                 existing_plan.needs_replan = False
+                                existing_plan.id = _secrets.token_hex(8)
                                 existing_plan.last_progress_at = datetime.datetime.now(datetime.timezone.utc)
+                            if old_plan_id:
+                                self._flush_history_for_plan(old_plan_id)
                             plan = existing_plan
                         else:
                             plan.state = self._state  # snapshot master at plan creation
@@ -1105,13 +1127,13 @@ class LLMObject:
             effective_depth = message.depth_remaining
             effective_step_index = message.plan_step_index
 
-        # Capture the task_id (plan.id) BEFORE the self-correction loop.
+        # Capture (task_id, plan_id) BEFORE the self-correction loop.
         # The evaluator inside the loop may auto-close the plan, after which
         # plan_for(trace_id) returns None. Capturing here ensures the final
-        # history append still tags the message with the correct task — the
-        # close-driven flush then removes it along with the rest of the
-        # task's history entries.
-        captured_task_id = self._resolve_task_id(trace_id)
+        # history append still tags the message with the correct plan
+        # generation — the close-driven flush then removes it along with
+        # the rest of that plan generation's entries.
+        captured_task_id, captured_plan_id = self._resolve_task_plan_ids(trace_id)
 
         # Self-correction loop. Each iteration: one ReAct cycle → evaluate
         # → break on PASS/skip OR on cycle cap, else re-prime messages with
@@ -1155,7 +1177,8 @@ class LLMObject:
                     # Persist tool names so the evaluator in the continuation
                     # turn can verify plan tool steps were actually executed.
                     plan.accumulated_tools_called.extend(tools_called_total)
-                self._append_history(message, self._resolve_task_id(trace_id))
+                _t, _p = self._resolve_task_plan_ids(trace_id)
+                self._append_history(message, _t, _p)
                 processing_completed_at = datetime.datetime.now(datetime.timezone.utc)
                 return ProcessingResult(
                     object_id=self.object_id,
@@ -1339,7 +1362,7 @@ class LLMObject:
                 ),
             }
 
-        self._append_history(message, captured_task_id)
+        self._append_history(message, captured_task_id, captured_plan_id)
 
         # Register any wait steps that are ready to be dispatched: kind=wait,
         # status=planned, and all depends_on satisfied. Sets plan.status to
@@ -1439,7 +1462,7 @@ class LLMObject:
                 for plan in self._active_plans.values():
                     plan.needs_replan = True
 
-        self._append_history(message, None)
+        self._append_history(message, None, None)
 
         processing_completed_at = datetime.datetime.now(datetime.timezone.utc)
         return ProcessingResult(
@@ -1795,7 +1818,7 @@ class LLMObject:
         # Shape 3: close active plan.
         if update.status in PLAN_TERMINAL_STATUSES:
             accumulated = []
-            closed_task_id: Optional[str] = None
+            closed_plan_id: Optional[str] = None
             with self._plans_lock:
                 plan = self._active_plans.get(trace_id) if trace_id is not None else None
                 if plan is None:
@@ -1809,14 +1832,14 @@ class LLMObject:
                 if update.status == "complete":
                     accumulated = list(plan.accumulated_deltas)
                 plan.status = update.status
-                closed_task_id = plan.id
+                closed_plan_id = plan.id
                 self._completed_plans.append(plan)
                 del self._active_plans[trace_id]
             if accumulated:
                 self._memory.apply(accumulated)
                 self._state = self._memory.serialize()
-            if closed_task_id:
-                self._flush_history_for_task(closed_task_id)
+            if closed_plan_id:
+                self._flush_history_for_plan(closed_plan_id)
             return
 
         # Shape 2: incremental updates to active plan.
@@ -1939,11 +1962,18 @@ class LLMObject:
             return outgoing
         with self._plans_lock:
             plan = self._active_plans.get(trace_id) if trace_id is not None else None
+        # Sender-side provenance: stamp every outgoing with the current
+        # task_id and plan_id (re-minted on replan). None when no plan is
+        # active (planner-off, admin reply, etc.).
+        sender_task_id = plan.task_id if plan is not None else None
+        sender_plan_id = plan.id if plan is not None else None
 
         for out in outgoing:
             out.plan_step_index = None
             out.in_reply_to = None
             out.is_reply = False
+            out.task_id = sender_task_id
+            out.plan_id = sender_plan_id
 
             # Path 1 — plan step match.
             if plan is not None and plan.status == "active":
@@ -2214,13 +2244,13 @@ class LLMObject:
                 else:
                     if (now - plan.last_progress_at) > threshold:
                         stale_tids.append(tid)
-            retired_task_ids: list[str] = []
+            retired_plan_ids: list[str] = []
             for tid in stale_tids:
                 plan = self._active_plans.pop(tid)
                 plan.status = "abandoned"
                 self._completed_plans.append(plan)
                 if plan.id:
-                    retired_task_ids.append(plan.id)
+                    retired_plan_ids.append(plan.id)
                 logger.debug(
                     "Retired stale plan for %s (trace=%s, idle=%.0fs)",
                     self.object_id, tid, (now - plan.last_progress_at).total_seconds(),
@@ -2236,7 +2266,7 @@ class LLMObject:
                 plan.status = "failed"
                 self._completed_plans.append(plan)
                 if plan.id:
-                    retired_task_ids.append(plan.id)
+                    retired_plan_ids.append(plan.id)
                 logger.info(
                     "Wait step timed out for %s (trace=%s, step=%d); plan closed.",
                     self.object_id, tid, step_idx,
@@ -2256,7 +2286,7 @@ class LLMObject:
                 oldest_plan.status = "abandoned"
                 self._completed_plans.append(oldest_plan)
                 if oldest_plan.id:
-                    retired_task_ids.append(oldest_plan.id)
+                    retired_plan_ids.append(oldest_plan.id)
                 logger.warning(
                     "Force-retired plan for %s (trace=%s) — active-plan cap %d reached",
                     self.object_id, oldest_tid, self._max_active_plans,
@@ -2266,9 +2296,9 @@ class LLMObject:
         if retired:
             with self._waits_lock:
                 self._pending_waits = [w for w in self._pending_waits if w["trace_id"] not in retired]
-        # Flush history rows tagged with any retired task id.
-        for tid in retired_task_ids:
-            self._flush_history_for_task(tid)
+        # Flush history rows tagged with any retired plan generation id.
+        for pid in retired_plan_ids:
+            self._flush_history_for_plan(pid)
 
     # --- Wait-step correlation ---------------------------------------------
 
@@ -2919,7 +2949,7 @@ class LLMObject:
         and commit its accumulated deltas to the master state."""
         closed = False
         accumulated = []
-        closed_task_id: Optional[str] = None
+        closed_plan_id: Optional[str] = None
         with self._plans_lock:
             plan = self._active_plans.get(trace_id) if trace_id is not None else None
             if plan is None or not plan.steps:
@@ -2928,7 +2958,7 @@ class LLMObject:
             if all_terminal:
                 plan.status = "complete"
                 accumulated = list(plan.accumulated_deltas)
-                closed_task_id = plan.id
+                closed_plan_id = plan.id
                 self._completed_plans.append(plan)
                 del self._active_plans[trace_id]
                 closed = True
@@ -2937,8 +2967,8 @@ class LLMObject:
                 self._memory.apply(accumulated)
                 self._state = self._memory.serialize()
             self._unregister_waits_for_trace(trace_id)
-            if closed_task_id:
-                self._flush_history_for_task(closed_task_id)
+            if closed_plan_id:
+                self._flush_history_for_plan(closed_plan_id)
 
     def mark_step_dispatched(self, step_index: int, trace_id: Optional[str] = None) -> None:
         """Runtime hook: after a plan-tagged outgoing goes on the bus, flip
@@ -3002,6 +3032,7 @@ class LLMObject:
             "definition": asdict(self._definition),
             "history_length": len(self._history),
             "history_task_ids": [e.task_id for e in self._history],
+            "history_plan_ids": [e.plan_id for e in self._history],
             "active_plan": plan_snap,
             "active_plans": active_plans_snap,
             "completed_plans": completed_snap,

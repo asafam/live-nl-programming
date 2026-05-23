@@ -841,6 +841,10 @@ class Runtime:
                 error=out.error if out.is_reply else None,
                 trace_id=result.source_trace_id,
                 parent_id=result.source_message_id,
+                # Sender-side provenance: which task and plan generation in
+                # the sender object produced this outgoing.
+                task_id=out.task_id,
+                plan_id=out.plan_id,
             )
             self._bus.deliver(chained)
             # If this outgoing dispatched one of our own plan steps, flip the
