@@ -1825,3 +1825,65 @@ Bisect-driven decisions:
    structural signals (markers in already-rendered text) rather than
    adding them to the universal prompt and hoping the LLM ignores them
    when irrelevant.
+
+### R8 & R9 — gated executor-side and evaluator-side mod hints (both reverted)
+
+After R5 landed as the operating point (gated mod-aware planner hint),
+two more layers were tried to push past the plateau:
+
+R8 — gated executor-side hint (mirrors the planner hint structure;
+fires only when the rendered behavior contains the `MODIFICATION RULES`
+marker; same content as planner hint, applied to the executor system
+prompt).
+
+R9 — gated evaluator-side hint (different layer: tells the evaluator
+to grade mod compliance — fail-if-suppressed-step-fires,
+fail-if-additionally-do-step-missing — so the executor self-corrects
+through the existing feedback loop rather than reading the rules per
+turn).
+
+Results on the random-30 mod eval, same 30 TCs:
+
+| Round | Layer | Mean | Steps | Mod | Inconclusive | Same-event Δ vs R5 |
+|---|---|---:|---:|---:|---:|---:|
+| R5 ★ | planner | 0.6383 | 0.8583 | 0.6000 | 5 | — |
+| R8 | + executor | 0.5640 | 0.5797 | 0.5643 | 14 | −10 |
+| R9 | + evaluator | 0.5480 | 0.7319 | 0.5143 | 11 | −12 |
+
+R8 same-event breakdown vs R5 (170 common events):
+  post_mod    n=76  + 13  - 10  net  +3 (the targeted-population win)
+  base        n=40  +  0  - 11  net -11 (stochastic; base events don't
+                                          carry the marker so the hint
+                                          never fires on them)
+  pre_mod     n=28  +  2  -  4  net  -2
+  irrelevant  n=26  +  2  -  2  net   0
+  TOTAL                   -10
+
+R9 same-event breakdown vs R5 (169 common events):
+  post_mod    n=76  +  7  - 11  net  -4 (targeted regressed!)
+  base        n=40  +  3  - 10  net  -7 (stochastic)
+  irrelevant  n=26  +  2  -  4  net  -2
+  pre_mod     n=27  +  3  -   2 net  +1
+  TOTAL                   -12
+
+R8 had +3 on the targeted post-mod subset — real but at the noise
+floor; offset by stochastic base regression. R9 actually regressed on
+post-mod (−4), suggesting the evaluator interpreted rules too strictly
+and pushed the executor into wrong corrections.
+
+Both reverted. R5 remains the final operating point. The mod loop has
+conclusively plateaued — every layer attempted (admin format, planner
+hint, executor hint, evaluator hint) shows the same pattern: targeted
+gains in the +2 to +3 range, drowned by ±10 stochastic variance on
+unrelated event categories.
+
+### Final architecture (after R0–R9)
+
+| Component | What stayed |
+|---|---|
+| `config/prompts/lnl/object_admin.yaml` | R1 — MODIFICATION RULES translation pattern with 6 vague→crisp category templates + quality bar |
+| `src/lnl/brain.py build_planner_prompt` | R5 — `_MODIFICATION_RULES_PLANNER_HINT` appended only when behavior contains the marker |
+| `src/lnl/brain.py build_system_prompt` (executor) | unchanged (R8 reverted) |
+| `src/lnl/brain.py build_evaluator_prompt` | unchanged (R9 reverted) |
+| `src/data/evaluate.py gather_evidence` | `prior_tool_calls` parameter + `_prior_tool_calls` helper available but not threaded into call sites (R6 reverted) |
+| `enable_replan_checkpoints` runtime flag | default `False` (R7 reverted); planner prompt still documents `kind: replan` as first-class; per-run opt-in via `--enable-replan-checkpoints` |
