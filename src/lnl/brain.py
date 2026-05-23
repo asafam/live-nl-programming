@@ -484,6 +484,35 @@ def _render_prior_plan_context(prior_plan: "Optional[Plan]", replan_question: Op
     return "\n".join(lines)
 
 
+_MODIFICATION_RULES_MARKER = "MODIFICATION RULES"
+
+_MODIFICATION_RULES_PLANNER_HINT = """
+
+  ## ⚠ Behavior contains MODIFICATION RULES — evaluate before planning
+
+  This object's `behavior` section ends with a `MODIFICATION RULES` block
+  that an administrator appended at runtime. For EACH rule in that block:
+
+  1. Read the rule's trigger predicate and evaluate it against THIS
+     event's content. State the result explicitly in your step's
+     `reasoning` (e.g. "M001 trigger: company == 'NorthPeak Labs' →
+     event.company == 'Harbor Analytics' → FALSE → rule ignored").
+  2. If TRUE: apply the rule's action — INSERT, OMIT, or ADJUST the
+     specific baseline steps the rule names. Every OTHER baseline step
+     still runs.
+  3. If FALSE: ignore the rule entirely and plan the FULL baseline.
+     Never carry the rule's action into a plan for non-matching events.
+
+  Common pitfalls to avoid:
+  - Entity-scoped rule (e.g. "company == X") applied to events from
+    other entities — only X-matching events trigger.
+  - Time-window rule (e.g. "before 09:00 Tuesday") applied outside the
+    window — only in-window events trigger.
+  - Rule says "do NOT do step S" → omit S, keep every other baseline
+    step. Do not drop unrelated work.
+"""
+
+
 def build_planner_prompt(
     definition: ObjectDefinition,
     current_state,  # str (from LLM) or dict (from mock scripts)
@@ -508,6 +537,11 @@ def build_planner_prompt(
     planner prompt (see planner_dag.yaml / planner_sequential.yaml). Whether
     a `kind=replan` step actually fires is controlled at the runtime layer
     by `SystemConfig.enable_replan_checkpoints`, not here.
+
+    Conditionally appends a "MODIFICATION RULES" planner hint when, and ONLY
+    when, the rendered behavior contains the marker — added by the admin
+    path (see object_admin.yaml). Avoids polluting the planner prompt on
+    events without modifications.
     """
     config = _load_prompt_config(prompt_file)
     template = config["system_prompt"]
@@ -520,12 +554,13 @@ def build_planner_prompt(
     else:
         state_str = "(empty)"
 
+    behavior_text = definition.behavior or "(none)"
     prior_plan_context = _render_prior_plan_context(prior_plan, replan_question)
 
-    return template.format(
+    rendered = template.format(
         object_id=definition.object_id,
         role=definition.role,
-        behavior=definition.behavior or "(none)",
+        behavior=behavior_text,
         peers=peers,
         tools=tools or "(none)",
         current_state=state_str,
@@ -534,6 +569,13 @@ def build_planner_prompt(
         message_content=str(getattr(message, "content", "")),
         prior_plan_context=prior_plan_context,
     )
+
+    # Gate the mod-aware hint on the behavior actually containing the marker
+    # — keeps the planner prompt lean for the 95% of events that aren't
+    # post-modification.
+    if _MODIFICATION_RULES_MARKER in behavior_text:
+        rendered = rendered + _MODIFICATION_RULES_PLANNER_HINT
+    return rendered
 
 
 def build_evaluator_prompt(

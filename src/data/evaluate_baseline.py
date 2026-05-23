@@ -298,7 +298,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v34): companion bump for evaluate.py v30 — LNL default --tool-dispatch set to sync across the stack (baseline unaffected)
+_VERSION: str = _build_version()  # bumped 2026-05-23 (v35): companion bump for evaluate.py v31 — judge evidence gains PRIOR TOOL EXECUTIONS cross-event tool log (baseline unaffected)
 
 # ── Infrastructure failure detection ─────────────────────────────────────────
 

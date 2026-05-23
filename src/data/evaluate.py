@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-22 (v30): default --tool-dispatch set to 'sync' across the stack (SystemConfig, evaluate.py internal + CLI). Async retained via --tool-dispatch async for actor-style production runs; sync is the eval default because the per-turn LLM call in async loses the prior tool_call context and triggers tool re-dispatch / lost-intent failures.
+_VERSION: str = _build_version()  # bumped 2026-05-23 (v31): judge evidence now includes a "PRIOR TOOL EXECUTIONS" section listing tool calls + responses from earlier events of the test case (in addition to the existing per-event "Tool calls" section). Helps the judge cross-reference what the workflow did upstream when scoring later events — especially for post_mod / irrelevant events that depend on whether a base/pre_mod step actually ran. Also exposed `_prior_tool_calls(execs, snapshots)` as a small helper alongside the existing `_new_tool_calls`.
 
 from src.data.schema import (
     EvalSummary,
@@ -229,20 +229,46 @@ def parse_when(when: str) -> int:
 
 # ── Evidence gathering ─────────────────────────────────────────────────────────
 
+def _format_tool_call_entries(flat: "list[dict]") -> "list[str]":
+    """Render tool-call log entries as evidence lines for the judge.
+
+    Each entry shows `[tool] call#N {args}` plus the `← {response}` it
+    received, plus any chain-triggered dispatches. Returns a list of
+    formatted lines (one per entry) — the caller decides whether to put
+    them under "THIS EVENT" or "PRIOR TOOL EXECUTIONS".
+    """
+    lines = []
+    for entry in flat:
+        idx = entry.get("call_index", "?")
+        line = f"  [{entry['tool']}] call#{idx} {json.dumps(entry['arguments'])}"
+        if "response" in entry:
+            line += f"\n    ← {entry['response']}"
+        for t in entry.get("triggered", []):
+            line += f"\n    → dispatched to [{t['target']}]: {t['message']}"
+        lines.append(line)
+    return lines
+
+
 def gather_evidence(
     rt,
     results,
     recipient: str,
     bus_messages: "list | None" = None,
     tool_calls: "list[list[dict]] | None" = None,
+    prior_tool_calls: "list[list[dict]] | None" = None,
 ) -> str:
     """Collect observable evidence after an event for the LLM judge.
 
-    Evidence is structured in two sections:
-    - THIS EVENT: everything that happened during this invocation —
+    Evidence is structured in sections:
+    - OBJECT REGISTRY: each object's role.
+    - PRIOR TOOL EXECUTIONS (optional): tool calls + responses that ran in
+      EARLIER events of this TC. The judge can cross-reference what the
+      workflow did upstream when judging the current event.
+    - THIS EVENT: everything that happened during the current invocation —
       tool calls made (primary), bus messages exchanged, and replies.
     - OBJECT STATES: each object's updated_state after the event
-      (may be empty; use THIS EVENT as authoritative evidence).
+      (may be empty; use THIS EVENT and PRIOR TOOL EXECUTIONS as
+      authoritative evidence).
     """
     this_event_parts: list[str] = []
 
@@ -250,16 +276,7 @@ def gather_evidence(
     if tool_calls:
         flat = [entry for per_ex in tool_calls for entry in per_ex]
         if flat:
-            lines = []
-            for entry in flat:
-                idx = entry.get("call_index", "?")
-                line = f"  [{entry['tool']}] call#{idx} {json.dumps(entry['arguments'])}"
-                if "response" in entry:
-                    line += f"\n    ← {entry['response']}"
-                for t in entry.get("triggered", []):
-                    line += f"\n    → dispatched to [{t['target']}]: {t['message']}"
-                lines.append(line)
-            this_event_parts.append("Tool calls:\n" + "\n".join(lines))
+            this_event_parts.append("Tool calls:\n" + "\n".join(_format_tool_call_entries(flat)))
 
     # Bus messages: the full message flow visible in --debug-messages
     if bus_messages:
@@ -296,6 +313,14 @@ def gather_evidence(
     sections: list[str] = []
     if registry_lines:
         sections.append("=== OBJECT REGISTRY ===\n" + "\n".join(registry_lines))
+    if prior_tool_calls:
+        prior_flat = [entry for per_ex in prior_tool_calls for entry in per_ex]
+        if prior_flat:
+            sections.append(
+                "=== PRIOR TOOL EXECUTIONS (calls made in earlier events of this test case; "
+                "use these to cross-reference what the workflow did upstream) ===\n"
+                + "\n".join(_format_tool_call_entries(prior_flat))
+            )
     if this_event_parts:
         sections.append("=== THIS EVENT ===\n" + "\n\n".join(this_event_parts))
     if state_parts:
@@ -402,7 +427,7 @@ def _execute_test_case_inner(
     log_planner_output: bool = False,
     tool_dispatch: str = "sync",
     planner_mode: str = "dag",
-    enable_replan_checkpoints: bool = False,
+    enable_replan_checkpoints: bool = True,
     replan_max_per_trace: int = 3,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample and return event + modification results."""
@@ -606,6 +631,13 @@ def _new_tool_calls(mock_executors: list, snapshots: list[int]) -> list[list[dic
     return [ex.call_log[s:] for ex, s in zip(mock_executors, snapshots)]
 
 
+def _prior_tool_calls(mock_executors: list, snapshots: list[int]) -> list[list[dict]]:
+    """Tool calls from BEFORE the current event's snapshot — i.e. every call
+    the runtime has made in the prior events of this test case. Used to give
+    the judge cross-event context."""
+    return [ex.call_log[:s] for ex, s in zip(mock_executors, snapshots)]
+
+
 # ── Diagnostic logging helpers — enabled by --verbose DEBUG ────────────────────
 def _serialize_plan(obj_id: str, plan, source: str) -> dict:
     return {
@@ -791,6 +823,7 @@ def _run_test_case_timeline(
                 evaluator_out_tok = sum(r.evaluator_metrics.output_tokens for r in results if r.evaluator_metrics)
                 bus_msgs = rt.message_log[log_snapshot:]
                 new_calls = _new_tool_calls(execs, exec_snap)
+                prior_calls = _prior_tool_calls(execs, exec_snap)
                 cf_errors = rt.drain_infra_errors()
                 # Mark infra-error if THIS event raised an error OR an earlier
                 # event in the same TC already did (downstream events depend
@@ -798,7 +831,7 @@ def _run_test_case_timeline(
                 infra_error = bool(cf_errors) or tc_had_infra_error
                 if infra_error:
                     tc_had_infra_error = True
-                evidence = gather_evidence(rt, results, step.recipient, bus_messages=bus_msgs, tool_calls=new_calls)
+                evidence = gather_evidence(rt, results, step.recipient, bus_messages=bus_msgs, tool_calls=new_calls, prior_tool_calls=prior_calls)
                 condition = step.expect.action
                 passed, reasoning, votes, j_in_tok, j_out_tok = harness.evaluate_assertion(condition, evidence, prior_context)
                 event_results.append(EventResult(
@@ -944,11 +977,12 @@ def _run_test_case_timeline(
             evaluator_out_tok = _evaluator_out_tok if _evaluator_out_tok is not None else sum(r.evaluator_metrics.output_tokens for r in res if r.evaluator_metrics)
             bus_msgs = rt.message_log[log_snap:]
             new_calls = _new_tool_calls(execs, exec_s)
+            prior_calls = _prior_tool_calls(execs, exec_s)
             if active_harness is tracked_harness:
                 # Memory-fidelity judge: only object states, no tool calls / bus traffic
                 evidence = gather_evidence(rt, res, evt.recipient)
             else:
-                evidence = gather_evidence(rt, res, evt.recipient, bus_messages=bus_msgs, tool_calls=new_calls)
+                evidence = gather_evidence(rt, res, evt.recipient, bus_messages=bus_msgs, tool_calls=new_calls, prior_tool_calls=prior_calls)
             passed, reasoning, votes, j_in_tok, j_out_tok = active_harness.evaluate_assertion(evt.expect.action, evidence, ctx)
             trace_spans, trace_root = build_event_trace(bus_msgs)
             event_results.append(EventResult(
@@ -1155,7 +1189,7 @@ def execute_test_case(
     log_planner_output: bool = False,
     tool_dispatch: str = "sync",
     planner_mode: str = "dag",
-    enable_replan_checkpoints: bool = False,
+    enable_replan_checkpoints: bool = True,
     replan_max_per_trace: int = 3,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample with a per-event timeout (seconds).
@@ -1520,7 +1554,7 @@ def run(args: argparse.Namespace) -> Path:
     if planner_mode == "dag" and planner_prompt_display == "planner_sequential.yaml":
         # Mode auto-selects planner_dag.yaml unless --planner-prompt was explicit.
         planner_prompt_display = "planner_dag.yaml"
-    replan_enabled = getattr(args, "enable_replan_checkpoints", False)
+    replan_enabled = getattr(args, "enable_replan_checkpoints", True)
     replan_label = (
         f"on (max={getattr(args, 'replan_max', 3)}/trace)" if replan_enabled else "off"
     )
@@ -1793,7 +1827,7 @@ def run(args: argparse.Namespace) -> Path:
                 log_planner_output=(getattr(args, "verbose", None) == "DEBUG"),
                 tool_dispatch=getattr(args, "tool_dispatch", "sync"),
                 planner_mode=getattr(args, "planner_mode", "dag"),
-                enable_replan_checkpoints=getattr(args, "enable_replan_checkpoints", False),
+                enable_replan_checkpoints=getattr(args, "enable_replan_checkpoints", True),
                 replan_max_per_trace=getattr(args, "replan_max", 3),
             )
         finally:
@@ -2529,7 +2563,7 @@ Examples:
         "--enable-replan-checkpoints",
         action=argparse.BooleanOptionalAction,
         dest="enable_replan_checkpoints",
-        default=False,
+        default=True,
         help=(
             "Replan checkpoints: planner re-entry when a `kind=replan` step is "
             "reached. The planner may insert replan steps that suspend "
@@ -2537,8 +2571,8 @@ Examples:
             "the planner with the prior plan + completed step results so it "
             "can emit continuation steps. Use for conditional branches the "
             "planner cannot decide up-front (stock level, authorization, "
-            "returned id). Default: DISABLED. Use --no-enable-replan-checkpoints "
-            "to be explicit. Budget per trace controlled by --replan-max."
+            "returned id). Default: ENABLED. Use --no-enable-replan-checkpoints "
+            "to disable. Budget per trace controlled by --replan-max."
         ),
     )
     parser.add_argument(
