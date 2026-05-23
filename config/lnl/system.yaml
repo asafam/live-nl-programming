@@ -43,3 +43,18 @@ planner_mode: dag
 # returned id). Budget-capped per trace to prevent runaway recursion.
 enable_replan_checkpoints: false
 replan_max_per_trace: 3
+
+# Reactive step-retry + replan (default off). When true, the runtime counts how
+# many times each PlanStep gets invalidated by the post-execution evaluator
+# (step.retry_count). If a step's retry_count crosses step_max_retries, the
+# runtime synthesizes a kind=replan step targeting it — reusing the same
+# planner-reentry machinery as enable_replan_checkpoints, but triggered
+# reactively from repeated failure rather than from a planner-pre-declared
+# checkpoint. If that synthesized replan itself exhausts (planner failure or
+# step_replan_max reached for that step), the originating step is marked
+# failed and the plan's status flips to "failed" so the trace concludes
+# gracefully. Independent of enable_replan_checkpoints — safe to enable
+# either, both, or neither.
+enable_step_retry_replan: false
+step_max_retries: 2
+step_replan_max: 1

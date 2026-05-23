@@ -77,6 +77,9 @@ class LLMObject:
         planner_mode: str = "dag",
         enable_replan_checkpoints: bool = False,
         replan_max_per_trace: int = 3,
+        enable_step_retry_replan: bool = False,
+        step_max_retries: int = 2,
+        step_replan_max: int = 1,
         log_synthetic_message: "Optional[Callable[[Message], None]]" = None,
         stale_plan_seconds: float = 180.0,
         max_active_plans: int = 32,
@@ -155,6 +158,12 @@ class LLMObject:
         # Per-trace replan cycle counts (cap to prevent runaway recursion).
         self._replan_cycles_per_trace: dict[str, int] = {}
         self._replan_cycles_lock = threading.Lock()
+        # Reactive step-retry + replan: triggered by per-step invalidation count,
+        # not by planner-pre-declared checkpoints. The two replan paths share
+        # _dispatch_pending_replans but have independent enable flags + budgets.
+        self._enable_step_retry_replan = bool(enable_step_retry_replan)
+        self._step_max_retries = int(step_max_retries) if step_max_retries > 0 else 0
+        self._step_replan_max = int(step_replan_max) if step_replan_max > 0 else 0
         # Per-trace evaluator cycle counts (cap to prevent runaway).
         self._evaluator_cycles_per_trace: dict[str, int] = {}
         self._evaluator_cycles_lock = threading.Lock()
@@ -1280,6 +1289,12 @@ class LLMObject:
                 break
 
             # FAIL with actionable feedback → re-enter ReAct with diagnostics.
+            # Bump the per-step retry_count for every step the evaluator
+            # flagged as FAIL so the reactive-replan trigger (gated by
+            # enable_step_retry_replan) can escalate steps that keep failing.
+            # Inert when the feature flag is off.
+            if self._enable_step_retry_replan:
+                self._bump_step_retry_counts(message.trace_id, criteria)
             self.record_evaluator_cycle(message.trace_id)
             eval_cycle += 1
             logger.debug(
@@ -1334,6 +1349,13 @@ class LLMObject:
         # entry captures the sender + content that triggered this plan —
         # the richest source of identifying tokens the future event will reference.
         self._dispatch_pending_waits(trace_id, originating_message=message)
+        # Reactive replan synthesis: if any step has been invalidated by the
+        # evaluator step_max_retries times, append a synthetic kind=replan step
+        # targeting it. The subsequent _dispatch_pending_replans call picks it
+        # up on the same turn — re-using the existing planner-reentry
+        # machinery. Inert when enable_step_retry_replan is off.
+        if self._enable_step_retry_replan:
+            self._synthesize_reactive_replans(trace_id)
         # Replan dispatch: if the executor's turns transitioned a step that
         # gated a `kind=replan` step (deps all terminal now), invoke the
         # planner inline to emit continuation steps. The new steps land via
@@ -2393,13 +2415,126 @@ class LLMObject:
             out.append({"step_id": sid, "kind": kind, "summary": summary})
         return out
 
+    def _bump_step_retry_counts(
+        self, trace_id: Optional[str], criteria: list,
+    ) -> None:
+        """Increment retry_count on plan steps the evaluator flagged FAIL.
+
+        One FAIL verdict bumps the targeted step's retry_count by 1 — multiple
+        FAIL criteria with the same step_id still only count as one
+        invalidation of that step on this evaluator cycle. Caller must guard
+        on self._enable_step_retry_replan.
+        """
+        if trace_id is None or not criteria:
+            return
+        failed_ids: set[str] = set()
+        for c in criteria:
+            if not isinstance(c, dict):
+                continue
+            if (c.get("status") or "").upper() != "FAIL":
+                continue
+            sid = c.get("step_id")
+            if isinstance(sid, str) and sid:
+                failed_ids.add(sid)
+        if not failed_ids:
+            return
+        with self._plans_lock:
+            plan = self._active_plans.get(trace_id)
+            if plan is None or not plan.steps:
+                return
+            now = datetime.datetime.now(datetime.timezone.utc)
+            for i, s in enumerate(plan.steps):
+                sid = s.id or f"s{i+1}"
+                if sid in failed_ids:
+                    s.retry_count += 1
+                    plan.last_progress_at = now
+
+    def _synthesize_reactive_replans(self, trace_id: Optional[str]) -> int:
+        """For each plan step whose retry_count crossed step_max_retries,
+        append a synthetic kind=replan step (depends_on=[] → fires same turn)
+        carrying reactive_replan_for=<originating step's id>. The subsequent
+        _dispatch_pending_replans call picks it up and invokes the planner
+        for an alternative continuation.
+
+        Per-step capped via step_replan_max (default 1). Returns the number
+        of synthetic steps added. Caller must guard on
+        self._enable_step_retry_replan.
+        """
+        if trace_id is None or self._step_max_retries <= 0:
+            return 0
+        added = 0
+        new_indices: list[int] = []
+        with self._plans_lock:
+            plan = self._active_plans.get(trace_id)
+            if plan is None or not plan.steps:
+                return 0
+            # Snapshot the original step list so the append loop doesn't
+            # iterate over freshly-added synthetic replans.
+            original_steps = list(plan.steps)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            for i, s in enumerate(original_steps):
+                if s.kind == "replan":
+                    continue
+                if s.status in STEP_TERMINAL_STATUSES:
+                    continue
+                if s.retry_count < self._step_max_retries:
+                    continue
+                if s.reactive_replan_count >= self._step_replan_max:
+                    continue
+                origin_id = s.id or f"s{i+1}"
+                # Don't pile a second synthetic replan on top of an already-
+                # pending one for the same step.
+                if any(
+                    r.kind == "replan"
+                    and r.status == "planned"
+                    and r.reactive_replan_for == origin_id
+                    for r in plan.steps
+                ):
+                    continue
+                new_idx = len(plan.steps)
+                plan.steps.append(PlanStep(
+                    kind="replan",
+                    id=f"rr{new_idx + 1}",
+                    description=(
+                        f"Reactive replan for step {origin_id}: "
+                        f"retried {s.retry_count} times without resolving"
+                    ),
+                    depends_on=[],  # fire same turn — origin step is the trigger, not a dep
+                    status="planned",
+                    replan_question=(
+                        f"Step {origin_id} ({s.description!r}) has been retried "
+                        f"{s.retry_count} times without resolving. Propose an "
+                        "alternative continuation that bypasses or works around "
+                        "the blocked step."
+                    ),
+                    reactive_replan_for=origin_id,
+                ))
+                s.reactive_replan_count += 1
+                plan.last_progress_at = now
+                new_indices.append(new_idx)
+                added += 1
+            plan_for_log = plan if added else None
+        # Log outside the plans_lock to keep lock-ordering simple if the log
+        # callback grabs other locks.
+        if plan_for_log is not None:
+            for idx in new_indices:
+                self._log_synthetic_plan_event(
+                    plan_for_log, idx, "step_reactive_replan_triggered",
+                )
+        return added
+
     def _skip_pending_replans(self, trace_id: str) -> int:
-        """Mark any ready `kind=replan` step on the trace's plan as `skipped`.
+        """Mark any ready PLANNER-EMITTED `kind=replan` step on the trace's
+        plan as `skipped`.
 
         Called when the runtime flag `enable_replan_checkpoints` is OFF but the
         planner emitted a replan step anyway. Without this, the step would
         remain `planned` and `_auto_close_plan_if_complete` would never retire
         the plan (it requires every step in STEP_TERMINAL_STATUSES).
+
+        Leaves SYNTHETIC reactive-replan steps (reactive_replan_for set) alone
+        — those are governed by enable_step_retry_replan and dispatched by
+        _dispatch_pending_replans even when checkpoints are off.
 
         Returns the number of steps marked skipped (callers treat >0 the same
         as a successful replan dispatch — plan changed, recompute readiness).
@@ -2417,6 +2552,8 @@ class LLMObject:
             for i, s in enumerate(plan.steps):
                 if s.kind != "replan" or s.status != "planned":
                     continue
+                if s.reactive_replan_for is not None:
+                    continue  # synthetic — dispatcher handles it
                 if not all(d in done_ids for d in (s.depends_on or [])):
                     continue
                 s.status = "skipped"
@@ -2458,8 +2595,15 @@ class LLMObject:
         """
         if trace_id is None:
             return 0
-        if not self._enable_replan_checkpoints:
+        # Gating: planner-emitted replan steps require enable_replan_checkpoints;
+        # synthetic reactive-replan steps require enable_step_retry_replan. The
+        # two paths share this dispatcher.
+        if not self._enable_replan_checkpoints and not self._enable_step_retry_replan:
             return self._skip_pending_replans(trace_id)
+        if not self._enable_replan_checkpoints:
+            # Skip planner-emitted replans up front so they don't block plan
+            # retirement; synthetic ones are preserved by _skip_pending_replans.
+            self._skip_pending_replans(trace_id)
         fired = 0
         while True:
             # Find the next ready replan step under the lock; release before
@@ -2480,27 +2624,36 @@ class LLMObject:
                 for i, s in enumerate(plan.steps):
                     if s.kind != "replan" or s.status != "planned":
                         continue
+                    is_synthetic = s.reactive_replan_for is not None
+                    # Planner-emitted replans only run when checkpoints are on;
+                    # they'd have been skipped above, but double-check defensively.
+                    if not is_synthetic and not self._enable_replan_checkpoints:
+                        continue
                     if all(d in done_ids for d in (s.depends_on or [])):
                         target_idx = i
                         target_step = s
                         break
                 if target_idx is None:
                     return fired
-                # Budget check
-                with self._replan_cycles_lock:
-                    used = self._replan_cycles_per_trace.get(trace_id, 0)
-                if used >= self._replan_max_per_trace:
-                    target_step.status = "failed"
-                    target_step.result_summary = (
-                        f"replan budget exhausted ({self._replan_max_per_trace} reached)"
-                    )
-                    target_step.completed_at = datetime.datetime.now(datetime.timezone.utc)
-                    plan.last_progress_at = target_step.completed_at
-                    self._log_synthetic_plan_event(
-                        plan, target_idx, "replan_budget_exhausted",
-                    )
-                    fired += 1
-                    continue
+                # Budget check applies only to planner-emitted replans. Synthetic
+                # reactive replans are bounded per-step at synthesis time
+                # (step_replan_max).
+                is_synthetic_target = target_step.reactive_replan_for is not None
+                if not is_synthetic_target:
+                    with self._replan_cycles_lock:
+                        used = self._replan_cycles_per_trace.get(trace_id, 0)
+                    if used >= self._replan_max_per_trace:
+                        target_step.status = "failed"
+                        target_step.result_summary = (
+                            f"replan budget exhausted ({self._replan_max_per_trace} reached)"
+                        )
+                        target_step.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                        plan.last_progress_at = target_step.completed_at
+                        self._log_synthetic_plan_event(
+                            plan, target_idx, "replan_budget_exhausted",
+                        )
+                        fired += 1
+                        continue
                 # Mark dispatched, snapshot the plan for the planner prompt.
                 target_step.status = "dispatched"
                 plan.last_progress_at = datetime.datetime.now(datetime.timezone.utc)
@@ -2541,7 +2694,11 @@ class LLMObject:
                     planner_prompt, object_id=self.object_id,
                 )
             except Exception as exc:
-                # Planner failure → mark the replan step failed, keep going.
+                # Planner failure → mark the replan step failed. For synthetic
+                # reactive replans, this is the terminal-failure signal: there
+                # was no alternative path, so the whole plan fails so the
+                # trace concludes with a graceful "couldn't complete" reply.
+                log_synthetic_failed = False
                 with self._plans_lock:
                     plan = self._active_plans.get(trace_id)
                     if plan is not None and 0 <= target_idx < len(plan.steps):
@@ -2550,6 +2707,13 @@ class LLMObject:
                         step.result_summary = f"replan call failed: {exc}"
                         step.completed_at = datetime.datetime.now(datetime.timezone.utc)
                         plan.last_progress_at = step.completed_at
+                        if step.reactive_replan_for is not None:
+                            plan.status = "failed"
+                            log_synthetic_failed = True
+                if log_synthetic_failed:
+                    self._log_synthetic_plan_event(
+                        plan, target_idx, "step_retry_replan_exhausted",
+                    )
                 fired += 1
                 continue
             # Parse the continuation. plan_dict_to_plan returns a Plan; we
@@ -2596,10 +2760,13 @@ class LLMObject:
             # Track planner metrics if the brain returned them.
             if planner_metrics is not None and hasattr(self, "_replan_metrics_per_trace"):
                 self._replan_metrics_per_trace.setdefault(trace_id, []).append(planner_metrics)
-            with self._replan_cycles_lock:
-                self._replan_cycles_per_trace[trace_id] = (
-                    self._replan_cycles_per_trace.get(trace_id, 0) + 1
-                )
+            # Only planner-emitted replans count against replan_max_per_trace;
+            # synthetic reactive replans have their own per-step budget.
+            if not is_synthetic_target:
+                with self._replan_cycles_lock:
+                    self._replan_cycles_per_trace[trace_id] = (
+                        self._replan_cycles_per_trace.get(trace_id, 0) + 1
+                    )
             fired += 1
             # Loop continues in case another replan is now ready (chained).
         # (unreachable)

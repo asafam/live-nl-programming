@@ -157,6 +157,18 @@ class SystemConfig:
     enable_replan_checkpoints: bool = False
     # Budget per trace_id; mirrors evaluator_max_cycles_per_trace.
     replan_max_per_trace: int = 3
+    # Reactive step-retry + replan. When enabled, the runtime tracks how many
+    # times each PlanStep has been invalidated by the evaluator (retry_count).
+    # If a step's retry_count crosses step_max_retries, the runtime synthesizes
+    # a kind=replan step targeting it — re-using the existing replan-checkpoint
+    # plumbing to invoke the planner for a continuation. If that synthesized
+    # replan itself exhausts (planner failure or step_replan_max reached for
+    # that step), the originating step is marked failed and the plan's status
+    # is flipped to "failed" so the trace concludes gracefully. Independent of
+    # enable_replan_checkpoints; safe to enable either, both, or neither.
+    enable_step_retry_replan: bool = False
+    step_max_retries: int = 2
+    step_replan_max: int = 1
 
     @staticmethod
     def load(path: Path | None = None) -> "SystemConfig":
@@ -193,6 +205,9 @@ class SystemConfig:
             planner_mode=planner_mode,
             enable_replan_checkpoints=bool(data.get("enable_replan_checkpoints", False)),
             replan_max_per_trace=int(data.get("replan_max_per_trace", 3)),
+            enable_step_retry_replan=bool(data.get("enable_step_retry_replan", False)),
+            step_max_retries=int(data.get("step_max_retries", 2)),
+            step_replan_max=int(data.get("step_replan_max", 1)),
         )
 
 
@@ -480,6 +495,9 @@ class Runtime:
             planner_mode=self._planner_mode,
             enable_replan_checkpoints=self._heartbeat.enable_replan_checkpoints,
             replan_max_per_trace=self._heartbeat.replan_max_per_trace,
+            enable_step_retry_replan=self._heartbeat.enable_step_retry_replan,
+            step_max_retries=self._heartbeat.step_max_retries,
+            step_replan_max=self._heartbeat.step_replan_max,
             log_synthetic_message=self._bus.log_synthetic,
             stale_plan_seconds=self._heartbeat.stale_plan_seconds,
             max_active_plans=self._heartbeat.max_active_plans_per_object,

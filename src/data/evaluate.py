@@ -69,7 +69,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-23 (v32): companion bump for evaluate_baseline.py v36 — multi-agent OC default peer_message_timeout flipped 150→0 (full fire-and-forget). LNL eval logic unchanged.
+_VERSION: str = _build_version()  # bumped 2026-05-23 (v33): add --enable-step-retry-replan / --step-max-retries / --step-replan-max — reactive escalation when one PlanStep keeps getting invalidated; default OFF, opt-in only.
 
 from src.data.schema import (
     EvalSummary,
@@ -429,6 +429,9 @@ def _execute_test_case_inner(
     planner_mode: str = "dag",
     enable_replan_checkpoints: bool = False,
     replan_max_per_trace: int = 3,
+    enable_step_retry_replan: bool = False,
+    step_max_retries: int = 2,
+    step_replan_max: int = 1,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Run a single Sample and return event + modification results."""
     from src.lnl.gateway import EventGateway
@@ -501,6 +504,9 @@ def _execute_test_case_inner(
         planner_mode=planner_mode,
         enable_replan_checkpoints=enable_replan_checkpoints,
         replan_max_per_trace=replan_max_per_trace,
+        enable_step_retry_replan=enable_step_retry_replan,
+        step_max_retries=step_max_retries,
+        step_replan_max=step_replan_max,
     )
     rt = Runtime(
         brain,
@@ -1250,6 +1256,9 @@ def execute_test_case(
         planner_mode=planner_mode,
         enable_replan_checkpoints=enable_replan_checkpoints,
         replan_max_per_trace=replan_max_per_trace,
+        enable_step_retry_replan=enable_step_retry_replan,
+        step_max_retries=step_max_retries,
+        step_replan_max=step_replan_max,
     )
 
 
@@ -1836,6 +1845,9 @@ def run(args: argparse.Namespace) -> Path:
                 planner_mode=getattr(args, "planner_mode", "dag"),
                 enable_replan_checkpoints=getattr(args, "enable_replan_checkpoints", False),
                 replan_max_per_trace=getattr(args, "replan_max", 3),
+                enable_step_retry_replan=getattr(args, "enable_step_retry_replan", False),
+                step_max_retries=getattr(args, "step_max_retries", 2),
+                step_replan_max=getattr(args, "step_replan_max", 1),
             )
         finally:
             # Always store snapshot and signal waiting workers — even on failure —
@@ -2595,6 +2607,43 @@ Examples:
             "Max number of replan re-entries per trace_id (default: 3). "
             "Mirrors --evaluator-max-cycles. Only consulted when "
             "--enable-replan-checkpoints is set."
+        ),
+    )
+    parser.add_argument(
+        "--enable-step-retry-replan",
+        action=argparse.BooleanOptionalAction,
+        dest="enable_step_retry_replan",
+        default=False,
+        help=(
+            "Reactive step-retry escalation: when the post-execution evaluator "
+            "invalidates the same plan step --step-max-retries times in a row, "
+            "synthesize a kind=replan step targeting it so the planner can "
+            "propose an alternative continuation. If the synthesized replan's "
+            "planner call itself fails, the plan flips to status=failed and "
+            "the trace concludes with a graceful 'couldn't complete' reply. "
+            "Independent of --enable-replan-checkpoints; safe to enable "
+            "either, both, or neither. Default: DISABLED."
+        ),
+    )
+    parser.add_argument(
+        "--step-max-retries",
+        type=int,
+        default=2,
+        help=(
+            "Per-step retry budget before a reactive replan triggers "
+            "(default: 2). Only consulted when --enable-step-retry-replan "
+            "is set."
+        ),
+    )
+    parser.add_argument(
+        "--step-replan-max",
+        type=int,
+        default=1,
+        help=(
+            "Per-step cap on synthesized reactive replans (default: 1). "
+            "Step is only escalated this many times before further "
+            "invalidations are ignored. Only consulted when "
+            "--enable-step-retry-replan is set."
         ),
     )
     parser.add_argument(

@@ -363,6 +363,18 @@ class PlanStep:
     # When deps complete, the runtime re-invokes the planner with completed step
     # results so it can emit continuation steps (appended via add_steps).
     replan_question: Optional[str] = None       # NL description of the deferred decision
+    # ── Reactive retry/replan tracking (SystemConfig.enable_step_retry_replan) ─
+    # retry_count: incremented each time the post-execution evaluator invalidates
+    # this step (FAIL verdict citing it). reactive_replan_count: incremented when
+    # the runtime synthesizes a kind=replan step targeting this one because its
+    # retry_count crossed step_max_retries. Both counters are inert when the
+    # feature flag is off.
+    retry_count: int = 0
+    reactive_replan_count: int = 0
+    # Tag set by _synthesize_reactive_replans on the synthetic kind=replan step
+    # so the terminal-failure branch in _dispatch_pending_replans can recognize
+    # it and propagate failure back to the originating step's id.
+    reactive_replan_for: Optional[str] = None
 
 
 @dataclass

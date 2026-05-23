@@ -298,7 +298,7 @@ def _build_version() -> str:
         from datetime import datetime
         return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
 
-_VERSION: str = _build_version()  # bumped 2026-05-23 (v36): default --peer-message-timeout flipped 150→0 — full fire-and-forget for ALL multi-agent OC peer sends (was: leaf peers only at 0, coordinator peers at 150s). Coordinator peers no longer wait for downstream A2A replies; matches LNL send-and-continue semantics. Pass --peer-message-timeout 150 to restore prior cascade-waiting behavior. Internal default in openclaw_export._agents_md / rewrite_agents_md also 90→0 for consistency.
+_VERSION: str = _build_version()  # bumped 2026-05-23 (v37): companion bump for evaluate.py v33 — LNL gained --enable-step-retry-replan reactive escalation flag (default OFF). Baseline logic unchanged.
 
 # ── Infrastructure failure detection ─────────────────────────────────────────
 
