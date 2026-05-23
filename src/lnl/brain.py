@@ -892,33 +892,6 @@ def plan_dict_to_plan(plan_dict: dict, trace_id: Optional[str] = None) -> "Plan"
     return Plan(goal=goal, steps=steps_out, status="active", trace_id=trace_id)
 
 
-_MODIFICATION_RULES_EXECUTOR_HINT = """
-
-# ⚠ Behavior contains MODIFICATION RULES — apply each rule's IF before acting
-
-This object's `behavior` section ends with a `MODIFICATION RULES` block.
-For EACH rule:
-
-  1. Evaluate the rule's trigger (IF clause) against THIS event's content
-     and the current state. State the evaluation explicitly in your
-     `thought` (e.g. "M001 trigger: company == 'NorthPeak' →
-     event.company == 'Harbor Analytics' → FALSE → ignoring rule").
-  2. If TRUE: only the SPECIFIC step/output named by the rule's THEN
-     clause is altered, suppressed, deferred, or added. Every OTHER
-     baseline action still runs as usual.
-  3. If FALSE: ignore the rule entirely. Do NOT carry its action into
-     this event's outputs.
-
-Pitfalls to avoid:
-  - Entity-scoped rule (e.g. "company == X") applied to events from
-    other entities — only X-matching events trigger.
-  - Time-window rule (e.g. "before 09:00 Tuesday") applied outside the
-    window — only in-window events trigger.
-  - Rule says "do NOT do step S" → omit S; keep every other baseline
-    output. Don't drop unrelated work.
-"""
-
-
 def build_system_prompt(
     definition: ObjectDefinition,
     current_state,  # str (from LLM) or dict (from mock scripts)
@@ -930,13 +903,7 @@ def build_system_prompt(
     prompt_file: str = "object.yaml",
     planner_mode: str = "dag",
 ) -> str:
-    """Build the system prompt from the YAML template and an ObjectDefinition.
-
-    Conditionally appends a "MODIFICATION RULES" executor hint when the
-    rendered behavior contains the marker — added by the admin path. Keeps
-    the executor prompt lean for events without modifications, mirroring
-    the gating in `build_planner_prompt`.
-    """
+    """Build the system prompt from the YAML template and an ObjectDefinition."""
     config = _load_prompt_config(prompt_file)
     template = config["system_prompt"]
 
@@ -952,12 +919,10 @@ def build_system_prompt(
     if definition.event_sources:
         event_sources = "\n".join(f"- {s}" for s in definition.event_sources)
 
-    behavior_text = definition.behavior or "(none)"
-
     substitutions = {
         "object_id": definition.object_id,
         "role": definition.role,
-        "behavior": behavior_text,
+        "behavior": definition.behavior or "(none)",
         "skills": skills_str or "(none)",
         "peers": peers or "(none)",
         "event_sources": event_sources or "(none)",
@@ -970,8 +935,6 @@ def build_system_prompt(
     result = template
     for key, value in substitutions.items():
         result = result.replace("{" + key + "}", value)
-    if _MODIFICATION_RULES_MARKER in behavior_text:
-        result = result + _MODIFICATION_RULES_EXECUTOR_HINT
     return result
 
 
