@@ -514,7 +514,7 @@ def build_planner_prompt(
     tools: str = "",
     prior_plan: "Optional[Plan]" = None,  # type: ignore[name-defined]
     replan_question: Optional[str] = None,
-    enable_replan_checkpoints: bool = False,
+    enable_replan_checkpoints: bool = True,
 ) -> str:
     """Build the planner system prompt from `planner_sequential.yaml` (the sequential default).
 
