@@ -2027,3 +2027,63 @@ The user's "stochastic variance is given, work under it" frame doesn't
 work because the variance is larger than the typical signal. Either we
 shrink the variance (option 1 or 2) or we stop spending on iterations
 that can't be interpreted.
+
+### 100-TC HEAD baseline: the gap isn't mods, it's base-step inconclusives
+
+Ran HEAD (R1+R5) on 100 TCs (30 existing + 70 new from a different
+random seed, balanced across mod-types: temporal 13, expansion 22,
+exception 19, contextual 14, removal 16, correction 16).
+
+Result:
+
+| Metric | Value | ±ME |
+|---|---:|---:|
+| Mean pass | 0.5791 | ±0.0670 |
+| Steps | 0.7656 | ±0.1106 |
+| Mod overall | 0.5510 | ±0.0786 |
+| Mod conclusive only | 0.6241 | ±0.0866 |
+| Pre-mod conclusive | 0.6379 | — |
+| Post-mod conclusive | 0.6106 | — |
+| Irrelevant conclusive | 0.6552 | — |
+| Inconclusive TCs | 25/100 | — |
+| Infra-error TCs | 15/100 | — |
+
+ME shrank as predicted (±0.107 → ±0.067 via √(100/30) ≈ 1.83×). This
+is now the proper baseline for future iteration.
+
+**The signal we'd been chasing was an inconclusive drag, not a mod
+gap.** On the 100-TC sample:
+- 25/100 TCs are inconclusive (base steps failed → mod events get 0
+  credit even if the agent would have honored the mod).
+- 15/100 hit infra errors (mock-server / content-filter).
+- Combined, 40% of TCs are non-evaluable.
+- Once we exclude inconclusives, pre-mod / post-mod / irrelevant rates
+  are all within ~5pt of each other (0.638 / 0.611 / 0.655). Mods are
+  NOT meaningfully harder than base behavior once base actually works.
+
+The original framing — "post-mod is 10pt below steps; iterate on the
+mod prompts" — was looking at the wrong gap. The 10pt gap exists in
+the overall numbers because inconclusive TCs drag mod scores down,
+not because mod execution is degraded.
+
+### Where the leverage actually is
+
+Priority order for future feedback loops on this dataset:
+
+1. **Resolve base-step failures** — 25 TCs inconclusive on this 100-TC
+   subset. Many are workflows already identified in prior audits
+   (lead-router, save-email-attachments, ai-voice-generator, automate-
+   hr-support, etc.). Each rescued TC removes ~3 events from "graded 0"
+   and lets the mod measurements actually reflect mod quality. Much
+   higher leverage than another round of mod-prompt tweaks.
+2. **Resolve infra-error TCs** — 15 TCs hit mock-server or content-
+   filter issues. Separate from prompt quality entirely.
+3. **THEN iterate on mod-aware prompts** at this baseline. With ME
+   ±0.067 a single round can detect ±5pt deltas with 1.5σ confidence;
+   tighter (±0.03–0.04) would need a 300-TC sample or multi-run on
+   100-TC.
+
+The "stochastic variance" the user flagged is real but secondary —
+the dominant performance ceiling is base-step reliability on a subset
+of workflows that have been failing across every round. Fixing those
+base steps is a different feedback loop with a different shape.
