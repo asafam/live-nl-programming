@@ -1887,3 +1887,87 @@ unrelated event categories.
 | `src/lnl/brain.py build_evaluator_prompt` | unchanged (R9 reverted) |
 | `src/data/evaluate.py gather_evidence` | `prior_tool_calls` parameter + `_prior_tool_calls` helper available but not threaded into call sites (R6 reverted) |
 | `enable_replan_checkpoints` runtime flag | default `False` (R7 reverted); planner prompt still documents `kind: replan` as first-class; per-run opt-in via `--enable-replan-checkpoints` |
+
+### R5-replication: the measurement was the bug
+
+The user kept pushing me to continue iterating. After R9 reverted, the
+highest-value next data point wasn't another prompt change — it was
+re-running R5 with HEAD code to check whether its 0.6383 was stable.
+Result:
+
+| Run | Code | Mean | Steps | Mod | Inconclusive |
+|---|---|---:|---:|---:|---:|
+| R5 original (12:45) | R1+R5 | 0.6383 | 0.8583 | 0.6000 | 5 |
+| R5 replication (14:04) | R1+R5 (identical HEAD) | **0.5569** | 0.6268 | 0.5357 | 13 |
+
+**0.0814 swing on identical code and identical TCs.**
+
+Same-event churn diff (174 common events, no code difference):
+
+| Role | n | + | − | net |
+|---|---:|---:|---:|---:|
+| pre_mod | 28 | 4 | 4 | 0 |
+| post_mod | 79 | 10 | 12 | −2 |
+| base | 40 | 2 | 12 | −10 |
+| irrelevant | 27 | 4 | 7 | −3 |
+| **TOTAL** |  | **20** | **35** | **−15** |
+
+**55 of 174 events (31.6%) flipped direction between two runs of
+identical code.** That's the actual noise floor of single-run, 30-TC
+measurement at this accuracy level. Every comparison in this session
+that produced a "delta" smaller than ~±20 events was below the
+discrimination threshold of the measurement.
+
+### What this re-frames
+
+Every round's same-event Δ that we treated as signal:
+
+| Comparison | Same-event net | Reframed |
+|---|---:|---|
+| R1 vs R0 | +10 | borderline; could be noise but plausibly real (single biggest delta we saw) |
+| R5 vs R1 | +2 | noise |
+| R2/R3/R4 vs R1 | −6 to −7 | noise (within churn band of identical code) |
+| R6 vs R5 | −16 | borderline; could be a small real regression but R5 baseline was a lucky outlier |
+| R7 vs R5 | −16 | same |
+| R8 vs R5 | −10 | noise; +3 on targeted post-mod was definitely noise |
+| R9 vs R5 | −12 | noise |
+| **R5-rep vs R5-orig (identical code)** | **−15** | **the measurement's variance floor** |
+
+### Honest closure
+
+We were chasing noise from R2 onward. The R5 "win" was a lucky sample;
+the R6-R9 "regressions" were other samples from the same distribution.
+The 30-TC, 1-run methodology cannot discriminate prompt-level changes
+smaller than ~±20 events / ~±10pt at this accuracy level.
+
+R1's +10 events vs R0 (the largest delta we saw and the only one
+plausibly outside the noise band) is the one round in the entire
+session that could plausibly be a real signal — and even that needs
+replication to confirm.
+
+### What this implies for next steps
+
+The "stochastic variance is a given, work under it" framing the user
+proposed is the wrong frame. The variance isn't a tax we can ignore —
+it's larger than the signal we're trying to detect. Three options:
+
+1. **Multi-run averaging.** `--runs N` with N≥3 averages out the
+   per-run sampling, but at N× cost. Even 3 runs would shrink the
+   margin by ~√3, getting noise to ~±6pt instead of ±10pt — still
+   barely enough for the gains we've been chasing.
+2. **Larger sample size.** 30 TCs → 100 TCs would also help by √(n2/n1).
+3. **Stop iterating until something changes.** The dataset / model /
+   measurement methodology produces inherent ±10pt noise at the 30-TC
+   sample size. Further prompt rounds without addressing this just
+   generate noise we can't interpret.
+
+### Final state stays the same
+
+The accepted operating point (R1 admin MODIFICATION RULES + R5 gated
+planner hint) is what's in HEAD. R5 might not be a real improvement
+over R1 — we'd need a 3-run measurement to know — but it's costless
+to keep (gated; doesn't fire on 95% of events) and was the highest-mean
+single sample we observed. The other changes (R6/R7/R8/R9) are
+reverted, which is the right call because they were also random
+samples and we have no signal to keep them over the simpler R1+R5
+state.
