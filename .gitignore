@@ -207,3 +207,6 @@ marimo/_lsp/
 __marimo__/.actor_states/
 outputs
 logs/
+
+# macOS
+.DS_Store
