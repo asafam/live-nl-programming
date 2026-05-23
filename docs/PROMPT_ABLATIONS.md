@@ -1543,3 +1543,104 @@ Conclusion: the relaxations are sound. The new judge passes the same
 events a different model family passes; it doesn't pass anything
 claude wouldn't pass. The 0.70 operating point is an honest measurement,
 not over-permissiveness.
+
+---
+
+## 2026-05-23 — Modifier feedback loop (admin → IF/ELSE → planner guard)
+
+Random-30 TCs sampled from `data/zapier/workflows-mods.jsonl` (seed
+20260523, mod-types: 9 expansion, 7 temporal, 5 contextual, 5 exception,
+2 correction, 2 removal). Eval WITHOUT `--steps-only` so pre_mod /
+post_mod / irrelevant events are exercised.
+
+| Round | Change | Steps | Mod overall | Post-mod conclusive | Inconclusive | Same-event Δ |
+|---|---|---:|---:|---:|---:|---:|
+| R0 baseline | (prior best operating point) | 0.6522 | 0.5556 | 0.6889 | 12 | — |
+| **R1 ★** | `object_admin.yaml`: translate vague mod intents into a structured `MODIFICATION RULES:` block at the end of behavior (suppression / removal / temporal / expansion / correction / contextual templates with concrete examples; quality bar; baseline-continues clause) | **0.7500** | **0.5926** | 0.6481 | **9** | **+10 vs R0** |
+| R2 | Refine R1 to mandate explicit `IF / THEN / ELSE` shape per rule | 0.6200 | 0.5931 | 0.8222 | 14 | **−6 vs R1** |
+| R3 | Add planner principle 13: read `MODIFICATION RULES` block, evaluate trigger against THIS event, ignore non-matching | 0.5871 | 0.5154 | 0.7692 | 13 | clear regression |
+
+### Diagnosis behind R1 (the one that landed)
+
+Mod intents in this dataset are conversationally hedged ("maybe don't
+do the exec-channel thing for Acme Corp wins", "let it wait until next
+morning", "leave it alone if already a batch of ideas"). The pre-R1
+admin prompt treated such inputs as field-patch instructions and either
+bailed to "ambiguous" or produced a vague behavior addition the planner
+inconsistently honored. The planner DOES re-plan after admin patches
+(via `_active_plans[trace].needs_replan=True` + the re-plan-in-place
+path at `object.py:953`); the gap was patch quality, not the replan
+mechanism. R1 fixes the patch quality by (a) telling the admin LLM
+hedging words are conversational softening, not ambiguity; (b)
+requiring a structured `MODIFICATION RULES:` block appended to behavior;
+(c) providing per-category transformation templates with vague→crisp
+examples; (d) enforcing a checkable trigger + named action + baseline-
+continues clause.
+
+R1 measurably improved suppression mods that were previously ignored:
+`ai-content-idea-generator E003` (batch-of-ideas → no Airtable write),
+`hubspot-slack exception E002` (Acme → no executive-wins), `automate-
+granola E002` (quick check-in → no recap), `lead-router temporal E002/
+E004` (ranking suppression respected), `contact-list temporal E002`
+(NorthPeak → no downstream outreach).
+
+### Why R2 underperformed R1
+
+R2 mandated `IF <trigger>: THEN <action>. ELSE: baseline.` shape for
+every rule. Semantically identical to R1's "EXCEPTION/TEMPORAL RULE:"
+templates which already required the baseline-continues clause. The
+extra structure added prompt length without changing what the planner
+actually does. Same-event diff vs R1: −6 net (−6 base, −2 pre_mod, +1
+post_mod, +1 irrelevant). The conclusive-post-mod 0.8222 was a
+composition artifact — more TCs became inconclusive (14 vs 9) shifting
+the conclusive subset toward easier mods. Reverted.
+
+### Why R3 underperformed R1
+
+R3 added a planner-side principle telling the planner to read the
+`MODIFICATION RULES` block, evaluate each trigger against THIS event,
+and ignore non-matching rules. Intent: prevent over-application on
+non-target events. Reality: added ~30 lines to the planner prompt that
+fires on EVERY event (not just mod-modified ones). For the 95% of
+events without a `MODIFICATION RULES` block, the principle is dead
+weight that distracts the planner. Net regression of ~5pt across the
+board. Reverted.
+
+### Architecture that landed
+
+| Component | State |
+|---|---|
+| Admin prompt | `object_admin.yaml` — `MODIFICATION RULES:` block translation pattern (commit `ffab94a`) |
+| Planner prompt | `planner_dag.yaml` — unchanged from prior session's storage-peer principle |
+| Executor prompt | `executor.yaml` — unchanged from prior session's broader placeholder list |
+
+### Lessons
+
+1. **Patch-quality is the leverage point for vague mods, not the replan
+   mechanism.** The runtime's `needs_replan` path already fires the
+   planner on the next event after every admin patch. The gap was the
+   admin LLM emitting a vague behavior addition the planner couldn't
+   apply consistently. A structured rule format with concrete examples
+   shifts the planner from "I'll try to interpret this" to "I have a
+   crisp predicate to evaluate."
+
+2. **Extra structure ≠ extra clarity.** R2's mandatory IF/THEN/ELSE
+   form was the same content as R1's prose-style rules — no measurable
+   improvement and a small same-event regression. Once a prompt is
+   sufficiently explicit, further structuring just adds tokens and
+   noise.
+
+3. **Don't bolt rule-evaluation guidance onto the universal planner
+   prompt.** Principle 13 fired on every event including the 95% with
+   no `MODIFICATION RULES` block. The right place for rule-evaluation
+   guidance is INSIDE the rule (where the admin already states "the
+   ELSE branch is the baseline") — the planner reads it in-band when
+   it's relevant, costs nothing when it isn't.
+
+4. **PASS-evaluator / FAIL-judge gap appears in mods too.** Same
+   fingerprint as the prior session's executor-placeholder bug: the
+   evaluator counts step-presence while the judge reads content. On
+   mods, the evaluator passes "tool was called" while the judge sees
+   "tool was called for the wrong subset of events". A crisp rule with
+   a checkable trigger reduces this gap by giving the executor an
+   unambiguous predicate to honor.
