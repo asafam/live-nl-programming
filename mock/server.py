@@ -64,12 +64,20 @@ _ORCHESTRATION_DIR = _MOCKS_DIR / "orchestration"
 
 # ── Template interpolation ────────────────────────────────────────────────────
 
-def _interpolate(template: str, args: dict[str, Any], tool_call_id: str) -> str:
-    """Fill {placeholders} in a template from tool call args."""
-    ctx = {**args, "tool_call_id": tool_call_id, "timestamp": time.strftime("%H:%M:%S")}
+def _interpolate(template: str, args: dict[str, Any], tool_call_id: str, call_index: int = 0) -> str:
+    """Fill {placeholders} in a template from tool call args.
+
+    Mirrors the in-process executor's context (src/lnl/tools.py): args go in
+    directly, plus `tool_call_id` (uuid), `timestamp`, and `call_index` (the
+    1-based per-(slot, method) sequence number — same semantics as
+    `MockInProcessExecutor._call_count`). Enrichment templates that key off
+    `{call_index}` (e.g. `"issue_key":"ITHELP-{call_index:04d}"`) work
+    consistently across both backends.
+    """
+    ctx = {**args, "tool_call_id": tool_call_id, "timestamp": time.strftime("%H:%M:%S"), "call_index": call_index}
     try:
         return template.format_map(ctx)
-    except KeyError:
+    except (KeyError, ValueError, IndexError):
         return template
 
 
@@ -125,6 +133,12 @@ def _make_app(state: "_ServerState") -> FastAPI:
         slot = state.get_slot(slot_id)
         session_key = body.pop("__session_key__", slot.session_key)
         tool_call_id = uuid.uuid4().hex[:8]
+        # Per-(slot, method) 1-based call counter — same semantics as
+        # the in-process MockInProcessExecutor._call_count so templates
+        # using {call_index} produce identical values across both
+        # backends.
+        slot.tool_call_counts[method] = slot.tool_call_counts.get(method, 0) + 1
+        call_index = slot.tool_call_counts[method]
 
         method_def: Optional[MockMethodDef] = None
         if slot.mock_script:
@@ -139,7 +153,7 @@ def _make_app(state: "_ServerState") -> FastAPI:
             user_msg = f"Tool call: {method}({json.dumps(body)})"
             result = _llm_chat(system_prompt, user_msg, model=slot.llm_model)
         elif method_def:
-            result = _interpolate(method_def.immediate.template, body, tool_call_id)
+            result = _interpolate(method_def.immediate.template, body, tool_call_id, call_index)
         else:
             result = f"(mock) {method} called — no script configured"
 
@@ -314,6 +328,10 @@ class _ServerState:
         self.llm_model: str = "gpt-4o-mini"
         self._slot_states: dict[str, "_ServerState"] = {}
         self._slot_lock = threading.Lock()
+        # Per-(slot, method) call counter — 1-based sequence number
+        # exposed to templates as {call_index}. Mirrors the in-process
+        # MockInProcessExecutor._call_count semantics.
+        self.tool_call_counts: dict[str, int] = {}
 
     def get_slot(self, slot_id: str) -> "_ServerState":
         """Return per-slot state for concurrent TC isolation.
@@ -337,6 +355,7 @@ class _ServerState:
                 s.llm_model = self.llm_model
                 s._slot_states = {}
                 s._slot_lock = threading.Lock()
+                s.tool_call_counts = {}
                 self._slot_states[slot_id] = s
             return self._slot_states[slot_id]
 
