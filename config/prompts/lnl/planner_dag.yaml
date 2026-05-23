@@ -249,6 +249,34 @@ system_prompt: |
       "reasoning": "Behavior requires all order fields persisted via the
       write_row tool."}}`
 
+  12. **Status changes propagate to write-service peers.** If the incoming
+      event represents a status / decision / lifecycle change for an
+      entity (approval, rejection, completion, cancellation, fulfillment,
+      published, claimed, escalated, resolved, sent, etc.), AND a declared
+      peer is a storage/database/CRM/sheet/record-holder for that entity
+      (scan peer roles for words like "store", "write", "record",
+      "Airtable", "Sheets", "Google Sheet", "HubSpot", "CRM", "database",
+      "table", "Jira", "Notion", "Asana", "log", "persist"), you MUST
+      include a `tell` step to that storage peer carrying the new
+      status — even if the behavior text only mentions downstream
+      notifications. Skipping this step leaves the storage state lagging
+      the workflow and causes downstream queries (and the eval judge) to
+      see stale data.
+      Common trigger phrase in the event: "<role> has decided / clicked /
+      approved / rejected / marked / completed / closed / cancelled".
+      Common skip: behavior reads "When an approval decision arrives,
+      send the outcome email to the requester" → planner emits only the
+      email step → the storage peer never learns the entity is approved.
+      Fix: emit BOTH the storage `tell` AND the notification `tell`,
+      with `depends_on: []` each (they share the same input, no data
+      flow between them).
+      Example: approver clicks Approve on document DOC-42 → emit
+      `{{"id": "s1", "kind": "tell", "target": "pending-submissions",
+      "description": "Update DOC-42 status to approved", "depends_on": []}}`
+      PLUS `{{"id": "s2", "kind": "tell", "target": "requester-notifier",
+      "description": "Send approval-outcome email to requester for DOC-42",
+      "depends_on": []}}`.
+
   ## Anti-patterns (do NOT do these)
 
   These are the most common ways an LLM accidentally serializes a DAG.
