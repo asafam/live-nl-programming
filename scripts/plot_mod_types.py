@@ -575,12 +575,21 @@ def compute_table_by_objects(path: Path, tc_objects: dict[str, int]) -> dict[str
         print(f"  [by-objects] coverage={coverage:.0%} ({n_in_eval}/{n_source} TCs) — "
               f"partial run, skipping absent-TC injection")
 
+    # Compute per-(TC, run) completion flag: 1.0 iff ALL base events passed.
+    # Done after injection so absent TCs (base=[False]) correctly get 0.0.
+    for b_data in by_bin.values():
+        for run_data in b_data.values():
+            for role_dict in run_data.values():
+                base_bools = role_dict.get("base", [])
+                if base_bools:
+                    role_dict["completion"] = [1.0 if all(base_bools) else 0.0]
+
     out: dict[str, dict] = {}
     for b, tcs in by_bin.items():
-        per_tc_means = {"mean": [], "base": [], "pre_mod": [], "on_mod": [], "off_mod": []}
-        per_tc_stds  = {"mean": [], "base": [], "pre_mod": [], "on_mod": [], "off_mod": []}
+        per_tc_means = {"mean": [], "base": [], "completion": [], "pre_mod": [], "on_mod": [], "off_mod": []}
+        per_tc_stds  = {"mean": [], "base": [], "completion": [], "pre_mod": [], "on_mod": [], "off_mod": []}
         for tc_id, runs in tcs.items():
-            for role in ("mean", "base", "pre_mod", "on_mod", "off_mod"):
+            for role in ("mean", "base", "completion", "pre_mod", "on_mod", "off_mod"):
                 rates = []
                 for ri, role_dict in runs.items():
                     bools = role_dict.get(role)
@@ -591,7 +600,7 @@ def compute_table_by_objects(path: Path, tc_objects: dict[str, int]) -> dict[str
                     per_tc_stds[role].append(float(np.std(rates)) if len(rates) > 1 else 0.0)
 
         row = {"n_tcs": len(tcs)}
-        for role in ("mean", "base", "pre_mod", "on_mod", "off_mod"):
+        for role in ("mean", "base", "completion", "pre_mod", "on_mod", "off_mod"):
             tc_means = per_tc_means[role]
             n_role   = len(tc_means)
             if n_role:
@@ -757,11 +766,12 @@ def write_tex_table_by_objects(
     lines = [
         r"% Per-system, per-object-count breakdown of modification pass rates.",
         r"% Bins are TCs grouped by number of objects in the workflow.",
+        r"% Completion = fraction of TCs where ALL base events passed (binary per-TC).",
         r"% Cells: mean $\pm$ 95\% CI (Student's t, across-TC variance).",
         r"% Infra + wiring failures excluded.",
         r"\begin{tabular}{l|c|c|c|c|c|c}",
         r"    \hline",
-        r"    \textbf{System} & \textbf{Objects} & \textbf{Mean} & \textbf{Base} & \textbf{Pre-Mod} & \textbf{On-Mod} & \textbf{Off-Mod} \\",
+        r"    \textbf{System} & \textbf{Objects} & \textbf{Completion} & \textbf{Mean} & \textbf{Pre-Mod} & \textbf{On-Mod} & \textbf{Off-Mod} \\",
         r"    \hline",
     ]
     # Per-bin winners (best system within each object-count bin, per role).
@@ -774,7 +784,7 @@ def write_tex_table_by_objects(
                  if bins.get(b, {}).get("n_tcs", 0) > 0],
                 "max",
             )
-            for role in ("mean", "base", "pre_mod", "on_mod", "off_mod")
+            for role in ("completion", "mean", "pre_mod", "on_mod", "off_mod")
         }
 
     for system, bins in all_data.items():
@@ -782,16 +792,16 @@ def write_tex_table_by_objects(
         for b in _BIN_ORDER:
             if b not in bins or bins[b]["n_tcs"] == 0: continue
             r = bins[b]
-            sys_cell  = system if first else ""
-            mean_cell = _bf(_fmt_rate(r['mean_mean'],    r['mean_ci95']),    system in win_by_bin[b]["mean"])
-            base_cell = _bf(_fmt_rate(r['base_mean'],    r['base_ci95']),    system in win_by_bin[b]["base"])
-            pre_cell  = _bf(_fmt_rate(r['pre_mod_mean'], r['pre_mod_ci95']), system in win_by_bin[b]["pre_mod"])
-            on_cell   = _bf(_fmt_rate(r['on_mod_mean'],  r['on_mod_ci95']),  system in win_by_bin[b]["on_mod"])
-            off_cell  = _bf(_fmt_rate(r['off_mod_mean'], r['off_mod_ci95']), system in win_by_bin[b]["off_mod"])
+            sys_cell   = system if first else ""
+            compl_cell = _bf(_fmt_rate(r['completion_mean'], r['completion_ci95']), system in win_by_bin[b]["completion"])
+            mean_cell  = _bf(_fmt_rate(r['mean_mean'],       r['mean_ci95']),       system in win_by_bin[b]["mean"])
+            pre_cell   = _bf(_fmt_rate(r['pre_mod_mean'],    r['pre_mod_ci95']),    system in win_by_bin[b]["pre_mod"])
+            on_cell    = _bf(_fmt_rate(r['on_mod_mean'],     r['on_mod_ci95']),     system in win_by_bin[b]["on_mod"])
+            off_cell   = _bf(_fmt_rate(r['off_mod_mean'],    r['off_mod_ci95']),    system in win_by_bin[b]["off_mod"])
             lines.append(
                 f"    {sys_cell:<24} & {b:<6}  ({r['n_tcs']:>3} TCs)"
+                + f"  & {compl_cell:<15}"
                 + f"  & {mean_cell:<15}"
-                + f"  & {base_cell:<15}"
                 + f"  & {pre_cell:<15}"
                 + f"  & {on_cell:<15}"
                 + f"  & {off_cell:<15} \\\\"
@@ -1163,6 +1173,13 @@ def main() -> None:
                 write_tex_table_by_objects(by_obj_data, by_obj_path)
                 plot_by_objects(by_obj_data, plots_dir, palette)
                 plot_by_objects_single(by_obj_data, plots_dir, palette)
+                plot_by_objects_single(
+                    by_obj_data, plots_dir, palette,
+                    mean_key="completion_mean",
+                    ci_key="completion_ci95",
+                    title="Workflow completion rate",
+                    filename="mod_types_by_objects_completion.pdf",
+                )
                 # Echo the table to stdout
                 print()
                 print(by_obj_path.read_text())
