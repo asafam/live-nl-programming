@@ -9,6 +9,12 @@
 # dies or the gateway dies without spawning a successor.
 set -euo pipefail
 
+# Make all container-created files world-writable (mode 666 / dirs 777). The
+# bind-mount target is owned by the host user (often a different UID), so if we
+# leave umask 022 the host can't clean these files on the next pool restart
+# ("Permission denied" on extensions/, agents/, canvas/, logs/).
+umask 000
+
 # ── Copy plugin into the bind-mount dir (hidden at image build time) ─────────
 # The bind-mount over /home/node/.openclaw hides any files baked into the image
 # at that path.  Restore the plugin from its staging location on every start.
@@ -17,6 +23,15 @@ cp -f "${HOME}/openclaw-extensions/lnl-mock-external/index.js" \
       "${HOME}/.openclaw/extensions/lnl-mock-external/index.js"
 cp -f "${HOME}/openclaw-extensions/lnl-mock-external/openclaw.plugin.json" \
       "${HOME}/.openclaw/extensions/lnl-mock-external/openclaw.plugin.json"
+# OpenClaw's plugin loader refuses to load plugins whose directory is
+# world-writable ("blocked plugin candidate: world-writable path ... mode=777").
+# Our top-level `umask 000` makes everything 0o777/0o666 by default; tighten the
+# extensions tree back to 0o755/0o644 so the plugin guard accepts it. Host-side
+# cleanup still works because clean_worker_dirs runs as root inside a container.
+chmod 755 "${HOME}/.openclaw/extensions" \
+          "${HOME}/.openclaw/extensions/lnl-mock-external"
+chmod 644 "${HOME}/.openclaw/extensions/lnl-mock-external/index.js" \
+          "${HOME}/.openclaw/extensions/lnl-mock-external/openclaw.plugin.json"
 
 # ── Start the Azure usage proxy ──────────────────────────────────────────────
 # Injects stream_options:{include_usage:true} into Azure streaming chat completions
@@ -80,9 +95,33 @@ for i in $(seq 1 30); do
 done
 
 # ── Start the OpenClaw gateway ────────────────────────────────────────────────
+echo "[entrypoint] === openclaw gateway run --help (one-shot diagnostic) ==="
+openclaw gateway run --help 2>&1 | head -60 || true
+echo "[entrypoint] === end help ==="
 echo "[entrypoint] Starting OpenClaw gateway..."
-openclaw gateway run --auth token --token "${OPENCLAW_GATEWAY_TOKEN}" --allow-unconfigured &
+openclaw gateway run --auth token --token "${OPENCLAW_GATEWAY_TOKEN}" --allow-unconfigured --bind lan &
 OC_PID=$!
+
+# ── Background: auto-approve peer device pairing requests ────────────────────
+# Peer agents (started lazily by sessions_send) generate pairing requests that
+# sit pending until approved.  Without approval the gateway closes the WS with
+# 1008 "pairing required" and the entry agent's sessions_send fails.  Loop
+# approves whatever's pending every second so peers come up quickly without
+# manual intervention.
+(
+    sleep 5  # let the gateway finish initial bind
+    while true; do
+        # Only run approve if there's actually a pending request, to avoid
+        # writing paired.json every iteration (gateway watches it via inotify
+        # and full-restarts on every write — was causing a restart loop).
+        if openclaw devices list 2>/dev/null | grep -q "^Pending ([1-9]"; then
+            openclaw devices approve --latest --timeout 2000 >/dev/null 2>&1 || true
+        fi
+        sleep 3
+    done
+) &
+APPROVE_PID=$!
+echo "[entrypoint] auto-approve loop started (PID ${APPROVE_PID})"
 
 # ── Monitor loop ──────────────────────────────────────────────────────────────
 # The gateway self-restarts (full process fork+exec) when evaluate_baseline.py

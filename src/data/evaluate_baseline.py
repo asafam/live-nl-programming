@@ -174,11 +174,12 @@ def _clean_pool_worker_dirs(workers: list[WorkerConfig]) -> None:
     """Wipe accumulated workspace/config/log files from each worker data_dir.
 
     Preserves identity/, devices/ (auth files written by start-pool.sh),
-    openclaw.json (gateway config containing the auth token + agent list), and
-    extensions/ (plugin JS files copied into the bind-mount by the entrypoint).
-    Deleting openclaw.json causes every worker to look like it has a token mismatch
-    on the next run, triggering unnecessary container restarts.  Deleting extensions/
-    causes the gateway to lose the lnl-mock-external plugin after a forced restart.
+    openclaw.json (gateway config containing the auth token + agent list),
+    extensions/ (plugin JS files copied into the bind-mount by the entrypoint),
+    and workspace-*/ dirs (agent workspaces written by pre-registration or prior
+    TCs — content is refreshed per-TC by export_workflow_from_objects with
+    force=True, so the dirs themselves must survive to avoid evicting agents that
+    were pre-started with skipBootstrap=False and are currently paired).
     Called once at the start of every pool-mode eval run so workers start clean.
     """
     import shutil
@@ -187,15 +188,26 @@ def _clean_pool_worker_dirs(workers: list[WorkerConfig]) -> None:
         if not w.data_dir.is_dir():
             continue
         removed = []
+        skipped = []
         for child in w.data_dir.iterdir():
-            if child.name not in _KEEP:
+            # Keep workspace dirs — pre-started agents read them; per-TC export
+            # rewrites their content with force=True so there is no state bleed.
+            if child.name in _KEEP or child.name.startswith("workspace-"):
+                continue
+            try:
                 if child.is_dir():
                     shutil.rmtree(child)
                 else:
                     child.unlink(missing_ok=True)
                 removed.append(child.name)
+            except PermissionError:
+                # Container-owned dirs (e.g. logs/, tmp/) may be unreadable/undeleteable.
+                # Skip them — they don't affect the eval.
+                skipped.append(child.name)
         if removed:
             print(f"  [{w.name}] cleaned {len(removed)} entries from {w.data_dir}")
+        if skipped:
+            print(f"  [{w.name}] skipped (permission denied): {skipped}")
 
 
 def _load_device_operator_token() -> Optional[str]:
@@ -240,6 +252,13 @@ def _write_worker_gateway_config(data_dir: Path, operator_token: str) -> None:
     cfg.setdefault("tools", {"sessions": {"visibility": "all"}})
     cfg.setdefault("commands", {"native": "auto", "nativeSkills": "auto", "restart": True})
     cfg.setdefault("agents", {"list": []})
+    # Delete before writing: openclaw.json may be owned by the container's node user
+    # (mode 600).  We own the parent directory, so unlink() succeeds even without
+    # file ownership; write_text() then creates a fresh file we own.
+    try:
+        config_path.unlink(missing_ok=True)
+    except Exception:
+        pass
     config_path.write_text(json.dumps(cfg, indent=2))
 
 
@@ -250,7 +269,26 @@ def _ensure_worker_gateway_token(worker: "WorkerConfig", operator_token: str) ->
     """
     import subprocess as _sp
     worker.data_dir.mkdir(parents=True, exist_ok=True)
-    current_token = _load_openclaw_token(worker.data_dir)
+
+    # Read openclaw.json directly, catching PermissionError explicitly.
+    # If the file is container-owned (mode 600), a PermissionError means the
+    # gateway was already configured by pre-registration (smoke-B / start-pool.sh).
+    # Restarting in that case would wipe the pre-registered agent list and undo
+    # config_mgr.patch effects (skipBootstrap, agentToAgent, etc.).
+    config_path = worker.data_dir / "openclaw.json"
+    current_token: Optional[str] = None
+    if config_path.exists():
+        try:
+            raw = config_path.read_text()
+            current_token = json.loads(raw).get("gateway", {}).get("auth", {}).get("token") or None
+        except PermissionError:
+            # File is container-owned (mode 600): pre-registration configured the
+            # container correctly. The gateway uses its --token CLI arg for auth, not
+            # the file. Skip restart to preserve the pre-registered config.
+            return False
+        except Exception:
+            pass  # readable but malformed — fall through to restart
+
     if current_token == operator_token:
         return False  # already correct
 
@@ -452,8 +490,11 @@ def _reset_agent_session(object_id: str, openclaw_home: Path) -> None:
     """
     sessions_dir = openclaw_home / "agents" / object_id / "sessions"
     sessions_json = sessions_dir / "sessions.json"
-    if not sessions_json.exists():
-        return
+    try:
+        if not sessions_json.exists():
+            return
+    except PermissionError:
+        return  # container owns agents/; gateway API handles cleanup
     try:
         store = json.loads(sessions_json.read_text())
     except Exception:
@@ -464,9 +505,12 @@ def _reset_agent_session(object_id: str, openclaw_home: Path) -> None:
     if entry:
         # Delete the JSONL transcript file so the gateway starts fresh
         transcript = Path(entry.get("sessionFile", ""))
-        if transcript.exists():
-            transcript.unlink(missing_ok=True)
-        sessions_json.write_text(json.dumps(store, indent=2))
+        try:
+            if transcript.exists():
+                transcript.unlink(missing_ok=True)
+            sessions_json.write_text(json.dumps(store, indent=2))
+        except PermissionError:
+            pass
 
 
 def _clear_agent_sessions(object_id: str, openclaw_home: Path) -> None:
@@ -482,34 +526,40 @@ def _clear_agent_sessions(object_id: str, openclaw_home: Path) -> None:
     openclaw_home, so we translate by replacing the container home prefix.
     """
     sessions_dir = openclaw_home / "agents" / object_id / "sessions"
-    if not sessions_dir.exists():
-        return
+    try:
+        if not sessions_dir.exists():
+            return
+    except PermissionError:
+        return  # container's node user owns agents/; can't stat — skip silently
     sessions_json = sessions_dir / "sessions.json"
-    # Delete every JSONL transcript file referenced in sessions.json
-    if sessions_json.exists():
-        try:
-            store = json.loads(sessions_json.read_text())
-            for entry in store.values():
-                raw_path = entry.get("sessionFile", "")
-                if not raw_path:
-                    continue
-                transcript = Path(raw_path)
-                # Remap container-absolute path to host path via openclaw_home
-                if transcript.is_absolute() and not transcript.exists():
-                    try:
-                        # Container home is /home/node/.openclaw; strip and re-root
-                        rel = transcript.relative_to(Path("/home/node/.openclaw"))
-                        transcript = openclaw_home / rel
-                    except ValueError:
-                        pass
-                transcript.unlink(missing_ok=True)
-        except Exception:
-            pass
-    # Also delete any orphaned JSONL files not referenced in sessions.json
-    for f in sessions_dir.glob("*.jsonl"):
-        f.unlink(missing_ok=True)
-    # Reset the session index to empty
-    sessions_json.write_text("{}\n")
+    try:
+        # Delete every JSONL transcript file referenced in sessions.json
+        if sessions_json.exists():
+            try:
+                store = json.loads(sessions_json.read_text())
+                for entry in store.values():
+                    raw_path = entry.get("sessionFile", "")
+                    if not raw_path:
+                        continue
+                    transcript = Path(raw_path)
+                    # Remap container-absolute path to host path via openclaw_home
+                    if transcript.is_absolute() and not transcript.exists():
+                        try:
+                            # Container home is /home/node/.openclaw; strip and re-root
+                            rel = transcript.relative_to(Path("/home/node/.openclaw"))
+                            transcript = openclaw_home / rel
+                        except ValueError:
+                            pass
+                    transcript.unlink(missing_ok=True)
+            except Exception:
+                pass
+        # Also delete any orphaned JSONL files not referenced in sessions.json
+        for f in sessions_dir.glob("*.jsonl"):
+            f.unlink(missing_ok=True)
+        # Reset the session index to empty
+        sessions_json.write_text("{}\n")
+    except PermissionError:
+        pass  # container's node user owns agents/; gateway API sessions.delete handles actual cleanup
 
 
 def _clear_worker_state(
@@ -659,7 +709,16 @@ def _openclaw_connect_kwargs(gateway_url: Optional[str] = None, openclaw_home: O
     kwargs: dict[str, Any] = {
         "gateway_ws_url": gateway_url or _DEFAULT_GATEWAY_WS_URL,
     }
-    token = os.environ.get("OPENCLAW_GATEWAY_TOKEN") or _load_openclaw_token(openclaw_home)
+    # Fallback chain: env var → worker's openclaw.json → host device-auth.json.
+    # The worker file may be mode 600 (container's node user owns it after the
+    # gateway cascade-rewrites it), so we need the device-auth.json fallback.
+    # device-auth.json is always readable and carries the same operator token
+    # that start-pool.sh seeded into each container's OPENCLAW_GATEWAY_TOKEN.
+    token = (
+        os.environ.get("OPENCLAW_GATEWAY_TOKEN")
+        or _load_openclaw_token(openclaw_home)
+        or _load_device_operator_token()
+    )
     if token:
         kwargs["api_key"] = token  # ClientConfig.api_key → ProtocolGateway(token=...)
     return kwargs
@@ -751,13 +810,19 @@ def _ensure_config_auth(config: dict, openclaw_home: Optional[Path]) -> None:
     would clear the gateway's in-memory auth, causing 'pairing required' on
     the next connection.  We restore the token from openclaw.json so the
     patched config always carries the auth section.
+
+    After the gateway cascade-rewrites openclaw.json, it may omit gateway.auth
+    (auth is managed by the --token CLI arg, not the file).  The fallback chain
+    ensures the next per-TC write re-seeds the auth section.
     """
     if config.get("gateway", {}).get("auth"):
         return  # already present — nothing to do
-    token = _load_openclaw_token(openclaw_home)
-    if not token:
-        import os
-        token = os.environ.get("OPENCLAW_GATEWAY_TOKEN")
+    import os
+    token = (
+        _load_openclaw_token(openclaw_home)
+        or os.environ.get("OPENCLAW_GATEWAY_TOKEN")
+        or _load_device_operator_token()   # reliable: always on host filesystem
+    )
     if token:
         config.setdefault("gateway", {})["auth"] = {"mode": "token", "token": token}
 
@@ -769,6 +834,7 @@ async def _configure_openclaw_agents(
     openclaw_home: Path,
     gateway_url: Optional[str],
     path_prefix: Optional[Path] = None,
+    skip_bootstrap: bool = True,
 ) -> str:
     """Register all objects as agents in the OpenClaw daemon config.
 
@@ -776,6 +842,11 @@ async def _configure_openclaw_agents(
         path_prefix: When set, use this path for workspace/agentDir entries in
             the gateway config instead of openclaw_home.  See
             _configure_single_openclaw_agent for details.
+        skip_bootstrap: When False, agents auto-start on gateway startup and
+            immediately pair (connect) with the gateway.  Required for
+            agentToAgent sessions_send to succeed — the target agent must be
+            paired before it can receive a session message.  Defaults to True
+            (agents start on demand, i.e. when they receive their first message).
 
     Returns the provider string used (passed through unchanged).
     """
@@ -821,18 +892,24 @@ async def _configure_openclaw_agents(
         new_a2a = {"enabled": True, "allow": merged_allow}
         new_vis = "all"
 
+        # defaults.skipBootstrap drives gateway-level auto-start behaviour
+        new_defaults = {"model": f"{provider}/{model}", "skipBootstrap": skip_bootstrap}
+
         # Check if config actually changed — skip patch (and the reload it
         # triggers) when the agent list and tool settings are already correct.
         old_ids = sorted(a.get("id") for a in lst)
         new_ids = sorted(a.get("id") for a in new_lst)
+        old_defaults = agents_cfg.get("defaults", {})
         config_changed = (
             old_ids != new_ids
             or tools_cfg.get("agentToAgent") != new_a2a
             or tools_cfg.get("sessions", {}).get("visibility") != new_vis
+            or old_defaults.get("skipBootstrap") != skip_bootstrap
         )
 
         if config_changed:
             agents_cfg["list"] = new_lst
+            agents_cfg["defaults"] = new_defaults
             tools_cfg["agentToAgent"] = new_a2a
             tools_cfg.setdefault("sessions", {})["visibility"] = new_vis
 
@@ -887,21 +964,42 @@ def _write_worker_config(
     oc_home = worker.data_dir
 
     # Create minimal workspace/agent dirs on the host bind-mount.
+    # agents/ tree may be owned by the container's node user; mkdir raises PermissionError
+    # in that case — skip silently, the gateway will create agentDir on first use.
     for oid in all_object_ids:
         (oc_home / f"workspace-{oid}").mkdir(parents=True, exist_ok=True)
-        (oc_home / "agents" / oid / "agent").mkdir(parents=True, exist_ok=True)
+        try:
+            (oc_home / "agents" / oid / "agent").mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            pass
     if single_agent_id:
         (oc_home / f"workspace-{single_agent_id}").mkdir(parents=True, exist_ok=True)
-        (oc_home / "agents" / single_agent_id / "agent").mkdir(parents=True, exist_ok=True)
+        try:
+            (oc_home / "agents" / single_agent_id / "agent").mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            pass
 
     # Read the existing config as base (preserves gateway.auth etc.).
     config_file = oc_home / "openclaw.json"
     if config_file.exists():
-        import json5
-        config = json5.loads(config_file.read_text())
+        try:
+            import json5
+            config = json5.loads(config_file.read_text())
+        except Exception:
+            # File may be unreadable (container's node user wrote it with 600 perms).
+            # Start from an empty config — auth will be re-seeded by _ensure_config_auth.
+            config = {}
     else:
         config = {}
     _ensure_config_auth(config, oc_home)
+
+    # Always ensure the gateway can start when --bind lan is active.
+    # Without dangerouslyAllowHostHeaderOriginFallback the gateway refuses to
+    # start if gateway.controlUi.allowedOrigins is absent (required for
+    # non-loopback bind).  This setting is safe for our local/HPC environment.
+    config.setdefault("gateway", {}).setdefault("controlUi", {})[
+        "dangerouslyAllowHostHeaderOriginFallback"
+    ] = True
 
     # Build clean agent list: chrome-extension + all eval agents.
     agents_cfg = config.setdefault("agents", {})
@@ -932,10 +1030,13 @@ def _write_worker_config(
     agents_cfg["list"] = new_lst
     tools_cfg = config.setdefault("tools", {})
     if preserve_a2a_allow:
-        # Keep the existing allow list (set during pre-registration with all agents).
-        # Per-TC writes must not narrow the allow list — that would block sessions_send
-        # from agents whose TC completed but whose gateway cascade is still draining.
-        tools_cfg.setdefault("agentToAgent", {})["enabled"] = True
+        # Merge current TC's agent IDs into the existing allow list (union, never narrow).
+        # Never overwrite with a smaller set — a cascade from a just-completed TC may still
+        # be draining and needs its agents to remain routable. If the existing config has
+        # no allow list (e.g. fresh container), this seeds it from the current TC's agents.
+        old_allow = set(tools_cfg.get("agentToAgent", {}).get("allow", []))
+        merged_allow = sorted(old_allow | registered_ids)
+        tools_cfg["agentToAgent"] = {"enabled": True, "allow": merged_allow}
     else:
         tools_cfg["agentToAgent"] = {
             "enabled": True,
@@ -957,7 +1058,18 @@ def _write_worker_config(
                 return n, False  # type: ignore[return-value]
         except Exception:
             pass
-    config_file.write_text(new_content)
+    # Write the config.  If the gateway's startup cascade has already rewritten
+    # openclaw.json (mode 600, owned by container's node user), the write will
+    # raise PermissionError.  Treat that as "unchanged" — workspace files were
+    # already exported above; skipping the write avoids a per-TC hot-reload
+    # cascade that causes the gateway PID to change, which the entrypoint
+    # misreads as a clean exit and shuts down the container.
+    try:
+        config_file.write_text(new_content)
+    except PermissionError:
+        if verbose:
+            print(f"  [{worker.name}] openclaw.json not writable (container-owned) — skipping.", flush=True)
+        return len(registered_ids), False  # type: ignore[return-value]
     n = len(registered_ids)
     if verbose:
         print(f"  [{worker.name}] Config written ({n} agents).", flush=True)
@@ -1040,6 +1152,155 @@ def _preregister_agents_on_workers(
         print(f"  [{w.name}] Ready ({n_agents} agents).", flush=True)
 
 
+def _pool_doctor_check(
+    openclaw_home: Path,
+    tc_objects: list,
+    *,
+    slot_suffix: str = "",
+    worker_name: str = "worker",
+    print_fn=None,
+) -> bool:
+    """Pre-execution health check for a pool worker's agent setup.
+
+    Verifies that the gateway config and workspace files are correctly set up
+    before a TC runs.  Called after _write_worker_config and after
+    reset_agent_state/rewrite_agents_md so all files should be present.
+
+    Checks:
+      1. openclaw.json readable, agentToAgent.allow present and contains TC agents
+      2. workspace-{id}/ directory exists for each agent
+      3. AGENTS.md exists and contains 'sessions_send'
+      4. state.md exists
+      5. lnl-mock-external plugin directory exists
+
+    Returns True if all checks pass.  Always prints a ✓/✗ report via print_fn
+    (defaults to tqdm.write if available, else print).
+    """
+    import json5 as _json5  # already used elsewhere in this module
+
+    if print_fn is None:
+        try:
+            from tqdm import tqdm as _tqdm
+            print_fn = _tqdm.write
+        except ImportError:
+            print_fn = print
+
+    label = f"[{worker_name}] doctor"
+    all_ok = True
+
+    # ── 1. openclaw.json ────────────────────────────────────────────────────
+    config_file = openclaw_home / "openclaw.json"
+    if config_file.exists():
+        try:
+            config = _json5.loads(config_file.read_text())
+            agent_ids_in_config = {a.get("id") for a in config.get("agents", {}).get("list", [])}
+            allow = config.get("tools", {}).get("agentToAgent", {}).get("allow")
+            tc_ids = {f"{obj.object_id}{slot_suffix}" for obj in tc_objects}
+
+            config_issues = []
+            if allow is None:
+                config_issues.append("agentToAgent.allow MISSING — A2A will be blocked")
+                all_ok = False
+            elif not allow:
+                config_issues.append("agentToAgent.allow is empty — A2A will be blocked")
+                all_ok = False
+            else:
+                missing_from_allow = tc_ids - set(allow)
+                if missing_from_allow:
+                    config_issues.append(
+                        f"agents not in allow list: {sorted(missing_from_allow)}"
+                    )
+                    all_ok = False
+            missing_from_list = tc_ids - agent_ids_in_config
+            if missing_from_list:
+                config_issues.append(
+                    f"agents missing from agents.list: {sorted(missing_from_list)}"
+                )
+                all_ok = False
+
+            if config_issues:
+                for issue in config_issues:
+                    print_fn(f"  {label} ✗ openclaw.json: {issue}")
+            else:
+                print_fn(
+                    f"  {label} ✓ openclaw.json: {len(agent_ids_in_config)} agents"
+                    f", allow={sorted(allow)}"
+                )
+        except PermissionError:
+            print_fn(
+                f"  {label} ⚠ openclaw.json: permission denied (container owns it) — cannot verify"
+            )
+        except Exception as exc:
+            print_fn(f"  {label} ✗ openclaw.json: parse error: {exc}")
+            all_ok = False
+    else:
+        print_fn(f"  {label} ✗ openclaw.json: NOT FOUND at {config_file}")
+        all_ok = False
+
+    # ── 2-4. Workspace files per agent ──────────────────────────────────────
+    for obj in tc_objects:
+        oid = f"{obj.object_id}{slot_suffix}"
+        ws = openclaw_home / f"workspace-{oid}"
+        if not ws.exists():
+            print_fn(f"  {label} ✗ workspace-{oid}/: directory MISSING")
+            all_ok = False
+            continue
+
+        agents_md = ws / "AGENTS.md"
+        if not agents_md.exists():
+            print_fn(f"  {label} ✗ workspace-{oid}/AGENTS.md: MISSING")
+            all_ok = False
+        else:
+            try:
+                content = agents_md.read_text()
+                is_leaf = "(No peers defined.)" in content
+                if "sessions_send" not in content:
+                    if is_leaf:
+                        # Leaf agents (no peers) call external tools directly — expected.
+                        print_fn(f"  {label} ✓ workspace-{oid}/AGENTS.md: ok (leaf, no peers)")
+                    else:
+                        print_fn(
+                            f"  {label} ✗ workspace-{oid}/AGENTS.md: 'sessions_send' not found"
+                            " (peer communication not configured)"
+                        )
+                        all_ok = False
+                else:
+                    peer_count = content.count("sessions_send")
+                    print_fn(
+                        f"  {label} ✓ workspace-{oid}/AGENTS.md: ok"
+                        f" (sessions_send ×{peer_count})"
+                    )
+            except Exception as exc:
+                print_fn(f"  {label} ✗ workspace-{oid}/AGENTS.md: read error: {exc}")
+                all_ok = False
+
+        state_md = ws / "state.md"
+        if not state_md.exists():
+            print_fn(f"  {label} ✗ workspace-{oid}/state.md: MISSING")
+            all_ok = False
+        else:
+            size = state_md.stat().st_size
+            print_fn(f"  {label} ✓ workspace-{oid}/state.md: {size}B")
+
+    # ── 5. Plugin directory ─────────────────────────────────────────────────
+    # The container's entrypoint copies the plugin into the bind-mount at startup.
+    # Absence means either the container hasn't finished initializing or the data_dir
+    # path doesn't match the container bind-mount (path mismatch bug).
+    plugin_dir = openclaw_home / "extensions" / "lnl-mock-external"
+    if plugin_dir.exists():
+        js_files = list(plugin_dir.glob("*.js"))
+        print_fn(f"  {label} ✓ extensions/lnl-mock-external: {len(js_files)} JS file(s)")
+    else:
+        # Warning only (not a hard failure): plugin is seeded by container entrypoint.
+        # If this persists, mock tools (zapier_*, slack_*, etc.) won't be available.
+        print_fn(
+            f"  {label} ⚠ extensions/lnl-mock-external: MISSING"
+            " — mock tools may be unavailable (path mismatch or container still starting)"
+        )
+
+    return all_ok
+
+
 async def _wait_for_gateway_restart(
     gateway_url: Optional[str] = None,
     openclaw_home: Optional[Path] = None,
@@ -1084,7 +1345,10 @@ async def _wait_for_gateway_restart(
     # Phase 2 — wait for the new process to be ready AND stable.
     # Requiring stability prevents returning during a brief lull between
     # back-to-back hot-reload cycles (e.g. startup reload + config-patch reload).
-    await _wait_for_gateway(gateway_url, openclaw_home, timeout_s=ready_timeout_s, stable_for_s=stable_for_s)
+    # http_only=True: gateway requires auth for WS upgrades, so the unauthenticated
+    # _probe_ws_connection always fails; HTTP health is sufficient here.
+    await _wait_for_gateway(gateway_url, openclaw_home, timeout_s=ready_timeout_s,
+                            stable_for_s=stable_for_s, http_only=True)
 
 
 async def _probe_ws_connection(ws_url: str, timeout: float = 3.0) -> bool:
@@ -1110,6 +1374,7 @@ async def _wait_for_gateway(
     openclaw_home: Optional[Path] = None,
     timeout_s: float = 30.0,
     stable_for_s: float = 0.0,
+    http_only: bool = False,
 ) -> None:
     """Poll until the gateway accepts HTTP *and* WebSocket connections, then return.
 
@@ -1120,6 +1385,9 @@ async def _wait_for_gateway(
     HTTP /health confirms the process is up; a raw WebSocket probe confirms the
     WS server is actually accepting connections — the two can be out of sync
     during hot-reloads (HTTP stays up while WS server restarts).
+
+    Pass http_only=True to skip the WS probe (use when the gateway requires token
+    auth for WS upgrades, making unauthenticated _probe_ws_connection always fail).
 
     Raises:
         asyncio.TimeoutError: if the gateway does not respond within timeout_s.
@@ -1145,7 +1413,7 @@ async def _wait_for_gateway(
         except Exception:
             pass
         if http_ok:
-            ws_ok = await _probe_ws_connection(ws_url, timeout=2.0)
+            ws_ok = http_only or await _probe_ws_connection(ws_url, timeout=2.0)
         if http_ok and ws_ok:
             if stable_since is None:
                 stable_since = _time.monotonic()
@@ -1375,6 +1643,8 @@ async def _execute_tc_async(
     thinking: Optional[str] = None,
     sequential: bool = False,
     peer_message_timeout: float = 0.0,
+    worker_name: Optional[str] = None,
+    run_doctor: bool = False,
 ) -> tuple[list[EventResult], list[ModificationResult]]:
     """Async core: open persistent sessions for ALL agents simultaneously, then send messages.
 
@@ -1487,6 +1757,14 @@ async def _execute_tc_async(
             session_name="main",
             slot_suffix=slot_suffix,
             peer_message_timeout=peer_message_timeout,
+        )
+
+    # Doctor check: verify agent files and gateway config are correctly set up.
+    if run_doctor and not single_agent_id:
+        _pool_doctor_check(
+            openclaw_home, tc.objects,
+            slot_suffix=slot_suffix,
+            worker_name=worker_name or "worker",
         )
 
     # Multi-agent: session names are generated PER-EVENT (not per-run) so each
@@ -1731,6 +2009,32 @@ async def _execute_tc_async(
                     judge_input_tokens=_in_tok, judge_output_tokens=_out_tok,
                     judge_votes=_votes,
                 ))
+
+        # ── Pre-warm peer agents (pool multi-agent only) ─────────────────────
+        # Peer agents start on-demand (skipBootstrap=true default): they are
+        # not yet running when the entry agent fires its first sessions_send.
+        # The gateway returns "pairing required" because the peer process has
+        # not yet connected.  Fix: send a brief warmup to every TC agent in
+        # parallel so they're all paired before the entry agent starts.
+        # Cost: one LLM call per agent per TC; session history is cleared by
+        # _make_event_handles → sessions.reset("agent:{id}:main") per event.
+        if not single_agent_id and run_doctor:
+            # Serialize: parallel gather() overwhelms the gateway during the
+            # first wake (each first-execute triggers an agent process spawn +
+            # WS pairing; doing N concurrently was killing workers). One at a
+            # time, short timeout, swallow errors — peer may still pair on the
+            # real sessions_send if this warmup fails.
+            for _obj in tc.objects:
+                _agent_id = f"{_obj.object_id}{slot_suffix}"
+                try:
+                    _h = client.get_agent(_agent_id, session_name="main")
+                    await asyncio.wait_for(
+                        _h.execute("Initialization check. Reply with 'Ready' only."),
+                        timeout=20.0,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)  # let the gateway settle between spawns
 
         for msg in messages:
             if steps_only and msg["kind"] != "step":
@@ -2502,12 +2806,18 @@ async def _run_all_tcs_concurrent(
                                 verbose=False, preserve_a2a_allow=True,
                             )
                             if _config_changed:
-                                await _wait_for_gateway_restart(
-                                    slot_gateway_url, None,
-                                    drop_timeout_s=15.0,
-                                    ready_timeout_s=120.0,
-                                    stable_for_s=5.0,
-                                )
+                                # Hot-reload: the gateway self-cascades 3-4 config rewrites
+                                # (~2s each via inotify) before settling — total ~8s.
+                                # 12s gives a clear margin over the cascade; HTTP /health
+                                # stays 200 throughout so no WS probe needed.
+                                await asyncio.sleep(12.0)
+                            else:
+                                # Even without a config change, workspace file overwrites
+                                # (force=True export) change AGENTS.md/SOUL.md mtimes,
+                                # which the gateway sees via inotify and uses to restart
+                                # the affected agents.  Wait for agents to re-pair before
+                                # the entry agent sends its first message.
+                                await asyncio.sleep(8.0)
                             # Delete BOOTSTRAP.md so the gateway doesn't run its
                             # onboarding flow (which overrides SOUL.md).
                             for _obj in tc.objects:
@@ -2585,6 +2895,8 @@ async def _run_all_tcs_concurrent(
                                     thinking=getattr(args, "thinking", None),
                                     sequential=bool(getattr(args, "sequential", None)),
                                     peer_message_timeout=getattr(args, "peer_message_timeout", 0.0),
+                                    worker_name=worker.name if workers else None,
+                                    run_doctor=False,
                                 )
                                 if tc_timeout:
                                     event_results, mod_results = await asyncio.wait_for(coro, timeout=tc_timeout)

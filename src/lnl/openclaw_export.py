@@ -503,6 +503,16 @@ def _write_file(
             )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
+        # Pool mode: workspace files live in a bind-mount the container's
+        # `node` user (UID 1000) updates in place (state.md after each agent
+        # turn). Without world-write, the container hits EACCES and the agent
+        # turn fails.
+        try:
+            import os as _os
+            _os.chmod(path, 0o666)
+            _os.chmod(path.parent, 0o777)
+        except OSError:
+            pass
     written.append(str(path))
 
 
@@ -590,6 +600,11 @@ def reset_agent_state(object_id: str, initial_state: str, output_dir: str | Path
         state_file.write_text(f"# State\n\n{initial_state}\n")
     else:
         state_file.write_text("# State\n\n_Empty. This file is updated at runtime by the agent._\n")
+    try:
+        import os as _os
+        _os.chmod(state_file, 0o666)
+    except OSError:
+        pass
 
 
 def rewrite_agents_md(
@@ -703,7 +718,10 @@ def _export_objects_to_dir(
 
         ad = _agent_dir(output_dir, obj.object_id)
         if not dry_run:
-            ad.mkdir(parents=True, exist_ok=True)
+            try:
+                ad.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                pass  # container owns agents/; gateway creates agentDir on first use
         written.append(str(ad) + "/")
 
     return written
@@ -743,6 +761,11 @@ def export_single_agent_workspace(
         if path.exists() and not force:
             pass  # skip — caller uses force=True for eval runs
         path.write_text(content)
+        try:
+            import os as _os
+            _os.chmod(path, 0o666)
+        except OSError:
+            pass
 
     _write(ws / "AGENTS.md", _combined_agents_md(obj_defs))
     _write(ws / "SOUL.md", _combined_soul_md(obj_defs))
@@ -750,7 +773,10 @@ def export_single_agent_workspace(
 
     # Ensure the agentDir exists (OpenClaw needs it for auth profiles etc.)
     ad = output_dir / "agents" / agent_id / "agent"
-    ad.mkdir(parents=True, exist_ok=True)
+    try:
+        ad.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        pass  # container owns agents/; gateway creates agentDir on first use
 
     return str(ws)
 
@@ -768,7 +794,13 @@ def reset_single_agent_state(
     ]
     ws = Path(output_dir) / f"workspace-{agent_id}"
     ws.mkdir(parents=True, exist_ok=True)
-    (ws / "state.md").write_text(_combined_state_md(obj_defs))
+    state_file = ws / "state.md"
+    state_file.write_text(_combined_state_md(obj_defs))
+    try:
+        import os as _os
+        _os.chmod(state_file, 0o666)
+    except OSError:
+        pass
 
 
 def apply_modification(

@@ -90,11 +90,29 @@ for n in $(seq 1 "${NUM_WORKERS}"); do
     export "OPENCLAW_GATEWAY_TOKEN_${n}=${OPERATOR_TOKEN}"
 done
 
-# ── Pre-seed worker identity dirs so gateways accept token connections ────────
+# Pre-seeding of worker identity dirs is only needed for `up`/`restart` —
+# `down` and `logs` don't touch the bind-mount, so skip the write block to
+# avoid PermissionError on container-owned paired.json.
 POOL_DATA_DIR="${LNL_POOL_DATA_DIR:-/tmp/lnl-pool}"
 HOST_DEVICE_JSON="${HOME}/.openclaw/identity/device.json"
 
-python3 - "${POOL_DATA_DIR}" "${DEVICE_AUTH}" "${HOST_DEVICE_JSON}" "${NUM_WORKERS}" "${DATA_PREFIX}" <<'PYEOF'
+# Wipe stale per-worker state via a one-shot root container. The worker
+# container writes paired.json (mode 0600) and agents/ (mode 0700) as UID
+# 1000, which the host user can't overwrite or recursively remove on a
+# subsequent run. Doing the cleanup as root inside a container sidesteps
+# that without needing host sudo.
+clean_worker_dirs() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "WARN: docker not found; skipping worker dir cleanup" >&2
+        return 0
+    fi
+    mkdir -p "${POOL_DATA_DIR}"
+    docker run --rm -v "${POOL_DATA_DIR}:/pool" --user 0:0 alpine \
+        sh -c "for n in \$(seq 1 ${NUM_WORKERS}); do rm -rf /pool/${DATA_PREFIX}-\$n 2>/dev/null || true; done"
+}
+
+seed_worker_identity() {
+    python3 - "${POOL_DATA_DIR}" "${DEVICE_AUTH}" "${HOST_DEVICE_JSON}" "${NUM_WORKERS}" "${DATA_PREFIX}" <<'PYEOF'
 import json, sys, base64, time, os
 from pathlib import Path
 
@@ -117,7 +135,7 @@ now_ms = int(time.time() * 1000)
 paired_entry = {
     "deviceId": device_id,
     "publicKey": raw_pub_key,
-    "platform": "darwin",
+    "platform": "linux",
     "clientId": "cli",
     "clientMode": "cli",
     "role": "operator",
@@ -143,11 +161,23 @@ for n in range(1, num_workers + 1):
     worker_dir = pool_dir / f"{data_prefix}-{n}"
     (worker_dir / "identity").mkdir(parents=True, exist_ok=True)
     (worker_dir / "devices").mkdir(parents=True, exist_ok=True)
-    (worker_dir / "identity" / "device-auth.json").write_text(json.dumps(device_auth, indent=2))
-    (worker_dir / "devices" / "paired.json").write_text(paired_json)
+    # Mode 0o777 / 0o666 so the container's `node` user (UID 1000) can update
+    # paired.json's lastUsedAtMs and rewrite device-auth.json on gateway
+    # restart. Without this the host-umask 0o022 produces 0o755/0o644, the
+    # container's in-place rewrite fails silently, and peer A2A connections
+    # fall back to "gateway closed (1008): pairing required".
+    for d in (worker_dir, worker_dir / "identity", worker_dir / "devices"):
+        os.chmod(d, 0o777)
+    auth_path = worker_dir / "identity" / "device-auth.json"
+    paired_path = worker_dir / "devices" / "paired.json"
+    auth_path.write_text(json.dumps(device_auth, indent=2))
+    paired_path.write_text(paired_json)
+    os.chmod(auth_path, 0o666)
+    os.chmod(paired_path, 0o666)
 
 print(f"Seeded identity/device-auth.json and devices/paired.json for {data_prefix}-1..{num_workers}")
 PYEOF
+}
 
 # Build list of service names for this type/size
 WORKER_SERVICES=""
@@ -159,14 +189,8 @@ done
 case "${CMD}" in
     up)
         echo "Cleaning worker data directories (${SERVICE_PREFIX} 1-${NUM_WORKERS})..."
-        for n in $(seq 1 "${NUM_WORKERS}"); do
-            worker_dir="${POOL_DATA_DIR:-/tmp/lnl-pool}/${DATA_PREFIX}-${n}"
-            if [ -d "${worker_dir}" ]; then
-                find "${worker_dir}" -mindepth 1 -maxdepth 1 \
-                    ! -name "identity" ! -name "devices" \
-                    -exec rm -rf {} +
-            fi
-        done
+        clean_worker_dirs
+        seed_worker_identity
         echo "Starting LNL OpenClaw worker pool (${WORKER_TYPE}-agent, ${NUM_WORKERS} workers)..."
         docker compose -f "${COMPOSE_FILE}" up -d --remove-orphans ${WORKER_SERVICES}
         echo ""
@@ -194,14 +218,8 @@ case "${CMD}" in
         echo "Restarting LNL OpenClaw worker pool (${WORKER_TYPE}-agent, ${NUM_WORKERS} workers)..."
         docker compose -f "${COMPOSE_FILE}" stop ${WORKER_SERVICES}
         docker compose -f "${COMPOSE_FILE}" rm -f ${WORKER_SERVICES}
-        for n in $(seq 1 "${NUM_WORKERS}"); do
-            worker_dir="${POOL_DATA_DIR:-/tmp/lnl-pool}/${DATA_PREFIX}-${n}"
-            if [ -d "${worker_dir}" ]; then
-                find "${worker_dir}" -mindepth 1 -maxdepth 1 \
-                    ! -name "identity" ! -name "devices" \
-                    -exec rm -rf {} +
-            fi
-        done
+        clean_worker_dirs
+        seed_worker_identity
         docker compose -f "${COMPOSE_FILE}" up -d --remove-orphans ${WORKER_SERVICES}
         ;;
     logs)

@@ -4,11 +4,15 @@
   },
   "gateway": {
     "mode": "local",
+    "bind": "lan",
     "auth": {
       "mode": "token",
       "token": "${OPENCLAW_GATEWAY_TOKEN}"
     },
-    "trustedProxies": ["127.0.0.1", "::1", "172.16.0.0/12"]
+    "trustedProxies": ["127.0.0.1", "::1", "172.16.0.0/12"],
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    }
   },
   "models": {
     "providers": {
@@ -46,9 +50,7 @@
   "agents": {
     "defaults": {
       "model": "azure/gpt-5.4-mini",
-      "llm": {
-        "idleTimeoutSeconds": 300
-      }
+      "skipBootstrap": true
     },
     "list": []
   }
