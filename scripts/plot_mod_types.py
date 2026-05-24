@@ -599,18 +599,18 @@ def compute_table_by_objects(path: Path, tc_objects: dict[str, int]) -> dict[str
                     per_tc_means[role].append(float(np.mean(rates)))
                     per_tc_stds[role].append(float(np.std(rates)) if len(rates) > 1 else 0.0)
 
-        # Count raw completed (TC×run) pairs for the annotation in the table.
-        n_completed_runs = sum(
-            1 for runs in tcs.values()
-            for role_dict in runs.values()
-            if role_dict.get("completion", [0.0])[0] == 1.0
+        # Count TCs that completed (mean completion > 0 = at least one run passed all base events)
+        # and total TCs that had completion data (denominator).
+        n_completed_tcs = sum(
+            1 for tc_id, runs in tcs.items()
+            if any(role_dict.get("completion", [0.0])[0] == 1.0
+                   for role_dict in runs.values())
         )
-        n_total_runs = sum(
+        n_completion_tcs = sum(
             1 for runs in tcs.values()
-            for role_dict in runs.values()
-            if "completion" in role_dict
+            if any("completion" in role_dict for role_dict in runs.values())
         )
-        row = {"n_tcs": len(tcs), "n_completed_runs": n_completed_runs, "n_total_runs": n_total_runs}
+        row = {"n_tcs": len(tcs), "n_completed_tcs": n_completed_tcs, "n_completion_tcs": n_completion_tcs}
         for role in ("mean", "base", "completion", "pre_mod", "on_mod", "off_mod"):
             tc_means = per_tc_means[role]
             n_role   = len(tc_means)
@@ -804,8 +804,8 @@ def write_tex_table_by_objects(
             if b not in bins or bins[b]["n_tcs"] == 0: continue
             r = bins[b]
             sys_cell   = system if first else ""
-            n_c, n_t   = r.get("n_completed_runs", 0), r.get("n_total_runs", 0)
-            compl_fmt  = f"{r['completion_mean']:>4.1f} $\\pm$ {r['completion_ci95']:>4.1f} ({n_c}/{n_t})"
+            n_c, n_t   = r.get("n_completed_tcs", 0), r.get("n_completion_tcs", 0)
+            compl_fmt  = f"{r['completion_mean']:>4.1f} $\\pm$ {r['completion_ci95']:>4.1f} ({n_c}/{n_t} TCs)"
             compl_cell = _bf(compl_fmt, system in win_by_bin[b]["completion"])
             mean_cell  = _bf(_fmt_rate(r['mean_mean'],       r['mean_ci95']),       system in win_by_bin[b]["mean"])
             pre_cell   = _bf(_fmt_rate(r['pre_mod_mean'],    r['pre_mod_ci95']),    system in win_by_bin[b]["pre_mod"])
