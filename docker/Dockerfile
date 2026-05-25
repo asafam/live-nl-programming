@@ -18,7 +18,7 @@
 # is committed to the repo. Only re-run `npm run build` in that directory first
 # if you have changed the plugin TypeScript source since the last commit.
 
-FROM ghcr.io/openclaw/openclaw:latest
+FROM ghcr.io/openclaw/openclaw:2026.3.23-2
 
 # ── Install Python 3 + pip (Debian/Ubuntu base) ───────────────────────────────
 USER root
